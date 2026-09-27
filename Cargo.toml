@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sh_nexus"]
+members = ["crates/sh_nexus", "crates/sh_nexus_wire"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,3 +26,118 @@ publish = false
 [workspace.dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "e683fd7b465ecfb42b1da88ff685d204c2781076" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "e683fd7b465ecfb42b1da88ff685d204c2781076" }
+
+# ---------------------------------------------------------------------------
+# PHASE 1 / WORK UNIT 1A -- the pure-Rust type foundation
+# ---------------------------------------------------------------------------
+#
+# Every crate below already appears in `Cargo.lock` transitively through GPUI's
+# tree, so adding them as direct dependencies costs no new download and no new
+# build of the 675-package dependency graph. Each is audited against
+# `AGENTS.md` 7.2's five criteria below; the full audit table is
+# `docs/DEPENDENCIES.md`, a Phase 1 exit criterion (PLAN.md section 2).
+#
+# Criterion 5 (`cargo build --timings` delta) for all of these is "no
+# measurable delta": the crates were already compiled as part of GPUI's tree
+# before they were named here. Only the compile *units* for the two new
+# workspace crates are new, and they are recorded in the Phase 1 timings pass.
+#
+# ---------------------------------------------------------------------------
+# serde 1.0.229 | MIT OR Apache-2.0 | maintained (1.0.229 is current) | millions
+#   of downloads/month | last commit well inside 6 months | no new compile units.
+#   Criterion 1: `AGENTS.md` 2.2 names serde explicitly as the project's
+#   serialization tool, and `PLAN.md` 2 lists it. Not a preference -- a mandate.
+#   Used ONLY by `sh_nexus_wire`, the crate whose entire purpose is a
+#   serialization format. The client crate does not depend on it, because
+#   `core/models` must not know that serialization exists (PLAN.md section 5).
+# ---------------------------------------------------------------------------
+serde = { version = "1", features = ["derive"] }
+
+# ---------------------------------------------------------------------------
+# serde_json 1.0.151 | MIT OR Apache-2.0 | maintained | millions of
+#   downloads/month | recent commits | no new compile units.
+#   Criterion 1: `AGENTS.md` 2.2 names serde_json explicitly; `PLAN.md` 2 lists
+#   it. The standard Rust JSON implementation, with no C dependency and no
+#   build script, so `AGENTS.md` 7.1's "no JavaScript, no WASM, no web tech" is
+#   untouched -- JSON here is a wire encoding, not a web technology.
+# ---------------------------------------------------------------------------
+serde_json = "1"
+
+# ---------------------------------------------------------------------------
+# chrono 0.4.45 | MIT OR Apache-2.0 | maintained | millions of downloads/month |
+#   recent commits | no new compile units.
+#   Criterion 1: `AGENTS.md` 2.1 requires `chrono::DateTime<Utc>` for all
+#   timestamps and PLAN.md 3 forbids hand-formatted RFC-3339. chrono is the
+#   only crate that satisfies that; `std` time cannot do timezone-aware UTC
+#   arithmetic or RFC-3339 round-tripping.
+#   Feature choice: `default-features = false` with `["std", "serde"]`.
+#   The default set is `["clock", "std", "oldtime", "wasmbind"]`; `clock` pulls
+#   `iana-time-zone` and `Utc::now()`, and work unit 1A needs neither. Excluding
+#   them also keeps timestamp *validation* pure and deterministic -- see the
+#   `timestamp_floor`/`timestamp_ceiling` rules in `network/mapping.rs`, whose
+#   tests would otherwise depend on a wall clock. GPUI's own tree may enable
+#   `clock` transitively (features unify per-build), so this is a declaration
+#   of what THIS crate needs, not a guarantee the binary omits `iana-time-zone`.
+# ---------------------------------------------------------------------------
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+
+# ---------------------------------------------------------------------------
+# uuid 1.26.1 | MIT OR Apache-2.0 | maintained | millions of downloads/month |
+#   recent commits | no new compile units.
+#   Criterion 1: `AGENTS.md` 7.4 requires a client-generated UUID
+#   (`client_msg_id`) on every client frame, and `PLAN.md` 2 lists uuid.
+#   Feature choice: defaults only (`std`). The `v4`/`rng` features are NOT
+#   enabled in 1A: no production code in this unit generates an id -- the
+#   generators are `state/actions.rs` and `network/`, which are Phase 4. The
+#   1A tests build ids deterministically from `Uuid::from_bytes`, which is
+#   better test hygiene than a random id per assertion. `rng` will be added
+#   when the first real generator lands, as its own justified change.
+#   `serde` is likewise not needed: the wire crate carries `client_msg_id` as a
+#   `String` and the boundary parses it, so the wire layer holds no uuid.
+# ---------------------------------------------------------------------------
+uuid = "1"
+
+# ---------------------------------------------------------------------------
+# smallvec 1.16.2 | MIT OR Apache-2.0 | maintained | millions of
+#   downloads/month | recent commits | no new compile units.
+#   Criterion 1: `AGENTS.md` 2.3 mandates `SmallVec` for small collections and
+#   names "reactions on a message" as the case; `PLAN.md` 5 sizes the inline
+#   buffers at `[Reaction; 2]` and `[Attachment; 1]`. smallvec has no
+#   dependencies, no build script, and no C code, and the crate defines no
+#   default features, so `smallvec = "1"` is already the minimal declaration.
+#   Only the client crate uses it; the wire crate uses `Vec`, so the DTOs stay
+#   free of the domain's memory-layout opinions and the conversion at
+#   `network/mapping.rs` is doing real work.
+# ---------------------------------------------------------------------------
+smallvec = "1"
+
+# ---------------------------------------------------------------------------
+# thiserror 2.0.21 | MIT OR Apache-2.0 | maintained | millions of
+#   downloads/month | recent commits | no new compile units.
+#   Criterion 1: `AGENTS.md` 2.2 mandates thiserror, 3.3 specifies
+#   `ShNexusError` as a `#[derive(Error)]` enum, and `PLAN.md` 2 records the
+#   mandate. A hand-written `Display` + `Error` impl for a nine-variant enum
+#   is strictly worse: thiserror generates it from the same `#[error]`
+#   attributes the constitution's snippet already uses.
+# ---------------------------------------------------------------------------
+thiserror = "2"
+
+# ---------------------------------------------------------------------------
+# proptest 1.11.0 | MIT OR Apache-2.0 | maintained | hundreds of thousands of
+#   downloads/month | recent commits | no new compile units for the
+#   `std`-only feature set.
+#   Criterion 1: `AGENTS.md` 4.4 mandates proptest, and 4.3 forbids `sleep()`
+#   in unit tests, which rules out the ad-hoc loops a property test replaces.
+#   Feature choice: `default-features = false, features = ["std"]`. The default
+#   set adds `fork` and `timeout`, which pull `rusty-fork` and `tempfile` for
+#   on-disk persistence of failing seeds -- 1A's properties are pure functions
+#   over values, so a failing case is reproducible from proptest's own printed
+#   seed and persistence buys nothing.
+#   COST, stated plainly: `gpui_platform/test-support` already pulls a *second*
+#   copy of proptest, from Zed's git pin rather than crates.io. Two copies of
+#   a test-only crate is the price of not inheriting a git dependency of our
+#   own, and it does not reach any release artifact -- `proptest` is a
+#   dev-dependency of both crates and `sh_nexus_wire` is a library the binary
+#   links only through `sh_nexus`.
+# ---------------------------------------------------------------------------
+proptest = { version = "1", default-features = false, features = ["std"] }

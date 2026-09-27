@@ -31,6 +31,7 @@ ADR-005.
 | [ADR-004](#adr-004--extending-agentsmds-coverage-floors-and-reconciling-planmd) | Extending `AGENTS.md`'s coverage floors and reconciling `PLAN.md` | **Accepted** |
 | [ADR-005](#adr-005--relaxing-agentsmd-61-62-performance-thresholds) | Relaxing `AGENTS.md` §6.1/§6.2 performance thresholds | **WITHDRAWN** |
 | [ADR-006](#adr-006--row-estimator-for-the-virtualized-message-list) | Row estimator for the virtualized message list | **Proposed** |
+| [ADR-007](#adr-007--deferring-the-from-error-payloads-in-shnexuserror) | Deferring the `#[from]` error payloads in `ShNexusError` | **Accepted (with a dated obligation)** |
 
 ---
 
@@ -552,6 +553,136 @@ review of this ADR is for, which is why it is Proposed and not Accepted.
 | **A per-content-class estimator** (one estimate for text, one for code blocks, one for reactions) | Genuinely better than a single uniform value, and a plausible refinement. Not proposed here because it is a bigger change to §7.3 than the amendment this ADR requests, and it presumes a content-classification step that `core/markdown.rs` has not yet produced. Revisit after Phase 2 has real measurements. |
 | **Ignore variable heights** and normalize every message bubble to a fixed height | Avoids the problem by removing the feature. Rejected: `AGENTS.md` §10 and §4.2 require Markdown and code-block rendering, so variable height is a requirement, not an accident. |
 | **Defer entirely** until Phase 2 shows measurable jank | Rejected as a default. §1's zero-jank priority is stated as a priority, not a nice-to-have, and "measure first" applies to the *magnitude* of the problem, not to whether a known-correctness gap in scroll positioning is worth writing down while it is still cheap to change. |
+
+---
+
+### ADR-007 — Deferring the `#[from]` error payloads in `ShNexusError`
+
+**Status:** **Accepted (with a dated obligation)** · 2026-09-27
+
+> The base status is **Accepted** — the decision below is in force and work unit 1A complies with it.
+> The parenthetical is a **condition attached to the acceptance**, not a fourth status value: the
+> three values in the table above are unchanged, and the obligation is stated, dated and binding in
+> **Consequences** below. An Accepted-with-obligation is Accepted, so implementation proceeds — the
+> obligation is a dated commitment, and its deadline is enforced by review rather than by the
+> compiler. The reason that distinction matters here is the last bullet of **Consequences**.
+
+#### Context
+
+`AGENTS.md` §3.3 specifies `ShNexusError` with `#[from]` payloads for its three I/O variants:
+
+```rust
+#[error("network error: {0}")]
+Network(#[from] reqwest::Error),
+
+#[error("websocket error: {0}")]
+WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+
+#[error("database error: {0}")]
+Database(#[from] rusqlite::Error),
+```
+
+Work unit 1A implemented the enum with **`String` payloads for those three variants**, and wired
+`Serialization(#[from] serde_json::Error)` for real.
+
+**The reason is dependency sequencing, not preference.** `reqwest` and `tokio-tungstenite` are
+**Phase 4** work (`PLAN.md` §8) and `rusqlite` is **Phase 3** (`PLAN.md` §8). **None of the three
+crates exists in work unit 1A.** A `#[from]` attribute is a claim that the source crate is a
+dependency; writing one for a crate that is not in `Cargo.toml` does not compile, so the typed form
+is not available as an option — it is simply not yet reachable.
+
+`rusqlite/bundled` makes the same point sharper. It **compiles SQLite's C amalgamation**, which
+would put a **C toolchain requirement** inside a work unit whose entire content is type
+definitions. `PLAN.md` §2 already records `rusqlite/bundled` as a deliberately accepted C build
+(`PLAN.md` §2, Dependency governance) — but accepted *in Phase 3*, where a database is the point, not
+as a hidden cost of the type-foundation unit.
+
+**What was implemented matches §3.3 everywhere else.** The variant **names** are §3.3's
+(`Network`, `WebSocket`, `Database`, `Serialization`, `Auth`, `Protocol`, `Config`, `Theme`,
+`Unknown`). The **payload meanings** are §3.3's. **All nine `Display` strings are exactly what
+§3.3 specifies** — the `#[error("network error: {0}")]` text is byte-identical to the constitution's.
+Only the *type inside* three of the nine payloads differs, and only in those three whose source
+crate has not landed.
+
+#### Decision
+
+1. **The three I/O variants carry `String` for now.** `Network(String)`, `WebSocket(String)`,
+   `Database(String)`. All three are constructed by `String` in every call site, so no call site
+   changes shape when the typed form lands.
+2. **`Serialization` carries its real `#[from]`** — `Serialization(#[from] serde_json::Error)` —
+   because `serde_json` **is** a dependency of this work unit for the wire boundary. One of the four
+   is real now rather than deferred with the other three, because for this one the crate is present.
+3. **The change to the typed form is a two-line diff per variant**, and no call site moves. When
+   `reqwest` lands, `Network(String)` becomes `Network(#[from] reqwest::Error)`; the variant's
+   constructors change from a `String` to the error value the dependency already produces, and every
+   other line in the crate is untouched.
+
+#### Consequences
+
+- **The real cost, stated plainly: a `String` payload loses the source error.** Two things are lost,
+  and they are different losses:
+  - **Pattern matching is gone.** `ShNexusError::Network` cannot be matched on
+    `reqwest::Error`'s **kind** — timeout, connect, decode, body, redirect. A caller cannot ask
+    "was this a timeout?" and branch on the answer, because after the `String` the kind does not
+    exist. The reconnect logic `PLAN.md` §8 Phase 4 and `AGENTS.md` §7.4 require — backoff, retry on
+    transient, do not retry on a non-transient — has less to work with than §3.3 intends it to.
+  - **The source chain is not preserved.** `thiserror`'s `#[from]` generates a `#[source]`, and
+    `std::error::Error::source()` walks it. With a `String` there is nothing to walk: the chain ends
+    at the variant. `AGENTS.md` §7.5 requires that `error!` records *"Errors affecting
+    functionality"* — a network failure is the canonical such error — and an `error!` that cannot
+    reach the source can only record a rendered sentence.
+- **The mitigation today is documentation plus a boundary rule, and it is partial.** Each of the
+  three variants' **doc comments names the deferral explicitly** and states that the typed form is
+  the right end state: `ShNexusError::Network` (the bolded *"The payload is a `String` in this
+  revision, not a `#[from] reqwest::Error`"* paragraph), `ShNexusError::WebSocket` (*"A `String`
+  payload for the same reason"*), and `ShNexusError::Database` (*"A `String` payload for the same
+  reason"*, including the C-amalgamation note). The enum's own doc comment states that *"The payload
+  of the three I/O variants is where this implementation deviates, and it is called out on each."*
+  On the GPUI boundary, `errors.rs`'s module docs and rule 3 require the **source chain to be logged,
+  not stringified into the domain**. Those four places are the reminder.
+- **OBLIGATION — dated, explicit, and binding. The typed `#[from]` payloads MUST be wired in the same
+  work unit that adds each dependency:**
+
+  | Dependency | Phase (`PLAN.md` §8) | MUST be wired in |
+  |---|---|---|
+  | `rusqlite` | **Phase 3** — Persistence | the work unit that adds `rusqlite` |
+  | `reqwest` | **Phase 4** — Networking | the work unit that adds `reqwest` |
+  | `tokio-tungstenite` | **Phase 4** — Networking | the work unit that adds `tokio-tungstenite` |
+
+  Not "in Phase 3" or "in Phase 4". **In the same work unit as the dependency.** Accepted 2026-09-27;
+  the deadline is the phase, because `PLAN.md` carries estimates and no calendar schedule, so a
+  calendar date would be a fiction. Each of the three doc comments above must be updated to remove
+  the deferral note in that same work unit, so the reminder cannot outlive the thing it reminds
+  about.
+- **The failure mode of missing that obligation is silent, and that is the whole reason this
+  obligation needs writing down.** **Nothing fails to compile** if `reqwest` lands and nobody wires
+  the `#[from]`. The variant still says `String`; `String` is a perfectly valid payload; every call
+  site still builds; `cargo check` is green; `cargo clippy` is green; `cargo test` is green. **The
+  error just keeps flattening to a `String`** and the loss of the source chain goes unnoticed, because
+  the symptom is not a failure — it is an error message that is slightly less useful than it should
+  be, in a log nobody reads until the day they need it. This is the "green build over a void" shape
+  that ADR-004 identified twice in `PLAN.md` Rev 2, and it is the reason the obligation is written
+  as a review item rather than trusted to a reviewer to notice.
+- **The check for it is a review item, not a compiler error.** There is no lint that fails on a
+  `String` where §3.3 wanted a typed payload; the type is legal. So the enforcement point is
+  `AGENTS.md` §5.3's review — and specifically a review that reads `crates/sh_nexus/src/errors.rs`
+  **against the dependency list of the work unit under review**, asking one question: *did this work
+  unit add a crate that `errors.rs` names, and if so, was the `#[from]` wired?* The three doc
+  comments named above are what that reviewer reads.
+- **The residual risk if the obligation is met late** is bounded and worth naming: during the gap, a
+  `network/` or `db/` call site has the concrete error value in hand and discards it to a `String` at
+  the `ShNexusError::` constructor. That is a one-line site to improve later, and the deferral is
+  visible in the diff when it happens. The unbounded risk is the opposite — the flattening happening
+  so early and so quietly that nobody remembers the typed form was ever specified. That is what
+  §3.3 and this ADR are for.
+
+#### Alternatives considered
+
+| Option | Why not chosen |
+|---|---|
+| **(a) Add `reqwest`, `tokio-tungstenite` and `rusqlite` in work unit 1A, to match §3.3 exactly** | This pulls a **TLS stack**, a **WebSocket client** and a **C SQLite build** into a work unit whose entire content is type definitions and a wire-protocol crate. It contradicts the phase sequencing in `PLAN.md` §8 — where these crates are Phase 3 and Phase 4 work, each with its own exit criteria — and `AGENTS.md` §7.2 criterion 5, which requires compile-time impact to be measured before a dependency is added: `AGENTS.md` §2.3's "measure, don't guess" cannot be satisfied for a TLS stack that landed as a side effect of an error enum. The compliance gained is three payload types; the cost is a C toolchain requirement, a materially larger build, and a §7.2 audit for three crates that have no user yet. Rejected. |
+| **(b) Omit the three variants until their crates exist** | `PLAN.md` §6's protocol needs `Network` and `Protocol` **from the first commit**: the wire boundary's whole job is to reduce a `WireError` into the domain vocabulary, and a `ShNexusError` with no `Network` variant cannot represent a connection failure — which is the single most common failure a chat client has. Beyond the immediate need, an enum that **grows variants as phases land** makes every `match` site non-exhaustive, so each later phase breaks every earlier `match` on an unrelated concern, and each break is a compiler error that a reader must triage against the phase that caused it. Adding variants is a breaking change to every consumer; adding them once, up front, is not. Rejected. |
+| **(c) Keep `String` permanently** | A **permanent** loss of the source error, and it directly weakens `AGENTS.md` §7.5's observability — `error!` exists to record errors affecting functionality, and a log line that cannot reach `reqwest::Error::source()` records a rendered sentence rather than a cause. `AGENTS.md` §1 lists Reliability second and states the project's priorities in order; an error type that discards its cause is a reliability cost paid on every failure, forever, in exchange for avoiding a two-line diff three times. Rejected. The deferral is a **sequencing** decision with an end state, not a preference for the weaker type. |
 
 ---
 

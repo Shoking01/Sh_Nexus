@@ -1,0 +1,69 @@
+[package]
+name = "sh_nexus_wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Sh_Nexus wire protocol - the single source of truth for the client/server contract"
+
+[lib]
+name = "sh_nexus_wire"
+path = "src/lib.rs"
+
+# NOTE ON DEPENDENCY DIRECTION
+# ---------------------------
+# This crate depends on nothing project-specific. It MUST NOT depend on
+# `sh_nexus`, `sh_nexus_server`, `gpui`, `tokio`, `reqwest`, `rusqlite` or any
+# other project or platform crate. The rule is not stylistic:
+#
+#   * `sh_nexus` and `sh_nexus_server` both depend on THIS crate (ADR-002).
+#     A back-edge would make the protocol depend on one of its two
+#     implementations, so "defined once" (the property ADR-002 exists to
+#     guarantee) would become "defined once, except where it matters".
+#   * Nothing here may touch I/O, a clock, a GPU, or a thread. Every function
+#     in this crate is a pure transformation over bytes or values, which is
+#     what makes the >=80% coverage floor (ADR-004) reachable and what makes it
+#     safe to compile into both sides of a socket.
+#
+# `tests/dependency_direction.rs` asserts the rule against this file, so a
+# back-edge is a test failure rather than a code-review opinion.
+#
+# Every version below is pinned once in the root `Cargo.toml`
+# (`[workspace.dependencies]`) and carries the `AGENTS.md` 7.2 audit there.
+# This file states only why *this* crate needs the crate.
+
+[dependencies]
+# The protocol's whole purpose is a serialization format, so serde is
+# structural here rather than optional. `derive` for the `#[serde(tag = ...)]`
+# enums; the plain `std` trait impls come along with it.
+serde = { workspace = true }
+
+# `serde_json` is the encoding. Chosen because it is what `reqwest` and
+# `tokio-tungstenite` on the client side and `axum` on the server side will
+# hand us as `text` frames and body strings, so the codec is a straight
+# `from_str`/`to_string` with no intermediate buffer.
+serde_json = { workspace = true }
+
+# Timestamps cross the wire as `DateTime<Utc>`, serialized by chrono's own
+# serde impl. `PLAN.md` 3 forbids hand-formatting RFC-3339, and hand-formatting
+# is exactly how a client and server end up disagreeing about a fractional
+# second count -- which is a silent message-ordering bug, not a crash.
+chrono = { workspace = true }
+
+# `AGENTS.md` 3.3 defines `ShNexusError` as a `thiserror` enum. This crate
+# cannot use that type (it would need the back-edge the note above forbids), so
+# it defines `WireError` the same way and `network/` reduces `WireError` into
+# `ShNexusError` at the boundary.
+thiserror = { workspace = true }
+
+# NOTE: `uuid` is deliberately absent. `client_msg_id` is a `String` here, not a
+# `Uuid`. The wire is untrusted text, and the rule that it must *be* a UUID
+# belongs to the domain, enforced in `sh_nexus::network::mapping`. Keeping the
+# wire free of the type is what makes that boundary rule testable rather than
+# redundant.
+
+[dev-dependencies]
+# `AGENTS.md` 4.4 requires property-based tests. See the root manifest for the
+# feature choice and for why a second copy of proptest (the first arrives via
+# `gpui_platform/test-support`) is the accepted cost.
+proptest = { workspace = true }
