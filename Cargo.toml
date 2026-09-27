@@ -5,7 +5,11 @@ members = ["crates/sh_nexus"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+# Must match the root LICENSE file (MIT, Copyright (c) 2026 Adrián Quirós).
+# This was previously "Apache-2.0", which contradicted the LICENSE. GPUI itself
+# is Apache-2.0 (see the pin note below) but that license attaches to the
+# dependency, not to this project.
+license = "MIT"
 publish = false
 
 # GPUI is pulled from Zed Industries' monorepo via a pinned `rev`, not from
