@@ -918,19 +918,35 @@ features.
 
 ## 15. Next Steps
 
-1. ~~**Phase 0 spike**~~ â€” **DONE. PASSED.** Commit `491bd0f` on `spike/gpui-windows`. Gate
-   cleared; ADR-001 holds. See Â§8 for the four findings that constrain later phases.
-2. Document the `fxc.exe` release-build prerequisite in `README.md` and wire it into CI setup.
-3. Write ADR-001 through ADR-004 into `docs/ARCHITECTURE.md`. **ADR-005 is withdrawn** â€” the
-   measured 9.92MB binary refuted the hypothesis (Â§11).
-4. Open ADR-006 for the Â§7.3 row-estimator amendment.
-5. **Phase 1** â€” `errors.rs`, `sh_nexus_wire`, `core/`, `state/`, under strict TDD. Exit
-   criterion: `docs/DEPENDENCIES.md` with the Â§7.2 audit, one row per crate.
-6. **Phase 2** â€” app shell and the virtualized message list.
-7. **Phase 3** â€” SQLite, migrations, outbox. Exit criterion: re-measure binary size against the
-   9.92MB baseline, and idle CPU over a â‰¥30-minute session.
-8. **Phase 4** â€” Axum backend, WebSocket, reconnection, timeouts.
+1. ~~**Phase 0 spike**~~ - **DONE. PASSED.** Commit `491bd0f`, pushed to `main`. Gate cleared;
+   ADR-001 holds. See section 8 for the four findings that constrain later phases.
+2. ~~Document the `fxc.exe` release-build prerequisite~~ - **DONE.** `README.md` Prerequisites
+   and Platform gotchas (a). CI wiring outstanding, see item 4.
+3. ~~Write ADR-001 through ADR-004 into `docs/ARCHITECTURE.md`~~ - **DONE**, along with ADR-005
+   (Withdrawn, retained as a record) and ADR-006 (Proposed). ADR-005 is withdrawn: the
+   measured 9.92MB binary refuted the hypothesis (section 11).
+4. **CI.** `.github/workflows/ci.yml` running the section 5.1 checklist is the one section 12
+   commitment with nothing behind it. Every push so far has been self-verified by hand, and
+   sections 6.1/6.3 merge-blocking rules are unenforceable until the pipeline exists. **Do
+   this before Phase 1** - Phase 1 lands under strict TDD with a >=90% coverage floor on `core/`,
+   and a self-reported floor is not a floor.
+5. **Phase 1** - `errors.rs`, `sh_nexus_wire`, `core/`, `state/`, under strict TDD. Exit
+   criterion: `docs/DEPENDENCIES.md` with the section 7.2 audit, one row per crate.
+6. **Phase 2** - app shell and the virtualized message list.
+7. **Phase 3** - SQLite, migrations, outbox. Exit criterion: re-measure binary size against the
+   9.92MB baseline, and idle CPU over a >=30-minute session.
+8. **Phase 4** - Axum backend, WebSocket, reconnection, timeouts.
 9. Choose the Phase 5 subset explicitly. Do not let it default to all nine.
+
+### Open items for the constitution owner
+
+These need the owner's decision; this plan does not act on them unilaterally.
+
+1. **`AGENTS.md` section 6.1's "GPUI statically links the renderer"** is false on Windows and is
+   the origin of ADR-005. Measured replacement text is in `docs/ARCHITECTURE.md` under ADR-005.
+2. **Project license.** `LICENSE` is MIT and `Cargo.toml` now says MIT, but `AGENTS.md` never
+   states a license. Worth confirming MIT is intended and recording it in `AGENTS.md`.
+3. **The other `AGENTS.md` defects** listed in Appendix A items 1-5.
 
 ---
 
