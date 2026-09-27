@@ -1,0 +1,21 @@
+# Cargo build artifacts.
+/target
+
+# `Cargo.lock` is intentionally COMMITTED.
+#
+# This workspace produces binaries (a client, and a server crate later), so the
+# lockfile pins the exact resolution of GPUI's very large transitive tree. A
+# git dependency already pins GPUI itself via `rev`, but its ~700 transitive
+# crates would otherwise float on every build, and upstream Zed bumps them
+# daily. Committing `Cargo.lock` is the standard Cargo guidance for
+# applications and is what makes a clean checkout reproducible -- which is
+# precisely what PLAN.md section 8 Phase 0 asks for ("a window opens on Windows
+# from a clean checkout").
+#
+# A future `sh_nexus_wire`/`sh_nexus_server` library split would move the
+# question to per-crate lockfiles; not a Phase 0 concern.
+
+# Editor / OS noise.
+.DS_Store
+Thumbs.db
+*.swp

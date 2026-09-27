@@ -1,0 +1,32 @@
+[package]
+name = "sh_nexus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Sh_Nexus - native team chat client (Rust + GPUI)"
+
+[[bin]]
+name = "sh_nexus"
+path = "src/main.rs"
+
+[lib]
+name = "sh_nexus"
+path = "src/lib.rs"
+
+[dependencies]
+# gpui: platform-agnostic core of Zed's UI framework. Apache-2.0. Pinned to a
+# `rev` rather than a semver range because the git channel expresses no
+# version guarantee and every upstream sync must be a deliberate review, not a
+# `cargo update` (PLAN.md ADR-001).
+gpui = { workspace = true }
+
+# gpui_platform: the OS-backend dispatcher. NOT optional -- since upstream
+# commit "gpui: Extract gpui_platform out of gpui" (2026-02-19) the platform
+# backends (gpui_apple/gpui_macos/gpui_linux/gpui_windows/gpui_wgpu) live
+# outside `gpui`, so depending on `gpui` alone yields no window on Windows.
+# `test-support` propagates to gpui/gpui_macos/gpui_windows/gpui_wgpu
+# test-support and is what makes the headless test harness exist at all
+# (PLAN.md section 10). Its `default` feature set is empty; Windows needs no
+# other feature.
+gpui_platform = { workspace = true, features = ["test-support"] }

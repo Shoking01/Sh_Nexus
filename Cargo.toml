@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/sh_nexus"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# GPUI is pulled from Zed Industries' monorepo via a pinned `rev`, not from
+# crates.io. The published `gpui` crate (0.2.2, last published 2025-10-22)
+# ships no Windows platform backend and its README states macOS/Linux only, so
+# it cannot satisfy this project's targets. See PLAN.md section 1 (ADR-001).
+#
+# Upstream commit: e683fd7b465ecfb42b1da88ff685d204c2781076
+#   date:    2026-09-27T17:37:29Z
+#   subject: "gpui: Add bench_metrics for multi-metric Criterion benchmarks (#64753)"
+#   license: Apache-2.0
+#
+# Upstream release context: Zed 1.19.1 (2026-09-04), per zed.dev.
+[workspace.dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "e683fd7b465ecfb42b1da88ff685d204c2781076" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "e683fd7b465ecfb42b1da88ff685d204c2781076" }
