@@ -30,3 +30,62 @@ gpui = { workspace = true }
 # (PLAN.md section 10). Its `default` feature set is empty; Windows needs no
 # other feature.
 gpui_platform = { workspace = true, features = ["test-support"] }
+
+# sh_nexus_wire: the protocol, shared with the server (ADR-002). A path
+# dependency, not a version: both crates are in this workspace, are released
+# together, and the whole point of ADR-002 is that they are one compiler
+# invocation over one set of types. A version range would reintroduce the
+# possibility of the two sides resolving different protocols.
+#
+# Note the direction: sh_nexus_wire does NOT depend on this crate. That is
+# asserted by crates/sh_nexus_wire/tests/dependency_direction.rs, because a
+# back-edge would make the protocol depend on one of its two implementations.
+sh_nexus_wire = { path = "../sh_nexus_wire" }
+
+# thiserror: `AGENTS.md` 3.3 defines ShNexusError as a `#[derive(Error)]` enum and
+# 2.2 mandates thiserror. The audit is in the root Cargo.toml.
+thiserror = { workspace = true }
+
+# serde_json: `AGENTS.md` 2.2 mandates it, and it is the encoding sh_nexus_wire
+# speaks, so this crate decodes the same JSON the wire crate encodes. Used in
+# exactly two places: `errors.rs`, whose Serialization variant wraps
+# `serde_json::Error` with a real `#[from]`, and the boundary tests.
+#
+# NOTE: this crate does NOT depend on `serde` itself. Nothing in the client
+# derives Serialize or Deserialize -- that is the wire/domain boundary
+# (`PLAN.md` section 5), and adding `serde` here would put the derive macros one
+# `use` away from core/models. crates/sh_nexus/tests/layer_boundary.rs scans
+# core/ for the word "serde"; a dependency would make that scan pass for the
+# wrong reason.
+serde_json = { workspace = true }
+
+# chrono: `AGENTS.md` 2.1 requires chrono::DateTime<Utc> for every timestamp and
+# forbids hand-formatted RFC-3339, and PLAN.md section 3 repeats it. Used by the
+# domain models and by the boundary's timestamp validation.
+chrono = { workspace = true }
+
+# uuid: `AGENTS.md` 7.4 requires a client-generated UUID as the client_msg_id, and
+# PLAN.md section 5 types it `Uuid` in the domain where the wire carries a
+# String. That split is what makes "must be a UUID" a rule the boundary can
+# enforce and a test can check.
+#
+# Defaults only (`std`); the `v4`/`rng` features are deliberately NOT enabled.
+# Nothing in work unit 1A generates an id -- the generators are
+# state/actions.rs and network/, which are Phase 4 -- and the 1A tests build ids
+# deterministically with Uuid::from_bytes, which is better hygiene than a random
+# id per assertion. `rng` is added as its own justified change when the first
+# real generator lands.
+uuid = { workspace = true }
+
+# smallvec: `AGENTS.md` 2.3 mandates it for small collections and names
+# "reactions on a message" as the case; PLAN.md section 5 sizes the inline buffers
+# at [Reaction; 2] and [Attachment; 1]. No dependencies, no build script, no C.
+smallvec = { workspace = true }
+
+[dev-dependencies]
+# proptest: `AGENTS.md` 4.4 mandates it. Its property tests here cover the
+# properties the hand-written cases cannot: that no wire value at all reaches
+# state/ unvalidated, and that every valid value round-trips. Feature choice and
+# the cost of a second copy of proptest (the first arrives via
+# gpui_platform/test-support) are recorded in the root Cargo.toml.
+proptest = { workspace = true }

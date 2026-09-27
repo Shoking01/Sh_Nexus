@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7c9972fa4d0ec6775bd2870bbab801f00386f99baba117e9ca336018ef67c89b # shrinks to wire = WireMessage { id: "a", client_msg_id: "00000000-0000-0000-0000-000000000000", channel_id: "0", user_id: "", content: "a", timestamp: 2000-01-01T00:00:00Z, edited_at: None, reactions: [], thread_id: None, attachments: [] }

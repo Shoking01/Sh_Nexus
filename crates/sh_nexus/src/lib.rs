@@ -8,6 +8,29 @@
 //!
 //! Phase 1 moves the root view into `src/app.rs` per PLAN.md section 4; it is
 //! kept here for the spike so the spike's footprint stays small.
+//!
+//! # The module tree (AGENTS.md section 3.1)
+//!
+//! `app.rs`, `ui/`, `state/`, `db/` and `platform/` are not declared yet. They
+//! are later work units, and they are absent rather than declared empty: a
+//! module that exists and does nothing reads as finished work.
+//!
+//! [`core`] is pure domain logic with no side effects -- no `gpui`, no `tokio`,
+//! no I/O (`AGENTS.md` section 3.2). [`network`] is protocol handling only: it
+//! parses wire formats into [`core::models`] and emits
+//! [`core::models::DomainEvent`] values, and never touches GPUI state
+//! directly. [`errors`] holds the project's global error type.
+
+// `AGENTS.md` section 2.2 requires `///` doc comments on all public items and
+// section 5.1 makes it a pre-commit gate. The lint is how the gate is enforced
+// rather than remembered: an undocumented public item is a compile warning, so it
+// cannot reach a commit unnoticed. Kept in step with the same lint in
+// `sh_nexus_wire/src/lib.rs`.
+#![warn(missing_docs)]
+
+pub mod core;
+pub mod errors;
+pub mod network;
 
 use std::cell::RefCell;
 use std::rc::Rc;

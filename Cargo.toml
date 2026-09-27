@@ -81,7 +81,35 @@ serde_json = "1"
 # ---------------------------------------------------------------------------
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 
+# ---------------------------------------------------------------------------
+# uuid 1.26.1 | MIT OR Apache-2.0 | maintained | millions of downloads/month |
+#   recent commits | no new compile units.
+#   Criterion 1: `AGENTS.md` 7.4 requires a client-generated UUID
+#   (`client_msg_id`) on every client frame, and `PLAN.md` 2 lists uuid.
+#   Feature choice: defaults only (`std`). The `v4`/`rng` features are NOT
+#   enabled in 1A: no production code in this unit generates an id -- the
+#   generators are `state/actions.rs` and `network/`, which are Phase 4. The
+#   1A tests build ids deterministically from `Uuid::from_bytes`, which is
+#   better test hygiene than a random id per assertion. `rng` will be added
+#   when the first real generator lands, as its own justified change.
+#   `serde` is likewise not needed: the wire crate carries `client_msg_id` as a
+#   `String` and the boundary parses it, so the wire layer holds no uuid.
+# ---------------------------------------------------------------------------
+uuid = "1"
 
+# ---------------------------------------------------------------------------
+# smallvec 1.16.2 | MIT OR Apache-2.0 | maintained | millions of
+#   downloads/month | recent commits | no new compile units.
+#   Criterion 1: `AGENTS.md` 2.3 mandates `SmallVec` for small collections and
+#   names "reactions on a message" as the case; `PLAN.md` 5 sizes the inline
+#   buffers at `[Reaction; 2]` and `[Attachment; 1]`. smallvec has no
+#   dependencies, no build script, and no C code, and the crate defines no
+#   default features, so `smallvec = "1"` is already the minimal declaration.
+#   Only the client crate uses it; the wire crate uses `Vec`, so the DTOs stay
+#   free of the domain's memory-layout opinions and the conversion at
+#   `network/mapping.rs` is doing real work.
+# ---------------------------------------------------------------------------
+smallvec = "1"
 
 # ---------------------------------------------------------------------------
 # thiserror 2.0.21 | MIT OR Apache-2.0 | maintained | millions of

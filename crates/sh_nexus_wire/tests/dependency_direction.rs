@@ -170,10 +170,27 @@ fn the_wire_crate_dependency_set_is_the_audited_one() {
     );
 }
 
-// `the_client_depends_on_the_wire_crate` is intentionally absent from this PR.
-//
-// It asserts that `crates/sh_nexus` declares a dependency on this crate, which
-// is a property of the CLIENT manifest, so it can only hold once the client is
-// wired up. This PR adds the wire crate alone; the client side lands in the
-// follow-up and the test lands with it. Keeping it here would mean shipping a
-// red build to assert an invariant that does not hold yet.
+/// The client depends on this crate, which is the other half of the arrow.
+///
+/// Without this, `crates/sh_nexus` could quietly stop using the shared protocol
+/// and define its own DTOs -- the exact drift ADR-002 exists to make
+/// structurally impossible.
+#[test]
+fn the_client_depends_on_the_wire_crate() {
+    let client_manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the wire crate lives under crates/")
+        .join("sh_nexus")
+        .join("Cargo.toml");
+    let text = fs::read_to_string(&client_manifest).unwrap_or_else(|error| {
+        panic!("{} should be readable: {error}", client_manifest.display())
+    });
+
+    assert!(
+        declared_dependency_names(&text)
+            .iter()
+            .any(|name| name == "sh_nexus_wire"),
+        "the client must depend on sh_nexus_wire (ADR-002). Not found in {}",
+        client_manifest.display()
+    );
+}
