@@ -1,0 +1,601 @@
+# Sh_Nexus — Architecture Decision Records
+
+This file holds every Architecture Decision Record for Sh_Nexus, in the format mandated by
+`AGENTS.md` §9.2: **Context, Decision, Consequences, Alternatives considered.**
+
+## Precedence
+
+`AGENTS.md` is the constitution of this project. `PLAN.md` and this file are subordinate to it. Where
+any two disagree, `AGENTS.md` wins and the other document is the bug.
+
+A subordinate document may **request** an amendment to the constitution through the ADR path
+(`AGENTS.md` §9.2). It may **not** pre-apply one. `PLAN.md` Rev 2 broke that rule by declaring
+`AGENTS.md`'s performance thresholds "targets, not gates", and was corrected — see ADR-004 and
+ADR-005.
+
+## Status values
+
+| Status | Meaning |
+|---|---|
+| **Accepted** | In force. Implementation must comply. |
+| **Proposed** | Written up and open for review. **Not** in force. Do not implement as settled. |
+| **Withdrawn** | Raised, then refuted or reversed. **Retained as a record**, never silently deleted. A withdrawn ADR is a decision that was considered and why it lost. |
+
+## Index
+
+| ADR | Title | Status |
+|---|---|---|
+| [ADR-001](#adr-001--gpui-distribution-channel) | GPUI distribution channel | **Accepted** |
+| [ADR-002](#adr-002--backend-in-rust-axum-as-a-workspace-member-not-python) | Backend in Rust (Axum) as a workspace member, not Python | **Accepted** |
+| [ADR-003](#adr-003--cargo-workspace-agentsmd-31s-tree-applied-per-crate) | Cargo workspace; `AGENTS.md` §3.1's tree applied per crate | **Accepted** |
+| [ADR-004](#adr-004--extending-agentsmds-coverage-floors-and-reconciling-planmd) | Extending `AGENTS.md`'s coverage floors and reconciling `PLAN.md` | **Accepted** |
+| [ADR-005](#adr-005--relaxing-agentsmd-61-62-performance-thresholds) | Relaxing `AGENTS.md` §6.1/§6.2 performance thresholds | **WITHDRAWN** |
+| [ADR-006](#adr-006--row-estimator-for-the-virtualized-message-list) | Row estimator for the virtualized message list | **Proposed** |
+
+---
+
+### ADR-001 — GPUI distribution channel
+
+**Status:** Accepted
+
+#### Context
+
+The published `gpui` crate on crates.io is version `0.2.2`, last published 2025-10-22 — roughly
+eleven months stale while Zed ships daily releases (1.19.1 as of 2026-09-04, per zed.dev). Its
+README states the user must "be on macOS or Linux", and its `windows-manifest` feature is an empty
+list that only embeds an app manifest. It provides no Windows platform backend.
+
+Zed *itself* does run on Windows, but that is the monorepo build, not the standalone crate.
+Conflating the two is the most common error made about GPUI platform support. For accuracy:
+upstream's Windows path uses **DirectX 11 for rendering** (a backend Zed built specifically to
+cover Windows 7+ and VMs), with **Win32 for windowing and DirectWrite for text**.
+
+This is the highest-consequence choice in the project: it gates all work. It was resolved by the
+Phase 0 spike, a hard gate with no estimate attached (`PLAN.md` §8).
+
+#### Decision
+
+Depend on GPUI directly from `zed-industries/zed` via a **git dependency with a pinned `rev`**,
+using two crates:
+
+- `gpui` — the platform-agnostic core
+- `gpui_platform` — the dispatcher that selects the OS backend
+
+`gpui_platform` is **not optional**; depending on `gpui` alone yields no window on Windows. Upstream
+extracted the platform backends out of `gpui` (commit "gpui: Extract gpui_platform out of gpui",
+2026-02-19) into `gpui_apple`, `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_wgpu`, and
+`gpui_web`. On `main`, the `wayland` and `x11` features of `gpui` no longer carry `blade-graphics` /
+`cosmic-text` / `x11rb` / `objc2-metal`, and `macos-blade` is gone.
+
+The pin in use is **`rev = e683fd7b465ecfb42b1da88ff685d204c2781076`**, recorded in the root
+`Cargo.toml` with a comment naming the upstream date (2026-09-27T17:37:29Z), the upstream subject
+line, and the upstream release context (Zed 1.19.1, 2026-09-04).
+
+**License:** Apache-2.0, verified against the repository root `LICENSE` and
+`crates/gpui/LICENSE-APACHE` ("Copyright 2022-2025 Zed Industries, Inc."). No copyleft obligations.
+Some third-party crate aggregators incorrectly report Zed as GPL-3.0-or-later; that claim is false.
+Do not source license facts from aggregators.
+
+#### Consequences
+
+- Every upstream sync is a **deliberate upgrade task**, not a `cargo update`. Review breaking
+  changes across the dependency tree before moving the pin.
+- A `git` dependency is not publishable to crates.io and expresses no semver range. Accepted; see
+  ADR-002.
+- The pinned `rev` is the upgrade boundary. Record it in `Cargo.toml` with a comment naming the
+  date and the upstream version it corresponds to.
+- **Compile time is a real cost.** GPUI's tree is large, and `AGENTS.md` §7.2 requires compile-time
+  impact to be measured. The Phase 0 baseline is 2m 12s dev cold, 3m 10s release cold on 12 logical
+  CPUs, across 675 packages and 424 release compile units.
+- **Release builds require a shader compiler that debug builds do not.** `gpui_windows/build.rs`
+  compiles HLSL under `#[cfg(not(debug_assertions))]` and panics with `"Failed to find fxc.exe"` when
+  it cannot locate one, so `cargo build` succeeds on a machine where `cargo build --release` fails
+  outright. This must be provisioned in CI setup, not discovered in a release job. Documented in
+  `README.md` and `PLAN.md` §8.
+- **`test-support` is not free.** It enables `leak-detection` (pulling `backtrace`) and `proptest`.
+  Measured cost: 9.5s of release wall clock and ~155KB of binary (190.5s → 181.0s;
+  10,401,792 → 10,246,656 B) — about 1.5% size and 5% build time. Moving `gpui_platform` to
+  `[dev-dependencies]` reclaims it. Not worth deviating from `AGENTS.md` §2 at that price; recorded
+  so the decision is reversible with numbers behind it.
+- **`gpui_windows` is pure Rust over the `windows` crate**, with a hand-written D3D11 renderer and
+  DirectWrite text. No Vulkan, no DXC, no `blade`, no `shaderc`. Only `fxc.exe` (shader model 4.1
+  targets) is needed beyond a C++-free toolchain.
+- **Some testing capability is unavailable on Windows.** `current_headless_renderer()` returns
+  `Ok(None)` there, so screenshot-diffing tests are macOS/Linux only. Headless render, simulated
+  pointer and keyboard input, and assertions on state, focus, layout and accessibility all work.
+  See `PLAN.md` §8, finding 3.
+
+**Validation — the Phase 0 result.** The spike passed and the decision is confirmed by measurement,
+not by argument (`PLAN.md` §8, commit `491bd0f` on `spike/gpui-windows`):
+
+- **A window opens on Windows** from a clean checkout at the pinned rev (non-zero window handle).
+- **4/4 headless tests pass**, covering render, click and keystroke.
+- **`cargo build`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test` and
+  `cargo build --release` are all green.**
+- **Release binary: 9.92 MB** (10,401,792 B) — 3× under `AGENTS.md` §6.1's 30MB maximum and 2×
+  under its 20MB target.
+
+ADR-001 holds. No fallback was needed.
+
+#### Alternatives considered
+
+| Option | §7.2 verdict | Why not chosen |
+|---|---|---|
+| `gpui = "0.2.2"` from crates.io | Passes maintenance bars | Stale by ~11 months; no Windows backend. Disqualifying. |
+| `gpui-component` / `gpui-kit` (longbridge) | Passes all five criteria; 0.6.6 published 2026-09-21, ~82k downloads in 90 days | Actively maintained and cross-platform. Rejected because it is a third-party opinionated design system, and this project builds its own UI layer anyway. **Reconsider if pin upkeep becomes a burden.** |
+| `gpui-unofficial` | **FAILS §7.2**: its Windows backend crate `gpui-windows-gpui-unofficial` has 1,583 all-time downloads — far under the 500/month bar the constitution sets. Maintained by one person and explicitly not by the Zed team. | Rejected on §7.2 grounds, not on preference. |
+| `open-gpui-platform`, `gpui-ce` | Incomplete assessment | Available republishes; would need the same §7.2 audit before adoption. |
+| egui / iced / Slint | Passes all five criteria | Mature Windows support on crates.io, but abandons the portfolio's "built on Zed's framework" premise. |
+
+**Fallback:** if the Phase 0 spike had failed, fall back to `gpui-kit` or `gpui-unofficial`. That
+would have required **revising this ADR first** — it is not an in-flight substitution. The rest of
+the architecture is unaffected either way, because GPUI is confined to `ui/` and `app.rs`.
+
+---
+
+### ADR-002 — Backend in Rust (Axum) as a workspace member, not Python
+
+**Status:** Accepted
+
+#### Context
+
+Sh_Nexus needs a real backend, not a mock: JWT auth, channel and message REST, and a WebSocket
+server. `AGENTS.md` §1 frames the project as demonstrating "full-stack capability", and §8.1
+mandates integration flows (Login, Real-time two-client delivery, Reconnect, Offline) that cannot be
+tested against a stub.
+
+`PLAN.md` Rev 1 listed the backend as **optional** and proposed **Python + FastAPI**. That is
+inconsistent with the constitution in two ways. It demotes a mandatory part of the system to a
+"nice to have", and it introduces a second language into a project whose constitution bans web
+technology outright (`AGENTS.md` §7.1: "No JavaScript, no WASM, no web tech").
+
+The wire protocol is not a detail here. `AGENTS.md` §7.4 requires a `v` field on every WS envelope
+with explicit rejection of unknown major versions, a client-generated `client_msg_id` on every
+client frame for idempotent dedup across reconnects, per-cursor resumption from `last_message_at`,
+and mandatory timeouts. `AGENTS.md` §4.2 requires serde round-trips for every wire format in **both**
+directions. A hand-duplicated protocol definition on the server side is a standing invitation to
+violate both.
+
+#### Decision
+
+**Rust + Axum, as a member of the same Cargo workspace** (`crates/sh_nexus_server`).
+
+The wire protocol is defined exactly once, in a third workspace crate, `sh_nexus_wire`. Both the
+client and the server compile against it. There is one language, one toolchain, one `cargo test`, and
+one CI matrix.
+
+#### Consequences
+
+- **The wire protocol is defined once and cannot drift.** `sh_nexus_wire` owns the serde DTOs, the
+  `v` envelope, and the version negotiation. Client and server are the same compiler invocation over
+  the same types, so a protocol change that breaks one side cannot compile on the other. This makes
+  "wire protocol drift" a category of bug that is structurally impossible rather than merely
+  unlikely.
+- **One language, one toolchain, one `cargo test`, one CI matrix.** Backend tests are ordinary Cargo
+  tests. `AGENTS.md` §5.1's checklist, §6.1's CI metrics and §6.3's merge-blocking rules apply to
+  the server with no separate pipeline, no second dependency audit, and no second formatter.
+- **One `§7.2` audit surface.** Every crate the project depends on is audited in the single
+  `docs/DEPENDENCIES.md`, regardless of which side of the wire it serves.
+- **Server and client share a build.** Changing the wire crate recompiles both. For a project of
+  this size that is a feature, not a cost: the two sides are always consistent and the CI signal is
+  honest. It does mean a wire change cannot be built and tested in isolation.
+- **The client and the server ship from one build pipeline**, so a `cargo build --release` produces
+  both artifacts and both are covered by the same binary-size accounting.
+- **Slower backend authoring than FastAPI.** This is a real cost. Axum, tokio and `sqlx`/`rusqlite`
+  are more ceremony than an async Python function; the request/handler/router/state plumbing is
+  explicit rather than implicit. Accepted deliberately: this is a portfolio project whose value is
+  the architecture, and the protocol guarantee is worth more than the authoring speed.
+- **The coverage floor extends to the server.** `sh_nexus_server` is held to ≥80% — see ADR-004.
+
+**Revisit condition.** This is the first ADR to revisit if backend velocity becomes the binding
+constraint on delivering the mandatory flows in `AGENTS.md` §8.1. If the server is the schedule
+risk, the question to reopen is *this* ADR — not a workaround inside it.
+
+#### Alternatives considered
+
+| Option | Why not chosen |
+|---|---|
+| **Python + FastAPI** (as proposed in `PLAN.md` Rev 1) | Faster to author, and FastAPI's ergonomics are genuinely better for a small REST surface. But it **duplicates the wire types by hand in a second language**, which guarantees drift and violates `AGENTS.md` §7.4's versioning requirements and §4.2's round-trip requirements. It also introduces a second runtime, a second dependency ecosystem, a second CI matrix and a second audit into a project whose constitution bans web technology in the first place, and into a portfolio whose stated premise is native Rust. |
+| Rust + Axum as a **separate repository** | Shares the language, but not the build. The wire crate would have to be published or path-referenced across a repo boundary, so the "defined once" guarantee degrades to "defined once, by convention" — the exact failure mode Python introduces, in a weaker form. Also splits the CI matrix and the §7.2 audit, which is a cost paid for no benefit. |
+| Go, Node, or Elixir server | Same two-language drift problem as Python, with a worse story: none of them can share `sh_nexus_wire` as Rust types. Node is additionally banned outright by `AGENTS.md` §7.1. |
+| **No backend** — mock or fixture the server side (as `PLAN.md` Rev 1 proposed) | Leaves `AGENTS.md` §8.1's Real-time, Reconnect and Offline flows untestable against a real server, and §7.4's resumption and idempotency requirements unverifiable. The constitution mandates those flows as integration tests; a mock cannot exercise them. |
+| Rust + Actix / Rocket | Functionally comparable to Axum. No decisive technical difference; Axum's tower/middleware composition and tokio alignment made it the lower-friction fit beside a tokio-based client. |
+
+---
+
+### ADR-003 — Cargo workspace; `AGENTS.md` §3.1's tree applied per crate
+
+**Status:** Accepted
+
+#### Context
+
+`AGENTS.md` §3.1 specifies a module organization as a single `src/` tree, and §3.2 specifies layer
+rules for `core/`, `ui/`, `state/`, `network/`, `db/` and `platform/`. Read literally, that is a
+single-crate layout.
+
+The project needs three things: the client application, a wire crate shared with the server
+(ADR-002), and the server. Three crates with the client/server split cannot live in one
+`src/` tree.
+
+The risk in resolving this is losing the layer discipline. `AGENTS.md` §3.2's rules and §4.1's
+coverage floors are the mechanism that keeps business logic out of `ui/` and out of `network/`, and
+that mechanism is stated in terms of directory names, not crate names. A workspace must not become
+an excuse to relax them.
+
+#### Decision
+
+**A Cargo workspace.** The client lives at `crates/sh_nexus/`, alongside `crates/sh_nexus_wire/`
+and `crates/sh_nexus_server/`. **`AGENTS.md` §3.1's `src/` tree is applied inside each crate**, not
+at the repository root.
+
+The root `Cargo.toml` declares `[workspace] members = ["crates/sh_nexus"]` with shared
+`[workspace.package]` metadata and shared `[workspace.dependencies]` — which is where the pinned GPUI
+`rev` lives, so a crate can never drift onto a different pin.
+
+#### Consequences
+
+- **`AGENTS.md` §3.2's layer rules hold per crate.** Inside `crates/sh_nexus/src/`, the `core/` /
+  `ui/` / `state/` / `network/` / `db/` / `platform/` split is exactly as §3.1 specifies. The
+  boundary is not weakened by the workspace; it is reproduced in each crate that needs it.
+- **`core/` stays pure, and that is what makes the coverage floor reachable.** §3.2 forbids
+  `core/` from importing `gpui` or `tokio` and from touching the filesystem. A test that asserts
+  dependency direction is part of the plan, because the ≥90% floor for `core/` is unreachable if the
+  layer is impure. Theme *file watching* therefore lives in `platform/file_watch.rs`, and
+  `core/theme.rs` only parses and validates bytes it is handed.
+- **`state/bridge.rs` is the single seam.** `AGENTS.md` §7.3 forbids blocking `cx.update_global`
+  from non-UI threads while §3.2 forbids `network/` from importing GPUI. A named owner resolves the
+  tension: `network/` emits plain domain events and `bridge.rs` is the only module that calls
+  `cx.update_global` / `cx.update`, always on the main thread. Without a named owner, the obvious
+  implementation is the one that is prohibited.
+- **All mutations go through `state/actions.rs`**, per §3.2, so they stay auditable and testable.
+- **`AGENTS.md` §4.1's coverage floors apply to the client crate** — `core/` ≥90%, `network/` ≥80%,
+  `state/` ≥80%, `db/` ≥85%, utilities ≥85% — and are **extended to `sh_nexus_wire` and
+  `sh_nexus_server`**; see ADR-004 for why, and for the floor values.
+- **`§6.1`'s workspace-total floors apply across the workspace**: ≥75% minimum, ≥85% target.
+- **One `cargo test` covers all three crates.** No per-crate invocation to forget in CI.
+- **The pinned GPUI `rev` is declared once**, in `[workspace.dependencies]`, so the client cannot
+  accidentally depend on a different revision than the one ADR-001 pins.
+- **Test discovery is now workspace-wide and unforgiving.** Cargo auto-discovers `tests/*.rs` and
+  `tests/*/main.rs` **only**. Files at `tests/integration/*.rs` are silently never compiled or run —
+  a green build with all ten mandatory integration flows from `AGENTS.md` §8.1 missing. The
+  integration tests are therefore flat in `crates/sh_nexus/tests/`, named for their flows. This is
+  recorded as a risk in `PLAN.md` §14 and as a note in `crates/sh_nexus/tests/spike_render.rs`.
+
+#### Alternatives considered
+
+| Option | Why not chosen |
+|---|---|
+| **Single crate, all modules flat under `src/`** (a literal reading of `§3.1`) | The client and the server cannot share Rust types across a module boundary without the server becoming a library the client links — which would pull `axum` and the server's entire dependency tree into the client binary, against `AGENTS.md` §6.1's binary-size row and §6.3's 5MB-justification rule. Protocol drift between "two copies of the same type" becomes possible, which is the failure ADR-002 exists to prevent. |
+| Server in a **separate repository** (discussed under ADR-002) | Cannot share `sh_nexus_wire` as types. Weakens the one-definition guarantee and splits the CI matrix. |
+| **Nested workspaces** (a workspace inside a workspace) | No technical benefit here. Doubles the configuration surface for three crates, and `AGENTS.md` §2.2's "idiomatic Rust" standard argues against it. |
+| A flat repository with **three independent Cargo projects** and no workspace | Requires separate dependency declarations, so the GPUI pin could drift between them; requires three `cargo test` invocations; and no shared target directory, so the dependency tree is built more than once. Directly contradicts ADR-002's "one toolchain, one `cargo test`, one CI matrix". |
+| Keep the client at the repository root (`src/` at top level) and add `crates/` for the rest | Legal in Cargo, but it breaks the symmetry of "the client is a crate like the others" and makes the client's own root the odd one out. The uniform `crates/<name>/` layout is easier to reason about and is what `PLAN.md` §4 already documents. |
+
+---
+
+### ADR-004 — Extending `AGENTS.md`'s coverage floors and reconciling `PLAN.md`
+
+**Status:** Accepted
+
+#### Context
+
+`AGENTS.md` is the constitution. `PLAN.md` is subordinate. Where the two disagree, `AGENTS.md` wins
+and `PLAN.md` is the bug.
+
+**Rev 1** contradicted `AGENTS.md` in eight places. **Rev 2** was written to reconcile them, and an
+**independent conformance audit** of Rev 2 against `AGENTS.md` then found **4 blockers, 13 major and
+21 minor residual defects.** Rev 3 applied the audit corrections; Rev 4 records the Phase 0 result.
+
+Two of the four blockers were **self-inflicted** — introduced by Rev 2 while trying to fix Rev 1, and
+both are failure modes that produce a *green build over a void*:
+
+1. **`client_msg_id` omitted from PLAN's own frames.** Rev 2 asserted that every client WebSocket
+   frame must carry a client-generated `client_msg_id`, then omitted it from **three of its own five**
+   client frames. `AGENTS.md` §7.4 requires it on *every* client message for idempotent dedup across
+   reconnects. A plan that states the rule and then violates it in its own protocol listing is worse
+   than a plan that never states the rule, because the reader inherits the contradiction.
+2. **Integration tests in a path Cargo does not auto-discover.** Rev 2 placed the ten mandatory flows
+   from `AGENTS.md` §8.1 in `tests/integration/*.rs`. Cargo auto-discovers `tests/*.rs` and
+   `tests/*/main.rs` **only**. Files in `tests/integration/` are **silently never compiled or never
+   run** — a green build with all ten mandatory integration flows absent, and no error to indicate it.
+
+A third defect was a governance failure rather than a technical one: **Rev 2 declared `AGENTS.md`'s
+performance thresholds "targets, not gates."** A subordinate document may request an amendment
+through the ADR path; it may never pre-apply one. And doing so selectively — keeping the metrics one
+likes while suspending the two one does not — is renegotiation, not reconciliation. Corrected in
+Rev 3.
+
+Separately, `AGENTS.md` has an **internal** conflict: §4.1 requires `core/` ≥90% while §6.1 lists
+85% minimum / 95% target for the same area. Recorded in the appendix below.
+
+#### Decision
+
+1. **`AGENTS.md` is the constitution; `PLAN.md` is subordinate.** A subordinate document may
+   *request* an amendment to the constitution through the ADR path (`AGENTS.md` §9.2). It may
+   **never pre-apply one.** Rev 2's selective relaxation of §6.1/§6.2 is withdrawn; those thresholds
+   stand as written.
+2. **The constitution's internal conflict is resolved by taking the stricter value: `core/` ≥90%.**
+   §4.1's 90% is the binding floor. §6.1's 85% minimum / 95% target is read as a workspace-level
+   summary, not a competing figure. The conflict is recorded for amendment.
+3. **Coverage floors are extended to the two new crates:**
+
+   | Area | Minimum | Target |
+   |---|---|---|
+   | `core/` | **90%** | 95% |
+   | `network/` | 80% | — |
+   | `state/` | 80% | — |
+   | `db/` | 85% | — |
+   | Utilities | 85% | — |
+   | **`sh_nexus_wire/`** | **80%** | — |
+   | **`sh_nexus_server/`** | **80%** | — |
+   | **Workspace total** | **75%** | **85%** |
+   | New code, any task | 80% | — |
+
+   Both new floors are ≥80% because the wire crate and the server are new code, and
+   `AGENTS.md` §5.1 already sets "test coverage of new code ≥ 80%" as a pre-commit gate. The floor
+   follows the code; the code is new.
+
+4. **`sh_nexus_wire` ≥80% is not a formality — it is where the mandate actually lives.**
+   `AGENTS.md` §4.2 requires "Serde round-trips for every wire format; malformed payload rejection"
+   and `AGENTS.md` §7.4 requires explicit rejection of unknown major versions. Those requirements
+   are *about the wire crate*. §4.1's floors are keyed to client directory names (`core/`,
+   `network/`, `state/`, `db/`) and so do not reach a crate that contains no such directory.
+   Without an extension, the most protocol-critical code in the project would be the only code
+   exempt from a coverage floor — a gap that follows directly from §4.1's directory-keyed wording,
+   not from any disagreement about intent.
+
+#### Consequences
+
+- **Every `AGENTS.md` threshold stands as written.** Nothing in `PLAN.md` suspends a merge-blocking
+  gate. §6.1 and §6.2 are currently being met with room to spare (see ADR-005).
+- **The two test-void traps are closed and are now documented where they will be encountered**:
+  `PLAN.md` §4 carries a prominent warning about Cargo's test discovery, and
+  `crates/sh_nexus/tests/spike_render.rs` repeats it in its own module docs. Both `client_msg_id`
+  requirements and per-channel resync are now stated in `PLAN.md` §6 and §7, consistent with §7.4.
+- **The protocol is self-consistent.** `PLAN.md` §6 states the `client_msg_id` rule and every
+  client frame in the listing carries one. `PLAN.md` §7 makes resync **per channel**, because a
+  single global timestamp cannot reconstruct per-channel history when each channel has its own
+  `last_message_at` and its own unread count — which is what `AGENTS.md` §8.1's Reconnect Flow
+  ("no duplicates, no gaps") requires.
+- **Coverage enforcement covers the whole workspace**, and the two new crates are not a coverage
+  holiday. `cargo tarpaulin` runs across the workspace.
+- **`AGENTS.md` needs a follow-up amendment pass**, not a rewrite. Five of its own issues were found
+  during this work and are listed in the appendix below. None of them blocks Phase 1; all of them
+  will mislead an implementer who reads only the constitution.
+- **The precedent is the durable output.** A subordinate document that pre-applies its own
+  preferences is the failure mode this ADR exists to prevent, and it is now named in `PLAN.md`'s own
+  precedence rule at the top of the file.
+
+#### Alternatives considered
+
+| Option | Why not chosen |
+|---|---|
+| **Let `PLAN.md` relax the §6.1/§6.2 thresholds**, as Rev 2 did | Only the constitution may set or relax its own gates, and only through the ADR path. A subordinate document voiding merge-blocking thresholds — and doing it selectively — is renegotiation. Rejected on governance grounds regardless of whether the numbers would have been met. (In the event they would have been: see ADR-005.) |
+| **Take §6.1's 85% for `core/`** over §4.1's 90% | §6.1 is the summary table; §4.1 is the normative requirement and is the stricter of the two. When a document conflicts with itself, take the stricter value — it is the one that cannot be satisfied by doing less. |
+| **Leave `sh_nexus_wire` and `sh_nexus_server` with no floor**, arguing §4.1 does not mention them | Technically a literal reading of §4.1. Rejected because it exempts the most protocol-critical code in the project, and because §5.1's "new code ≥80%" gate already applies. The floor exists; §4.1 just cannot see it. |
+| **Add the wire/server coverage rows to `AGENTS.md` directly** | `AGENTS.md` was not modified — this ADR is the request, and the constitution is amended separately through the ADR path. Editing the constitution from a subordinate document is precisely the failure Rev 2 committed. |
+| **Rewrite `PLAN.md` from scratch** | The Rev 1 → Rev 2 → Rev 3 → Rev 4 sequence and its revision history are themselves an audit trail: they show which defects were found, by what check, and how they were closed. Discarding it would destroy the evidence and re-expose the project to the same defects. |
+
+---
+
+### ADR-005 — Relaxing `AGENTS.md` §6.1/§6.2 performance thresholds
+
+**Status:** **WITHDRAWN**
+
+> This ADR is **retained deliberately**. It records a relief request that was raised, and the
+> measurement that refuted it. Deleting it would leave the same hypothesis available to be
+> re-raised by the next person who guesses at GPUI's binary size.
+
+#### Context
+
+`PLAN.md` Rev 2 predicted the release binary would land in **tens of megabytes**, declared
+`AGENTS.md` §6.1's **30MB ceiling unachievable**, and **pre-drafted this relief ADR** in advance of
+measuring anything.
+
+The hypothesis behind it was written down in the constitution itself, in the note under §6.1's
+table:
+
+> "Note: GPUI statically links the renderer. Binary size is larger than typical Rust apps but
+> smaller than Electron."
+
+The plan read that note, inferred a large static renderer, and treated the inference as settled
+fact. It was an assumption, not a measurement. `AGENTS.md` §2.3 is explicit on the difference:
+*"Profile before optimizing. Measure, don't guess."*
+
+The predicted remedy — amending §6.1's binary-size row — is exactly the kind of action `AGENTS.md`
+§9.2 reserves for the ADR path, and exactly the kind of pre-application `PLAN.md`'s own precedence
+rule forbids. Writing the ADR early was, in fairness, an attempt to do it through the proper path.
+The defect was not the process; it was that the premise was never tested.
+
+#### Decision
+
+**None.**
+
+#### Consequences
+
+**The hypothesis was refuted by measurement.** The Phase 0 spike measured the release binary at
+**9.92 MB** (10,401,792 B) — **3× under the 30MB maximum and 2× under the 20MB target.** The
+ceiling `AGENTS.md` §6.1 calls unachievable is met with more than 20MB to spare.
+
+The underlying factual claim is also false: **GPUI does not statically link its renderer on
+Windows.** `gpui_windows` is pure Rust over the `windows` crate, with a hand-written **D3D11**
+renderer and **DirectWrite** text. There is no `blade`, no `shaderc`, no Vulkan, and no DXC. The
+only shader tool is `fxc.exe` (shader model 4.1), required for release builds only.
+
+**`AGENTS.md` §6.1 needed no amendment.** Its numbers stand as written and are currently being met
+with room to spare. The relief request is withdrawn in full — context, decision, and the draft
+amendment it would have produced.
+
+**The note under `AGENTS.md` §6.1's table is the surviving loose end.** The binary-size row itself is
+correct and met; the explanatory note carries the false premise. That note should be corrected
+through the amendment path. It is deliberately *not* listed in the appendix below, which is scoped
+to defects that affect implementation.
+
+**The remaining open item is the delta, not the total.** The spike linked only `gpui` +
+`gpui_platform`. The dependencies the real application needs were not measured: `syntect`, `reqwest`
+with TLS, bundled SQLite, `rodio`, `notify-rust`. The 9.92MB figure is a **floor**, not a
+projection, and the delta is genuinely unmeasured. It is a **Phase 3 exit criterion**, to be
+measured when those crates actually land (`PLAN.md` §11).
+
+**`AGENTS.md` §6.3's rules apply from here.** Any increase >5MB in binary size requires
+justification, and a regression >10% in any performance metric blocks the merge — against the
+measured baseline, not against a guess.
+
+**The methodological lesson is recorded where it will be read next.** A constitutional note asserting
+a fact about a third-party framework is a hypothesis with the authority of a rule attached. It gets
+tested before it gets obeyed.
+
+#### Alternatives considered
+
+| Option | Why not chosen |
+|---|---|
+| **Raise the §6.1 binary-size ceiling to ~50MB** (the pre-drafted amendment) | Refuted by measurement. The ceiling is not merely met, it is met with a 3× margin. Amending a working threshold to accommodate a hypothesis that measurement disproved would be a governance failure with an invented justification. |
+| **Lower the ceiling to reflect the 9.92MB result** | Tempting, and rejected. The 9.92MB figure excludes `syntect`, `reqwest`, bundled SQLite, `rodio` and `notify-rust`. Lowering the ceiling now would set a bar against a partial build and invite a future amendment request when the real number lands. §6.1's current numbers are already met; leave them. |
+| **Delete this ADR** | A withdrawn decision is a decision. Removing it destroys the record of *why* the hypothesis was rejected and makes the next guess cheaper to make. The record is the output. |
+| **Amend §6.2's latency rows too**, on the argument that GPUI's unproven 120fps path invalidates them | No evidence. The latency rows are not yet measured at all, and nothing in the spike contradicts them. Guessing at a second, unrelated set of thresholds is the same error as the first. |
+
+---
+
+### ADR-006 — Row estimator for the virtualized message list
+
+**Status:** **Proposed — NOT ACCEPTED. Not in force. Do not implement as settled.**
+
+> Phase 2 has not started. This ADR is open for review. `PLAN.md` §8, Phase 2 states the
+> **compliance** plan below, which is what will be built in the meantime; that plan is not this ADR's
+> decision, and Phase 2 does not depend on this ADR resolving first.
+
+#### Context
+
+`AGENTS.md` §7.3 is explicit and mandatory:
+
+> "Virtualized lists: Message lists must render only visible items. **Use a uniform row estimator and
+> recycle.**"
+
+A **uniform** row estimator assumes every row is the same height. That assumption holds for a list of
+fixed-height items and is the standard, correct approach for one. It does not hold for a chat
+message list.
+
+Markdown and code blocks make true message row heights **genuinely variable** within a single
+channel: a one-word message, a five-line paragraph, a fenced code block, a message with reaction chips
+underneath — all in the same viewport, all different heights, and none of them predictable from the
+message's metadata without laying the text out. Wrapping width alone makes height a function of
+viewport width, so heights are not even stable across window resizes.
+
+`AGENTS.md` §1 lists the project's core priorities in order, and the first is **Responsiveness**:
+"120fps UI, <16ms message render, **zero jank while receiving messages**." §6.2 sets scroll frame
+time at **<8ms** for 10k virtualized messages. A uniform estimator against variable-height content
+forces the scroll position to be computed from an assumption the data contradicts: the scrollbar
+thumb is wrong, `scroll_to` overshoots or undershoots, and a newly-arrived message lands at the wrong
+offset. That is visible jank, against the project's highest priority, caused by a rule written for a
+different data shape.
+
+This is a genuine conflict inside the constitution, not a preference: §7.3's uniform estimator
+directly threatens §1's zero-jank priority and §6.2's <8ms frame-time target. `AGENTS.md` §3.2
+already anticipates layer rules adapting to context; the same latitude is warranted here.
+
+#### Decision
+
+**Pending. This ADR proposes, and does not decide.**
+
+The proposed decision, for review:
+
+1. **Implement the `AGENTS.md` §7.3 uniform estimator as the specified default and first-pass
+   fallback.** For every row that has not yet been rendered, the estimator's value is used. §7.3 is
+   complied with literally on first paint.
+2. **Layer measured per-row heights on top as a superset, once a row has actually been rendered.** A
+   row's measured height replaces the estimate in the height cache; the estimate remains the answer
+   for unmeasured rows. This is the standard measured/virtualized-list pattern — estimate, then
+   correct — and it is a **superset of §7.3, not an override of it**: §7.3's estimator remains the
+   mechanism, and it remains the fallback.
+3. **Recycling is unaffected.** §7.3's recycle requirement stands as written and is not in question.
+   Only the height source changes.
+4. **This ADR proposes amending `AGENTS.md` §7.3** to say "a uniform row estimator, refined by
+   measured heights where available" for lists whose content is variable-height, and to keep the
+   strict uniform estimator for genuinely uniform lists.
+
+**Rationale for framing it as compliance rather than override:** point 1 satisfies §7.3 exactly as
+written. Point 2 adds a refinement that §7.3 does not prohibit — §7.3 mandates an estimator, not a
+prohibition on knowing better numbers. Whether that reading is acceptable is precisely what the
+review of this ADR is for, which is why it is Proposed and not Accepted.
+
+#### Consequences (of the proposed decision, if accepted)
+
+- **Scroll position becomes correct rather than approximate**, for the common case where a channel's
+  visible rows have been rendered at least once.
+- **First paint of a scrolled-to-middle channel remains estimate-based** — the accuracy of the
+  scrollbar before those rows have been seen is bounded by the estimator, exactly as §7.3 intends.
+  This is the residual cost of compliance, and it is the honest limit of the proposal.
+- **Window resizes invalidate measured heights**, since wrapping width changed. They must be
+  recomputed or discarded on resize; the estimate is the correct answer in the gap.
+- **The height cache must be bounded**, per `AGENTS.md` §7.1's prohibition on unbounded in-memory
+  growth. A 10,000-message channel must not retain 10,000 measured heights indefinitely.
+- **§6.2's <8ms scroll frame time becomes measurable for the first time**, since correct scroll
+  position is a precondition for the measurement to mean anything.
+- **If this ADR is rejected**, the uniform estimator stands as written and §1's zero-jank priority is
+  at risk for variable-height content. That is a legitimate outcome and would be an explicit decision
+  to accept a known trade-off — but it should be a decision, not a default.
+
+**Open questions for review:**
+
+- Does the "superset, not override" reading of §7.3 hold, or is any estimator refinement an override?
+- Should measured heights be keyed by viewport width, and discarded on resize?
+- What is the correct bound and eviction policy for the height cache?
+- Does §7.3 need a carve-out for variable-height lists, or is a general rewrite cleaner?
+
+#### Alternatives considered
+
+| Option | Why not chosen (yet) |
+|---|---|
+| **Strict uniform estimator**, as §7.3 says | Correct for fixed-height lists; wrong for chat content. Kept as the specified default and first-pass fallback under the proposal, and it is the fallback if this ADR is rejected. Rejecting it outright now would be a decision taken without Phase 2 evidence. |
+| **Measure everything up front** — lay out and measure all N rows before the first paint | Correct scroll position immediately, and correct for every row. Rejected on performance: it is O(N) layout work on channel switch, against §6.2's <100ms cold channel-switch budget for 500 messages, and it is exactly the "render 10,000 elements" anti-pattern §2.3 forbids. |
+| **No estimator; virtualize on a measured-only basis** | Cannot scroll to an unrendered row at all, because the position is unknown. Rejected: a list you cannot scroll through is not a list. |
+| **A per-content-class estimator** (one estimate for text, one for code blocks, one for reactions) | Genuinely better than a single uniform value, and a plausible refinement. Not proposed here because it is a bigger change to §7.3 than the amendment this ADR requests, and it presumes a content-classification step that `core/markdown.rs` has not yet produced. Revisit after Phase 2 has real measurements. |
+| **Ignore variable heights** and normalize every message bubble to a fixed height | Avoids the problem by removing the feature. Rejected: `AGENTS.md` §10 and §4.2 require Markdown and code-block rendering, so variable height is a requirement, not an accident. |
+| **Defer entirely** until Phase 2 shows measurable jank | Rejected as a default. §1's zero-jank priority is stated as a priority, not a nice-to-have, and "measure first" applies to the *magnitude* of the problem, not to whether a known-correctness gap in scroll positioning is worth writing down while it is still cheap to change. |
+
+---
+
+## Appendix — Defects found in `AGENTS.md`
+
+The constitution's own issues, surfaced during this work. **Not this file's to fix** — the
+constitution is not modified from a subordinate document (ADR-004) — but recorded here so they are
+not rediscovered later, and so an amendment pass has a queue to work from.
+
+1. **§4.1 contradicts §6.1 on the same metric.** §4.1 requires `core/` ≥90% coverage; §6.1's table
+   lists 85% minimum / 95% target for "Test coverage (`core/`)". Two figures for one requirement.
+   **Resolution taken:** the stricter **90%** is binding (ADR-004, decision 2). §6.1's row is read as
+   a workspace-level summary rather than a competing figure.
+
+2. **§1's platform description is incomplete, and the omission is what caused ADR-001's central
+   confusion.** §1 attributes Windows rendering to "DirectX" and does not mention that **windowing
+   uses Win32** and **text uses DirectWrite**. The DirectX 11 claim is correct for *rendering* — the
+   Windows backend is D3D11 — but a reader who takes "DirectX" as the whole platform picture
+   confuses the renderer with the windowing and text stacks. The same sentence names Vulkan for
+   Linux, where `gpui_wgpu` is in fact wgpu-based; the macOS "Metal" claim is correct. Upstream's
+   Windows path is **D3D11 + Win32 + DirectWrite**.
+
+3. **§12's `ls -lh target/release/sh_nexus` is Unix-only**, in a project whose §5.2 requires manual
+   QA on **Windows, macOS and Linux**. The command works on two of the three required platforms and
+   produces `command not found` on the third. A cross-platform equivalent is needed
+   (`Get-Item target\release\sh_nexus.exe | Select-Object Length` on Windows/PowerShell). §6.1's table
+   has the same `ls -lh` problem in its Tool column. §6.2's `/usr/bin/time -v` is Unix-only for the
+   same reason.
+
+4. **§4.1's coverage floors are keyed to client directory names** — `core/`, `network/`, `state/`,
+   `db/`, "utilities" — and therefore do not cover `sh_nexus_wire` or `sh_nexus_server`, which contain
+   none of those directories. §4.2's "serde round-trips for every wire format" mandate lives in the
+   wire crate, so a literal reading of §4.1 exempts the most protocol-critical code in the project
+   from any floor. **Extension recorded in ADR-004** (both new crates ≥80%); the constitution should
+   say so rather than leaving the gap implicit.
+
+5. **§7.3's "uniform row estimator" is likely wrong for variable-height chat lists.** Markdown and
+   code blocks make row heights genuinely unpredictable, so a uniform estimator produces incorrect
+   scroll positions and jank against §1's zero-jank priority and §6.2's <8ms frame-time target. The
+   rule is correct for fixed-height lists and wrong for this one. **ADR-006 proposes the amendment**
+   and is **Proposed, not Accepted**; `PLAN.md` §8, Phase 2 complies with §7.3 as written in the
+   meantime.
+
+Additionally, and outside the numbering above because it affects no implementation: the **note under
+§6.1's table** — "Note: GPUI statically links the renderer" — is **factually false** and was the
+origin of the refuted hypothesis in ADR-005. The binary-size row itself is correct and currently
+met; the note is what needs correcting. See ADR-005.
