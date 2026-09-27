@@ -1,0 +1,17 @@
+# Normalize line endings to LF in the repository; check out LF on every platform.
+#
+# This project is developed on Windows and verified on Windows, macOS and Linux
+# (AGENTS.md section 5.2), so the working tree must not carry platform-specific
+# line endings. Without this, git warns on every Windows checkout and CRLF can
+# leak into files that were authored with LF.
+* text=auto eol=lf
+
+# Binary assets that must never be touched.
+*.wav      binary
+*.png      binary
+*.ico      binary
+*.icns     binary
+*.ttf      binary
+*.otf      binary
+*.db       binary
+*.sqlite   binary
