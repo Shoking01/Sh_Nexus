@@ -19,3 +19,125 @@
 .DS_Store
 Thumbs.db
 *.swp
+*~
+*.orig
+*.rej
+
+# Editor / IDE state.
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.template.json
+*.code-workspace
+
+# ---------------------------------------------------------------------------
+# LOCAL-ONLY DEVELOPMENT ARTIFACTS
+#
+# Working documents that exist to drive development and are of no use to a
+# reader of the repository. They are machine-local by design: the authoritative
+# record of a decision is the ADR in docs/ARCHITECTURE.md, not the scratch file
+# that produced it.
+# ---------------------------------------------------------------------------
+
+# Organic Driven Development task state (`odd/tasks/<feature>.md` and the
+# Engram mirror under `odd/<feature>/`). This is the orchestrator's working
+# checklist, rewritten on every task. The durable output of that work is the
+# code, its tests, and the ADRs.
+odd/
+
+# Spec-Driven Development artifacts. `openspec/` is the file-based SDD store;
+# Engram is the default store and lives outside the repository entirely, so it
+# needs no rule here. A change's specs and designs are summarised into
+# docs/ARCHITECTURE.md before a change is considered done.
+openspec/
+.sdd/
+specs/
+.specs/
+
+# Agent scratch and per-machine agent configuration. Any `*.local.md` is a
+# per-machine override of a versioned file of the same name, so the shared
+# version stays the committed default.
+.opencode/
+.claude/
+.cursor/
+*.local.md
+*.local
+.local/
+
+# Session notes, scratch and working capture. Never part of the deliverable.
+notes/
+scratch/
+journal/
+tmp/
+*.notes.md
+TODO.local.md
+BRAINSTORM.local.md
+
+# Coverage and profiling output. `cargo tarpaulin` and `cargo flamegraph` write
+# these into the working directory; they are regenerated, never reviewed.
+*.profraw
+*.profdata
+lcov.info
+lcov-report/
+tarpaulin-report.html
+cobertura.xml
+coverage.xml
+coverage/
+flamegraph.svg
+*.flamegraph.svg
+perf.data*
+
+# Local benchmark output. Benchmarks are code (committed); their output is not.
+target/criterion/
+bench-out/
+
+# Locally generated test data. AGENTS.md section 8.2 requires large message
+# histories to come from proptest generators rather than checked-in files, so
+# anything produced by a generator run is disposable.
+#
+# NOTE: `crates/*/tests/fixtures/` is deliberately NOT ignored. AGENTS.md
+# section 8.2 requires a real fixture set there (valid + invalid theme JSON, a
+# recorded WebSocket session as JSONL, message payloads per protocol version).
+# The generator output is ignored; the committed fixtures are not.
+generated/
+**/generated-testdata/
+
+# Local development databases. Scoped to known dev locations so this cannot
+# accidentally swallow the committed fixture databases under tests/fixtures/.
+*.db-shm
+*.db-wal
+/sh_nexus.db*
+/*.db
+/*.db-shm
+/*.db-wal
+/data/
+/var/
+!crates/*/tests/fixtures/
+
+# Secrets and local environment. Never commit these; the token store belongs in
+# the OS keychain behind the `platform/` abstraction (AGENTS.md section 7.1).
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!tests/fixtures/**/*.pem
+secrets/
+credentials.json
+
+# ---------------------------------------------------------------------------
+# DELIBERATELY NOT IGNORED
+#
+# These are the repository's actual documentation and they stay tracked:
+#   README.md              entry point, prerequisites, platform gotchas
+#   AGENTS.md              the project constitution; AGENTS.md sections 5.1,
+#                          5.3 and 12 reference it for the QA and review
+#                          process, so a clone without it cannot reproduce CI
+#   PLAN.md                the implementation plan and the Phase 0 evidence
+#   docs/ARCHITECTURE.md   the ADRs; the durable record of every decision
+#   docs/DEPENDENCIES.md   the section 7.2 dependency audit
+#   docs/API.md            the wire protocol and version negotiation
+#
+# Note that ignoring any of them now would not remove them from history: they
+# are already pushed. Gitignore affects future adds only.
+# ---------------------------------------------------------------------------
