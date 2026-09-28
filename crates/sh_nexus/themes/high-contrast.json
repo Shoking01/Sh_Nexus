@@ -1,0 +1,26 @@
+{
+  "name": "Sh_Nexus High Contrast",
+  "author": "Sh_Nexus",
+  "version": 1,
+  "colors": {
+    "background": "#000000",
+    "surface": "#141414",
+    "sidebar": "#242424",
+    "text": "#ffffff",
+    "text_muted": "#d8d8d8",
+    "accent": "#4ea1ff",
+    "accent_hover": "#8ec6ff",
+    "danger": "#ff5c52",
+    "success": "#5ce68a",
+    "mention": "#ffd866",
+    "code_block_bg": "#0a0a0a",
+    "bubble_self": "#4a4a4a",
+    "bubble_other": "#1a1a1a"
+  },
+  "spacing": { "xs": 4, "sm": 8, "md": 16, "lg": 24 },
+  "radii": { "sm": 0, "md": 0, "lg": 0 },
+  "typography": {
+    "family": "Inter",
+    "sizes": { "caption": 13, "timestamp": 12, "body": 15, "title": 20 }
+  }
+}

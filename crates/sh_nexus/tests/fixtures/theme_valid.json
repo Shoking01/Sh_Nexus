@@ -1,0 +1,26 @@
+{
+  "name": "Fixture Valid Theme",
+  "author": "Sh_Nexus test suite",
+  "version": 1,
+  "colors": {
+    "background": "#14161c",
+    "surface": "#1e2129",
+    "sidebar": "#101218",
+    "text": "#e4e7ee",
+    "text_muted": "#949aab",
+    "accent": "#5b8def",
+    "accent_hover": "#7aa4f5",
+    "danger": "#e5534b",
+    "success": "#57ab5a",
+    "mention": "#d9b56b",
+    "code_block_bg": "#0b0d12",
+    "bubble_self": "#2a2f3c",
+    "bubble_other": "#1e2129"
+  },
+  "spacing": { "xs": 4, "sm": 8, "md": 16, "lg": 24 },
+  "radii": { "sm": 4, "md": 8, "lg": 16 },
+  "typography": {
+    "family": "Inter",
+    "sizes": { "caption": 11, "timestamp": 10, "body": 14, "title": 16 }
+  }
+}

@@ -48,15 +48,18 @@ thiserror = { workspace = true }
 
 # serde_json: `AGENTS.md` 2.2 mandates it, and it is the encoding sh_nexus_wire
 # speaks, so this crate decodes the same JSON the wire crate encodes. Used in
-# exactly two places: `errors.rs`, whose Serialization variant wraps
-# `serde_json::Error` with a real `#[from]`, and the boundary tests.
+# exactly three places: `errors.rs`, whose Serialization variant wraps
+# `serde_json::Error` with a real `#[from]`; `core/theme.rs`, which parses a
+# theme document's bytes with it and derives nothing; and the boundary tests.
 #
 # NOTE: this crate does NOT depend on `serde` itself. Nothing in the client
 # derives Serialize or Deserialize -- that is the wire/domain boundary
 # (`PLAN.md` section 5), and adding `serde` here would put the derive macros one
 # `use` away from core/models. crates/sh_nexus/tests/layer_boundary.rs scans
-# core/ for the word "serde"; a dependency would make that scan pass for the
-# wrong reason.
+# core/ for the word "serde" and admits exactly one spelling of it,
+# `serde_json`; a `serde` dependency would make that scan fail for the right
+# reason, and the check itself is
+# `core_admits_serde_json_and_still_rejects_serde`.
 serde_json = { workspace = true }
 
 # chrono: `AGENTS.md` 2.1 requires chrono::DateTime<Utc> for every timestamp and

@@ -9,7 +9,8 @@ coverage drop merge-blocking, which requires a baseline to drop *from*. This fil
 It is a **record of measurement, not a claim of compliance.** Where a floor cannot yet be measured,
 §3 says so explicitly rather than letting an absent row read as a pass.
 
-**Recorded:** 2026-09-28 · **work unit 1C-2b** · Windows, MSVC, rustc 1.98.1
+**Recorded:** 2026-09-28 · **work unit 1D** · Windows, MSVC, rustc 1.98.1
+**Prior:** 2026-09-28 · work unit 1C-2b · same environment
 **Prior:** 2026-09-27 · work unit 1C-2a · same environment
 **Prior:** 2026-09-27 · work unit 1C-1 · same environment
 **Prior:** 2026-09-27 · work unit 1B · same environment
@@ -18,10 +19,31 @@ It is a **record of measurement, not a claim of compliance.** Where a floor cann
 `AGENTS.md` §6.3 makes a coverage drop merge-blocking, and a drop is only
 meaningful against a prior number, so **every** recording is kept: 1B's figures are
 in §2.5 as a delta table against 1A, 1C-1's delta is §2.7, 1C-2a's live figures were the
-§2.1–§2.2 tables this recording replaced, and 1C-2b's delta is **§2.8**. Where a prior
+§2.1–§2.2 tables this recording replaced, 1C-2b's delta is **§2.8**, and 1D's is
+**§2.10**. Where a prior
 recording made a prediction that measurement then refuted, that is recorded
 as a refutation rather than quietly corrected — `PLAN.md` Rev 2's whole history is predictions that
 measurement did not support.
+
+**The headline of 1D is the largest single-work-unit rise in this file's history, and the
+interesting part is a coverage report finding two real gaps that 785 passing tests had
+missed.** `core/theme.rs` entered at **98.93% regions and 99.78% lines** on its first
+measurement, but the first measurement was of an *incomplete* suite: `cargo llvm-cov
+--show-missing-lines` named three unexecuted regions, and two of them were not unreachable
+arms at all — a label field holding a JSON number, and the `Display` of the
+oversize error. Both were closed with four tests, and the file finished at **98.93% /
+99.78%** with a single missed line: the arm §6 of its own module documentation calls
+unreachable. **`core/` rose 0.81 points to 97.76%** and the workspace total rose 1.41 to
+**95.80%**, both far more than 1D's new file alone can account for, and §2.11 shows where
+the rest came from: ten regions of previously-uncovered `errors.rs`, which entered the
+report for the first time because 1D gave it a `From` impl.
+
+**The mutation table (§5.6) is the more interesting half of 1D, and its first draft was
+worse than the table it replaces.** Three of nine deliberate defects were caught by exactly
+**one** test each, against `cache.rs`'s minimum of five — and two of the three landed on
+decisions this file's own §4 calls load-bearing. That is reported rather than smoothed, and
+the two cheapest of them were then strengthened and **re-measured**, with both numbers
+recorded.
 
 **The headline of 1C-2b is that no aggregate regressed, and the interesting part is a pair of
 arithmetic errors in the recording immediately before this one.** `core/cache.rs` grew from 125
@@ -553,6 +575,148 @@ file at `markdown.rs`'s ~96% would pull the layer down by roughly 0.5 points and
 `ordering.rs`'s 100% would push it up by roughly 0.4, on a denominator of about 1,214. **Both
 directions are recorded in advance so that 1D cannot quietly report whichever one it likes.**
 
+### 2.10 The 1D delta, and the score of §2.9's prediction
+
+| Aggregate | 1C-2b | 1D | Δ |
+|---|---|---|---|
+| `sh_nexus\src\core\theme.rs` | *did not exist* | **98.93%** regions / 99.78% lines (842 regions, 9 missed, 463 lines, 1 missed) | new |
+| `sh_nexus\src\core\cache.rs` | 99.44% / 100.00% | 99.44% / 100.00% | **none** |
+| `sh_nexus\src\core\markdown.rs` | 95.74% / 94.98% | 95.74% / 94.98% | **none** |
+| `sh_nexus\src\core\ordering.rs` | 100.00% / 100.00% | 100.00% / 100.00% | **none** |
+| `sh_nexus\src\errors.rs` | **no report row** — see §2.10.1 | 100.00% / 100.00% (3 regions, 0 missed) | new |
+| `sh_nexus\src\lib.rs` | 60.81% / 67.68% | 60.81% / 67.68% | **none** |
+| `sh_nexus\src\main.rs` | 0.00% / 0.00% | 0.00% / 0.00% | **none** |
+| `sh_nexus\src\network\mapping.rs` | 99.40% / 100.00% (modal) | 99.40% / 100.00% | **none** (see §2.6) |
+| `sh_nexus_wire\src\error.rs` | 100.00% / 100.00% | 100.00% / 100.00% | **none** |
+| `sh_nexus_wire\src\frame.rs` | 98.82% / 100.00% | 98.82% / 100.00% | **none** |
+| `sh_nexus_wire\src\version.rs` | 100.00% / 100.00% | 100.00% / 100.00% | **none** |
+| **`core/` as a layer** | **96.95%** (1177/1214) | **97.76%** (2010/2056) | **+0.81** |
+| `sh_nexus_wire` as a crate | 98.95% / 100.00% | 98.95% / 100.00% | **none** |
+| `sh_nexus` as a crate | 93.88% / 94.30% (1596/1700) | **95.56% / 95.81%** (2432/2545) | **+1.68 / +1.51** |
+| **Workspace total** | **94.39% / 94.95%** (1890 regions, 106 missed) | **95.80% / 96.17%** (2735 regions, 115 missed) | **+1.41 / +1.22** |
+
+**Eight rows are unchanged to the decimal, and that is the control.** 1D touched no line
+of `cache.rs`, `markdown.rs`, `ordering.rs`, `lib.rs`, `main.rs`, `mapping.rs` or any
+wire-crate file, and the tool reports exactly what 1C-2b reported for all eight. §2.6's
+instability in `mapping.rs` did **not** reproduce: two runs in 1D were byte-identical
+including that row, at its recorded modal value of 2 missed regions.
+
+**Every aggregate rose, and the crate-level rise is mostly not `theme.rs`.** `sh_nexus` as
+a crate gained 1.70 points, while `theme.rs` alone is 842 of 2545 crate regions at 98.93% —
+which contributes about +0.4. The remaining ~1.3 points come from §2.10.1, and reading the
+crate figure as "1D's new file was good" would be the same misreading §2.8 warned about.
+**The per-layer and per-file rows are the signals; the crate figure is arithmetic** — and
+this recording is a second demonstration of why, in the direction that flatters.
+
+**§2.9's prediction, scored.** 1C-1 and 1C-2a left a falsifiable two-branch prediction:
+*"a new file at `markdown.rs`'s ~96% would pull the layer down by roughly 0.5 points and a
+file at `ordering.rs`'s 100% would push it up by roughly 0.4, on a denominator of about
+1,214. Both directions are recorded in advance so that 1D cannot quietly report whichever
+one it likes."*
+
+`theme.rs` landed at **98.93%**, between the two anchors, and pushed `core/` **up 0.81**.
+
+- **The sign was predicted correctly.** The prediction's real content was "this will not
+  fall", and it did not fall.
+- **The magnitude fell outside both stated branches**, and above the optimistic one. +0.81
+  against a predicted +0.4 is roughly double. The prediction's arithmetic assumed the new
+  file's size, and it under-estimated it by a factor of seven: 842 regions against the
+  ~1,214 *whole layer* the note used as its denominator, where 1C-1's `markdown.rs` had
+  been 846 at a comparable scale but arrived on a layer three times smaller.
+- **So the prediction is recorded as half-refuted.** It got the direction right on
+  evidence, and it framed the outcome as binary between two anchors that were never going
+  to bracket it. A falsifiable prediction that survives only its sign is worth less than
+  one that states a range — which is the form the next one should take.
+
+#### 2.10.1 `errors.rs` left §2.3's list, and why that is a real change
+
+`sh_nexus\src\errors.rs` was in §2.3's category of files that produce **no report row at
+all**, because until 1D it held no executable code: a `#[derive(Error)]` enum, a type alias,
+and a doctest. 1D added `impl From<ThemeError> for ShNexusError`, which is three regions
+and is executed by `a_theme_rejection_converts_into_the_project_error_type`.
+
+This is a **new row in §2.1** rather than a change to an existing one, so §2.3 is not
+edited. It is worth its own paragraph because the mechanism is the one §5.3's closing note
+is about: a coverage table can only work on code that exists, and the single most
+consequential structural decision 1D made — that `core/` cannot name `ShNexusError`, so the
+conversion lives on the other side of the boundary — is enforced by *tests*
+(`core_reaches_only_its_own_modules`, `errors_is_a_sibling_of_core_not_a_member_of_it`) and
+therefore has no coverage row either. **The `From` impl is the visible half; the absence of
+a `use crate::errors` in `core/` is the invisible half, and only the second one is
+load-bearing.**
+
+#### 2.10.2 1D's proptest regressions file, and what is in it
+
+`crates/sh_nexus/tests/theme.proptest-regressions` is **committed, and §1's rule about
+the 1C-2b file applies to it unchanged**: the seeds are replayed before any novel case
+is generated, so the suite is more reproducible than it was before them, and the file
+must not be deleted as noise.
+
+It holds **two** seeds, and both are defects in the *test suite*, not in the code under
+test — which is the first time this project has recorded that, and the reason is worth
+stating:
+
+| Seed | The failure it pins | How it was found |
+|---|---|---|
+| `954b9f15…` | The generator emitted `"colors":{… thirteen entries…,}` — a **trailing comma**, which JSON forbids. Every generated document was invalid | `a_generated_valid_theme_always_parses_to_what_it_encoded` |
+| `08a08fde…` | `arbitrary_label` could produce a **whitespace-only** label, which the schema correctly refuses — so the property was failing *for the correct reason* with a misleading message | the same property |
+
+**The second is the one worth keeping as a lesson, and it is the same shape as M9's in
+§5.6.1.** A generator that produces inputs the specification *forbids* will fail its
+property for the right reason with a message that points at the wrong thing, and the
+instinct is to blame the validator. Here the validator was right and the generator was
+wrong, and the fix was to anchor the generated label on a leading letter. **A property's
+generator has to be checked against the specification, not only against the
+implementation** — the implementation is what the property is testing, so agreement with
+it is not evidence the generator is right.
+
+Both seeds are now replayed on every run, so neither defect can come back silently.
+
+### 2.11 The four reconciliation sums, printed
+
+The invariant §1 adopted after two arithmetic errors: **crate + wire must equal the tool's
+TOTAL in the denominator and in the covered count, in both columns.** Derived aggregates
+are demonstrated against the TOTAL before they are written. Four sums, from §2.1's rows:
+
+```text
+regions:  178 + 846 + 190 + 842 +   3 + 148 +   7 + 331 +   4 + 169 +  17 = 2735
+missed:     1 +  36 +   0 +   9 +   0 +  58 +   7 +   2 +   0 +   2 +   0 =  115
+covered: 2735 − 115 = 2620          2620 / 2735 = 95.80%   <- matches 2.1's TOTAL exactly
+
+lines:    132 + 618 + 143 + 463 +   3 +  99 +   7 + 229 +   3 + 139 +  17 = 1853
+missed:     0 +  31 +   0 +   1 +   0 +  32 +   7 +   0 +   0 +   0 +   0 =   71
+covered: 1853 −  71 = 1782          1782 / 1853 = 96.17%   <- matches 2.1's TOTAL exactly
+```
+
+And the two crates against each other, in both columns:
+
+```text
+sh_nexus      2545 regions (113 missed)  +  sh_nexus_wire   190 regions (  2 missed)  =  2735 (115)  OK
+               1694 lines   ( 71 missed)  +                  159 lines   (  0 missed)  =  1853 ( 71)  OK
+               2432 covered               +                  188 covered               =  2620         OK
+```
+
+**The three aggregates §2.2 publishes, each derived from the rows above rather than
+carried forward, and each cross-checked against the TOTAL:**
+
+```text
+core/ as a layer:    178 + 846 + 190 + 842 = 2056 regions;  1 + 36 + 0 + 9 = 46 missed
+                     2056 − 46 = 2010       2010 / 2056 = 97.76%
+                       132 + 618 + 143 + 463 = 1356 lines;  0 + 31 + 0 + 1 = 32 missed
+                       1356 − 32 = 1324       1324 / 1356 = 97.64%
+
+sh_nexus as a crate: 2545 regions, 113 missed  ->  2432 / 2545 = 95.56%
+                      1694 lines,    71 missed  ->  1623 / 1694 = 95.81%
+                      (2545 + 190 = 2735 and 113 + 2 = 115: the crates sum to the TOTAL above)
+
+sh_nexus_wire crate:  190 regions,  2 missed  ->   188 /  190 = 98.95%
+                       159 lines,    0 missed  ->   159 /  159 = 100.00%
+```
+
+**Both columns reconcile, for the fourth consecutive recording, and the line column
+reconciles as §2.4 established rather than by accident.** The region column — the one
+ADR-004's floors rest on — is the one every verdict in §3 uses.
+
 ---
 
 ## 3. Verdict against each floor
@@ -640,7 +804,41 @@ margin that depends on a file nobody can test: the two sub-80% files are
 `lib.rs` and `main.rs`, both characterised in §4.1–§4.2 as the window-opening
 path that Phase 2 moves, and neither is in a directory §4.1 names.
 
+### 3.5 The 1D verdicts, added rather than folded into §3.1–§3.4
 
+§3.1–§3.4 are the 1C-2b verdicts and are left as they were. These are the 1D
+measurements against the same floors, each recomputed from §2.1's rows at the
+moment of writing per §1's rule.
+
+| Floor | Source | 1C-2b | **1D** | Verdict |
+|---|---|---|---|---|
+| Workspace total ≥75% min / ≥85% target | `AGENTS.md` §6.1 | 94.39% | **95.80%** regions (2620/2735, two identical runs) | **PASSES target, +10.80** |
+| `sh_nexus_wire` ≥80% | ADR-004 decision 3 | 98.95% | **98.95%** (188/190) | **PASSES — unchanged, no wire file touched** |
+| `core/` ≥90% | `AGENTS.md` §4.1, ADR-004 decision 2 | 96.95% (1177/1214) | **97.76%** (2010/2056) | **PASSES — +7.76 over the floor** |
+| New code ≥80% | `AGENTS.md` §5.1, ADR-004 | `cache.rs` 99.44% | **`theme.rs` 98.93%** (833/842) | **PASSES** |
+| `network/` ≥80% | `AGENTS.md` §4.1 | `mapping.rs` 99.40% | `mapping.rs` **99.40%** | **PASSES — unchanged** |
+| `state/`, `db/`, utilities ≥80/85% | `AGENTS.md` §4.1 | n/a | directories do not exist yet | Not applicable in 1D |
+
+**Three things the 1D numbers say that the 1C-2b ones did not.**
+
+1. **The `core/` floor's margin grew for the right reason, and the reason is visible in
+   the missed count.** 1C-2b's 37 missed regions were 36 of them `markdown.rs`'s defensive
+   arms. 1D's 46 are 36 of those, 9 of `theme.rs`'s, and 1 of `cache.rs`'s — so of the 842
+   regions 1D added, **833 were executed and 9 were not**, and the layer's numerator grew by
+   833 against a denominator that grew by 842. That ratio is the honest statement of what
+   "the new code is well covered" means, and §2.10's is the number a ratio alone would hide.
+2. **The workspace total is now 10.80 points above its target, having been 9.39 above it
+   three recordings ago**, and the line column agrees (96.17%). Both columns reconcile in
+   §2.11, which is the fourth consecutive recording where they do.
+3. **`core/` at 97.76% is the first time the layer has cleared `cache.rs`'s 99.44%-class
+   files on a *sustained* basis rather than as a one-file artefact.** 1B's 100.00% was a
+   statement about a single file (§2.7 says so explicitly); the layer has now been measured
+   at 96.95%, 96.95% and 97.76% across three recordings with two, three and four logic
+   modules in it. **That is the number ADR-004's floor should be gated on**, and it is the
+   first figure in this file that means what §2.10's header claims for it.
+
+**Still not applicable, and still not a pass:** §4.1 and §4.2's two sub-80% files are
+untouched by 1D and are Phase 2's to move (§5.4).
 
 
 ---
@@ -1011,6 +1209,55 @@ open action, because the honest generalisation from two errors in one recording 
 are fine" but "aggregates in this document have been derived by hand for five work units and two of
 the four most recent are wrong."
 
+### 4.10 `sh_nexus\src\core\theme.rs` — 98.93% regions, 99.78% lines
+
+**842 regions, 9 missed, 57 of 57 functions executed, 463 of 463 lines, 1 missed line.** In
+this section for the same reason §4.8 is: a coverage number is a particularly poor
+description of what a *validator* has to get right, and this file is the only one in
+`core/` whose bug class is **silently accepting the wrong thing**.
+
+**The single missed line is the documented-unreachable arm, and it is guarded by a test
+rather than by a comment.** Line 1127 is `Err(failure) => Err(failure)` in
+`load_or_default` — the path taken only if the *built-in default* itself fails to parse.
+`every_built_in_theme_parses_and_validates` (via `every_built_in_carries_its_own_id_and_name`
+and the three per-theme cases) fails the build if any of the three embedded themes stops
+validating, so the arm is unreachable in a shipped binary. It is kept rather than `unwrap`ed
+because `AGENTS.md` §2.1 forbids unwrapping in production paths and a build-time fixture
+corrupted by a bad merge should degrade rather than crash at startup; `core/theme.rs` §6
+argues the point in full. **This is the same shape as `cache.rs`'s one missed region
+(§4.8): a region kept for a safety property, at the cost of one uncovered line.**
+
+**What 99.78% of lines does not tell you about a validator — and this is the sentence
+§5.6 exists to support.** Every one of those 463 lines executed, which for this file means
+every rejection path in the module was taken at least once: unknown keys, missing keys,
+wrong types, malformed colours, out-of-range numbers, unsupported versions, blank labels,
+oversize documents, and the whole `MalformedJson` family. It does **not** mean the
+validator is *correct*. A validator that accepted `#fff`, ignored `"colour"`, or let a zero
+font size through would execute the very same regions and report the very same 833/842.
+**A validator's failure mode is a theme that renders wrong with no error, and no coverage
+number is sensitive to that.** That is the entire argument for §5.6, and §5.6's table is the
+instrument for it.
+
+**Two gaps that 785 green tests had missed, found by `--show-missing-lines` rather than by
+the ratio — and this is the most transferable finding in the entry.** The first
+measurement of this file was **97.74% regions / 98.49% lines**, and the report named three
+unexecuted regions:
+
+| Missed | What it actually was |
+|---|---|
+| `1127` | The documented-unreachable arm above. A real, accepted cost. |
+| `1246`, `1248-1249` | **A genuine gap.** The `WrongType` arm inside `text()`. A *colour* field holding a JSON number was tested; a *label* field holding one was not — same rule, different helper, and the second path was never exercised. |
+| `897-898` | **A genuine gap, and a worse one.** `ThemeError::TooLarge`'s `Display` arm. The variant was *constructed* by a test that matched on the enum, so the message was never rendered — **a user-facing message that no test had ever read**, in a module whose entire reason for hand-writing a parser is that its messages are the product (§2 of its own docs). |
+
+Both were closed with four tests (`a_label_field_of_the_wrong_type_is_a_type_error`, 3
+cases × 5 types; `the_size_rejection_names_the_size_and_the_limit`), taking the file to
+**98.93% / 99.78%** and leaving only the unreachable arm. **The lesson is the ratio's
+limit, not the two bugs:** a file at 97.74% looked fine, and 191 tests passing looked
+finer, and the only thing that found either was asking the tool *which lines* rather than
+*what percentage*. §5.1's whole argument — that a coverage number is not a quality
+statement — has a concrete instance here, in this project's own newest file.
+
+
 ### 5.1 1A's nine-line residual — **CLOSED in 1B, with one refuted prediction**
 
 1A left a nine-line residual here, by line range, and named the action. Both are now done.
@@ -1142,6 +1389,35 @@ Neither file has moved since 1A and both measure identically (§2.8).
 
 **Opened by 1C-2b, and it is the only open action this recording adds.**
 
+**1D found the second half of this, and it is a limitation of the rule 1C-2b adopted.**
+
+1C-2b adopted the reconciliation invariant — *crate + wire equals the tool's TOTAL, in
+both the denominator and the covered count, on both columns* — after §2.8 proved two
+of the orchestrator's own figures unreproducible. **1D's `sh_nexus` crate row
+reconciled on all four checks while its percentage was still wrong by 0.02**:
+`2432 / 2545` was published as `95.58%` when it is `95.56%`.
+
+So the invariant is **necessary and not sufficient**, and the reason is structural.
+It checks *counts* against the tool, because counts are what the tool prints. A
+percentage is a further derived step on top of already-verified counts, and nothing
+in the invariant constrains it. The error is smaller than 1C-2a's (0.02 against
+0.27) and it survives four checks that 1C-2a's did not.
+
+**Two rules now, not one:**
+
+1. **Reconcile the counts** against the tool's TOTAL — all four checks. This catches
+   a wrong denominator, a wrong numerator, or a missing row.
+2. **Derive every percentage from its own fraction, and never transcribe it
+   independently.** A percentage is not a separate observation of the tool; it is
+   arithmetic on two numbers that rule 1 has already verified. Writing it twice
+   creates a second chance to be wrong, and that second chance is not covered.
+
+The general lesson is the one §2.8 already stated, now with a second instance from
+a different direction: **each verification rule covers the failure modes it was
+built for, and the gap is always in the step just past its edge.** 1C-2a's mistake
+was a hand-copied count. 1D's was a hand-copied ratio of verified counts. The
+check that caught the first would never have caught the second.
+
 §4.9 found two arithmetic errors in the 1C-2a recording: §2.4's `core/` line denominator (848 where
 it should be 849) and §2.2's `sh_nexus` crate fractions (`1571/1672` and `1077/1145`, where neither
 number can be reproduced from the per-file table). **Both were in derived figures — aggregates
@@ -1162,6 +1438,112 @@ anything, and a reader who wants them re-derived should be able to see that they
 from §2.1's rows at the moment of writing, never by carrying the previous recording's figure
 forward. A propagated aggregate has no transcription step to catch it, which is the whole mechanism
 of both errors found here.
+
+**1D did not touch this action and does not close it.** 1D applied §1's rule to its own
+figures (§2.11 prints the four sums), and it re-derived 1C-2b's baseline from the per-file
+table rather than carrying it forward — which is why §2.10's deltas are stated against
+figures recomputed here rather than copied. **§2.5's and §2.7's aggregates remain
+unverified**, exactly as §5.5 says, and 1D's silence on them is not a finding that they
+are correct.
+
+### 5.6 The `core/theme.rs` mutation table
+
+**Why this table exists, and it is not decoration.** `AGENTS.md` §6.1 makes coverage a
+CI metric, and §4.10 is the sharpest illustration yet of why that is not sufficient for
+this file: **a validator that accepts `#fff` for a colour, ignores a misspelled key, or lets
+a zero font size through executes every region it has and reports 833/842 all the same.**
+The bug class of a validator is *silently accepting the wrong thing* — there is no crash,
+no wrong pixel, just a theme that renders with a colour nobody chose — and a coverage number
+is structurally blind to it.
+
+**Method.** Nine deliberate defects were introduced into `core/theme.rs` one at a time, the
+**full** suite was run with `cargo test --workspace --no-fail-fast` (so one broken target
+cannot hide another), the number of failing tests was recorded, and the defect was reverted.
+Each mutant is a one-line change to the line named, and the file's SHA-256 was compared
+against the pre-mutation copy after every revert — a mistake this project has already made
+once, in `docs/COVERAGE.md`, is not made twice. **Every mutant was caught**, which is the
+only result that makes the table worth keeping.
+
+| # | Deliberate defect | Line changed | Tests that caught it | Doctests |
+|---|---|---|---|---|
+| M1 | Accept a 3-digit shorthand colour | `from_hex`: `digits.len() != 6` → `< 6` | **4** | 1 |
+| M2 | Never reject an unknown key | `reject_unknown_keys`: `unknown.clear()` after the sort | **12** | 1 |
+| M3 | **Accept a zero font size** | `MIN_FONT_SIZE: u32 = 1` → `0` | **2** → **6** after §5.6.1 | 0 |
+| M4 | Accept any version | `version_of`: drop the `== THEME_FORMAT_VERSION` guard | **4** | 1 |
+| M5 | **Accept an over-long label** | `text()`: `if raw.chars().count() > MAX_LABEL_CHARS` → `if false && …` | **1** → **4** after §5.6.1 | 0 |
+| M6 | Drop the parent prefix from a nested path | `child()`: `format!("{parent}.{key}")` → `key.to_owned()` | **77** | 0 |
+| M7 | **Swap two colour fields** | `palette_from`: `surface` reads `"sidebar"` | **2** | 0 |
+| M8 | **The fallback swallows the rejection** | `load_or_default`: substitute a generic `BlankText` | **1** → **9** after §5.6.1 | 0 |
+| M9 | Emit an unescaped control character | `push_json_string`: `other if (other as u32) < 0x20` → `other if false` | **1** → **2** after §5.6.1 | 1 |
+
+**The lowest number in this table is 1, and it is reported three times over rather than
+smoothed away.** §5.3's minimum was 5. Three mutants here start at a single catcher, and
+**two of the three landed on decisions this document and `core/theme.rs` §4 both call
+load-bearing**:
+
+- **M8 (1) — §10.2's second half.** "An invalid theme falls back to the default **with an
+  error message in-app**" is two requirements, and the message is the one a fallback can
+  quietly break: a generic message renders correctly and tells the user nothing. Caught by
+  `an_invalid_document_yields_the_default_and_the_reason` alone.
+- **M5 (1) — a §7.1 memory bound.** `MAX_LABEL_CHARS` is "no unbounded growth of
+  in-memory state" applied to a hot-reloadable user file, and it was asserted for `name`
+  only.
+- **M9 (1) — a hand-written escaper.** A control character in a theme *name* is not
+  something anyone writes, which is exactly why it needs a test.
+
+**M3 and M7 sitting at 2 is a different and more interesting shape than M5's 1**, and it
+deserves its own note. Both are *swap* or *widen* defects that keep the file compiling and
+keep every region executed. M7 in particular is the mutation the schema test was designed
+for — `every_colour_key_reaches_its_own_palette_field_under_its_own_path` substitutes a
+distinct `#0000XX` per key precisely so that two fields exchanging values is detectable, and
+it caught M7 twice (the schema test and the round-trip). **A net of 2 for a field swap is
+correct rather than thin**, because the class of bug is *silent misrouting*, and the test
+that catches it is a structural one that has no reason to be duplicated.
+
+#### 5.6.1 The three thin nets, strengthened, with both numbers recorded
+
+Three mutants were caught by exactly one test, on decisions the module's own
+documentation calls load-bearing. **All three were strengthened and re-measured, and both
+numbers are in the table above.** This is recorded as a process entry rather than a
+results entry, because the thing worth keeping is not the improved numbers — it is that
+**the mutation table found a weakness the coverage number and the test count both called
+fine.**
+
+| Mutant | Weakness the table exposed | The fix | Cost |
+|---|---|---|---|
+| M8 | §10.2's in-app message was asserted for **one** rejection kind (a misspelled key) and one fixture. A fallback that special-cased *that* error would pass | `the_fallback_reports_the_real_reason_not_a_generic_one` — 8 `#[case]`s, one per rejection kind, each asserting the message names the actual field | ~35 lines |
+| M3 | The zero-font-size rejection was a **loop**, so it counted as one test however many fields it covered — and the loop derived its expectation from the constant it was testing, so it could not catch a change to the constant | Split into `a_zero_font_size_is_rejected_at_every_size_field` (4 `#[case]`s), keeping the constant assertion in `the_documented_numeric_bounds_are_the_bounds_in_force` | ~20 lines |
+| M5 | The label-length bound was asserted for `name` only, though `author` and `typography.family` reach it through the same helper | `an_over_long_label_is_refused_at_every_label_field` and `a_label_at_the_limit_is_accepted_at_every_label_field` (3 `#[case]`s each), plus `the_label_limit_is_the_documented_number` | ~45 lines |
+| M9 | `arbitrary_label` generated only `\n`, `\r` and `\t`, which have their **own arms** in `push_json_string` — so the property never reached the generic `< 0x20` arm | Added `\u{7}` and `\u{1}` to the generator, so the property now covers an encoding `to_json` does not itself emit | 2 lines |
+
+**M9's fix is the one worth copying, and it cost two lines.** A generator that only
+produces the cases the implementation already handles is testing the happy path twice:
+`\n`, `\r` and `\t` have dedicated arms, so removing the generic control-character arm
+changed nothing about them. **A property generator has to be checked against the branches
+it is meant to reach, and the branch list is in the code under test** — which is the same
+"read the code, do not assume" discipline §2.4's arithmetic error is an instance of.
+
+#### 5.6.2 What is *not* in this table, and should be
+
+- **No mutant targets the `serde` split.** `serde` remains forbidden in `core/` and
+  `serde_json` is admitted, and that distinction is a **single function**
+  (`forbidden_serde_mention`) plus a list entry — code whose *absence* is the invariant.
+  It is covered structurally instead: `core_admits_serde_json_and_still_rejects_serde`
+  in `tests/layer_boundary.rs` asserts both directions on synthetic sources, so a change
+  that made the check vacuous fails a test rather than passing one. **This is the same
+  asymmetry §5.3 records for `cache.rs`'s thread-safety decision**, and it is a real limit
+  of mutation testing as a method: it works on code that exists, and this project's most
+  consequential decisions for two of its files are code that deliberately does not.
+- **No mutant targets `to_json`'s key *order*.** The canonical order is asserted by
+  `the_canonical_json_is_compact_and_in_schema_order`, which is a claim about a string
+  rather than a value, and a swap of two adjacent keys would keep the round-trip green.
+  This is a known, accepted gap: key order has no functional consequence for a parser, and
+  the test exists for diff stability rather than correctness.
+- **No mutant was run twice for stability.** Each figure is a single full-suite run, which
+  is the same protocol §5.3 used. The proptest properties are seeded per-case and replay
+  their committed regressions first, so the counts are reproducible; a *global* seed is not
+  fixed, and §2.6's recommendation of one still stands.
+
 
 
 ---
