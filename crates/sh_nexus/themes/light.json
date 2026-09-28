@@ -1,0 +1,26 @@
+{
+  "name": "Sh_Nexus Light",
+  "author": "Sh_Nexus",
+  "version": 1,
+  "colors": {
+    "background": "#ffffff",
+    "surface": "#f4f5f7",
+    "sidebar": "#e9ebef",
+    "text": "#1b1d23",
+    "text_muted": "#5a606c",
+    "accent": "#2f6feb",
+    "accent_hover": "#1f5ad0",
+    "danger": "#c8352c",
+    "success": "#2f7d32",
+    "mention": "#8a5a00",
+    "code_block_bg": "#eef0f3",
+    "bubble_self": "#d8e4fb",
+    "bubble_other": "#f4f5f7"
+  },
+  "spacing": { "xs": 4, "sm": 8, "md": 16, "lg": 24 },
+  "radii": { "sm": 4, "md": 8, "lg": 16 },
+  "typography": {
+    "family": "Inter",
+    "sizes": { "caption": 12, "timestamp": 11, "body": 14, "title": 18 }
+  }
+}

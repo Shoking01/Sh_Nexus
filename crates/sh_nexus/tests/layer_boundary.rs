@@ -14,7 +14,8 @@
 //!
 //! | Rule | Source | Checked here |
 //! |---|---|---|
-//! | `core/` names no I/O, platform, or serialization crate | §3.2, `PLAN.md` §4, §5 | `core_names_no_forbidden_dependency` |
+//! | `core/` names no I/O, platform, or serialization-derive crate | §3.2, `PLAN.md` §4, §5 | `core_names_no_forbidden_dependency` |
+//! | `core/` may name the `serde_json` *parser* but never the `serde` *derive* crate | `PLAN.md` §5 | `core_admits_serde_json_and_still_rejects_serde` |
 //! | `core/models` derives no `Serialize`/`Deserialize` | `PLAN.md` §5 | `core_models_derives_no_serde_traits` |
 //! | `core/` touches no filesystem | `PLAN.md` §4 | `core_names_no_forbidden_dependency` |
 //! | `core/` reads no clock and starts no thread | `core/models/mod.rs` | `core_names_no_clock_and_no_thread` |
@@ -154,7 +155,19 @@ fn use_statements(stripped: &str) -> Vec<(usize, String)> {
 /// `PLAN.md` section 2 lists for other layers stay out on purpose: `syntect`
 /// (syntax highlighting) is a Phase 5 concern and `notify` is a filesystem
 /// watcher, which is `platform/file_watch.rs`.
-const CORE_ALLOWED_CRATES: [&str; 9] = [
+///
+/// **`serde_json` was added here in work unit 1D, in the same commit that
+/// started `core/theme.rs` naming it.** It is the second parsing crate admitted,
+/// and it was admitted for the same narrow reason as the first: `core/theme.rs`
+/// is the only file that names it, it parses a theme document's bytes into data
+/// and hands back data, and it has no I/O, no clock, no thread, no file handle
+/// and no dependency on anything the caller does not already hold. It is a
+/// *parser*, not a *serialization framework*: nothing in `core/` derives a trait
+/// from it, which is the property `the_client_does_not_depend_on_serde` and
+/// `core_models_derives_no_serde_traits` between them guard. Admitting it here
+/// without splitting the `"serde"` token would have been a no-op, because
+/// `"serde_json".contains("serde")` -- see the note on that token.
+const CORE_ALLOWED_CRATES: [&str; 10] = [
     "std",
     "core",
     "alloc",
@@ -162,13 +175,20 @@ const CORE_ALLOWED_CRATES: [&str; 9] = [
     "smallvec",
     "uuid",
     "pulldown_cmark",
+    "serde_json",
     "crate",
     "super",
 ];
 
 /// Crates `core/` may never name.
-const CORE_FORBIDDEN_TOKENS: [&str; 10] = [
-    "serde",
+///
+/// **`serde` is not in this list, and that is the second half of the split
+/// described on [`forbidden_serde_mention`].** It was here until work unit 1D,
+/// and a flat substring list cannot express "not `serde`, but `serde_json`":
+/// the one entry rejected both crates, so the boundary was simultaneously too
+/// strict about a parser it should permit and imprecise about the crate it
+/// actually forbids.
+const CORE_FORBIDDEN_TOKENS: [&str; 9] = [
     "gpui",
     "tokio",
     "sh_nexus_wire",
@@ -180,14 +200,68 @@ const CORE_FORBIDDEN_TOKENS: [&str; 10] = [
     "std::process",
 ];
 
+/// The literal forbidden in `core/`: the `serde` crate, which brings the derive
+/// macros with it.
+const SERDE_TOKEN: &str = "serde";
+
+/// The one suffix that turns [`SERDE_TOKEN`] into a permitted crate name.
+///
+/// `serde` + `_json` = `serde_json`, the JSON *parser*. One entry rather than a
+/// list of permitted `serde*` crates, because the rule is about a prefix and a
+/// deny-list of every crate starting with `serde` would have to be extended
+/// every time somebody published `serde_json_derive`.
+const PERMITTED_SERDE_SUFFIX: &str = "_json";
+
+/// A mention of the `serde` crate in comment-stripped `core/` source, if any.
+///
+/// **The split, and why it is a tightening rather than a loosening.** Until work
+/// unit 1D, `core/`'s ban on `serde` was one entry in a substring scan, and
+/// `"serde"` is a substring of `"serde_json"`. That single fact made the old
+/// check wrong in two directions at once:
+///
+/// - **Too strict where it should have been permissive.** `core/theme.rs` must
+///   parse a JSON theme document, and there is no way to spell that without
+///   naming a JSON parser. A fully qualified `serde_json::from_slice(..)` -- the
+///   spelling the token scan exists precisely to catch -- was rejected too,
+///   because the parser and the derive crate were indistinguishable to a
+///   `contains` call.
+/// - **Imprecise where it mattered.** The check could not say *which* crate it
+///   had found, so a violation reported "mentions `serde`" whether the source
+///   said `serde`, `serde_json` or `serde_derive`.
+///   `core_models_derives_no_serde_traits` exists precisely because such a check
+///   is not sufficient, and this is the half of that insufficiency.
+///
+/// The rule now: **every occurrence of the literal `serde` in `core/` must be
+/// part of the single permitted name `serde_json`.** That is strictly more
+/// rejections than the old check could express -- `use serde;`, `serde::Serialize`,
+/// `#[derive(serde::Serialize)]` and `serde_derive::` are all now rejected *for
+/// a stated reason* rather than incidentally -- and it is one fewer false
+/// positive, the parser, which is a real dependency this crate already had.
+///
+/// Returns the text that followed the offending `serde`, so a failure can name
+/// what it found instead of only that it found something.
+fn forbidden_serde_mention(stripped: &str) -> Option<String> {
+    let mut offset = 0;
+    while let Some(found) = stripped[offset..].find(SERDE_TOKEN) {
+        let after = offset + found + SERDE_TOKEN.len();
+        if !stripped[after..].starts_with(PERMITTED_SERDE_SUFFIX) {
+            return Some(stripped[after..].chars().take(24).collect());
+        }
+        offset = after;
+    }
+    None
+}
+
 /// `core/` names no I/O, platform, or serialization crate.
 ///
-/// Checked twice over, because the two checks fail differently:
+/// Checked three times over, because the three checks fail differently:
 ///
 /// - a **`use` allow-list**, which is exact but only sees imports;
 /// - a **token scan** over comment-stripped source, which catches a fully
 ///   qualified path (`chrono::Utc` inline, or `serde_json::from_str(..)` written
-///   without a `use`) that no import list would show.
+///   without a `use`) that no import list would show;
+/// - a **precise `serde` check**, because the token scan cannot tell `serde` from
+///   `serde_json` and the boundary has to. See [`forbidden_serde_mention`].
 #[test]
 fn core_names_no_forbidden_dependency() {
     let core_dir = src_dir().join("core");
@@ -221,6 +295,15 @@ fn core_names_no_forbidden_dependency() {
                 file.display()
             );
         }
+
+        assert!(
+            forbidden_serde_mention(&stripped).is_none(),
+            "{} names `serde` outside the permitted `serde_json`. PLAN.md section 5 \
+             gives serialization to sh_nexus_wire and keeps the domain unaware of \
+             it; the derive macros are one `use` away from core/models, which is \
+             what `core_models_derives_no_serde_traits` also asserts.",
+            file.display()
+        );
     }
 }
 
@@ -532,7 +615,124 @@ fn network_names_no_gpui() {
     }
 }
 
-/// `errors.rs` sits outside `core/`, which is why it may mention serialization.
+/// The `serde` split holds in both directions, and this is the test for it.
+///
+/// The task it does and the reason it is not satisfied by
+/// `core_names_no_forbidden_dependency` passing: a green tree proves only that no
+/// file *currently* violates the rule. It says nothing about whether the rule can
+/// still *catch* a violation, and the previous single-token check had a failure
+/// mode a green tree could not reveal -- `"serde_json".contains("serde")` meant
+/// that admitting the parser was impossible, and the only way to "fix" that was
+/// to delete the token, which would have taken the derive ban with it.
+///
+/// So both halves are demonstrated on synthetic sources, plus one check against
+/// the real tree:
+///
+/// 1. every spelling of the **derive** crate is rejected, including the
+///    `serde_derive` proc-macro crate the old substring entry rejected only
+///    incidentally;
+/// 2. both spellings of the **parser** -- a `use` and a fully qualified path --
+///    are accepted, and the `use` allow-list admits it too;
+/// 3. prose *about* `serde` is stripped and does not trip the check, so this
+///    file's own documentation can discuss the boundary;
+/// 4. `core/theme.rs` really does name `serde_json`, so the allow-list entry
+///    cannot be quietly reverted while the code still needs it.
+#[test]
+fn core_admits_serde_json_and_still_rejects_serde() {
+    // 1. The derive crate, in every spelling the boundary has to catch. The
+    //    `#[derive(..)]` line is the one `core_models_derives_no_serde_traits`
+    //    exists for; a `use` cannot reach it, so the fully qualified form is
+    //    the only way in and this is the only check that sees it in `core/`.
+    for violation in [
+        "use serde;",
+        "use serde::Serialize;",
+        "use serde::{Deserialize, Serialize};",
+        "#[derive(serde::Serialize)]",
+        "#[derive(serde::Deserialize, Clone)]",
+        "use serde_derive::Serialize;",
+        "let value = serde::to_string(&theme);",
+        "extern crate serde;",
+    ] {
+        let found = forbidden_serde_mention(without_comments(violation).as_str());
+        assert!(
+            found.is_some(),
+            "`{violation}` names the serde crate and must be rejected, but the \
+             check found nothing"
+        );
+    }
+
+    // The reported text names what was found, so a failure says which crate.
+    assert_eq!(
+        forbidden_serde_mention("use serde::Serialize;").as_deref(),
+        Some("::Serialize;"),
+        "the rejection should name what followed `serde`"
+    );
+
+    // 2. The parser, in both spellings, plus the allow-list that governs imports.
+    for permitted in [
+        "use serde_json::Value;",
+        "let root: serde_json::Value = serde_json::from_slice(bytes).ok().unwrap_or(serde_json::Value::Null);",
+        "use serde_json::{Map, Value};",
+    ] {
+        assert!(
+            forbidden_serde_mention(permitted).is_none(),
+            "`{permitted}` names only the serde_json parser and must be admitted, \
+             but the check rejected it"
+        );
+    }
+    assert!(
+        CORE_ALLOWED_CRATES.contains(&"serde_json"),
+        "serde_json must be on the import allow-list: {CORE_ALLOWED_CRATES:?}"
+    );
+    assert!(
+        !CORE_ALLOWED_CRATES.contains(&"serde"),
+        "serde must NOT be on the import allow-list: {CORE_ALLOWED_CRATES:?}"
+    );
+
+    // 3. Prose about the boundary does not trip the boundary. Without this, the
+    //    paragraph above and `core/theme.rs`'s own section 2 would both fail the
+    //    scan, and the fix would be to stop documenting the rule.
+    let prose = concat!(
+        "//! This module must not name serde, and neither must serde_derive.\n",
+        "/// The derive macros come from `serde`; the parser is `serde_json`.\n",
+        "use std::fmt;\n",
+    );
+    let stripped = without_comments(prose);
+    assert!(
+        !stripped.contains("serde"),
+        "the comment stripper should have removed every mention, got {stripped:?}"
+    );
+    assert!(
+        forbidden_serde_mention(&stripped).is_none(),
+        "prose about serde must not be scanned as code"
+    );
+
+    // 4. The real tree. This is what makes the allow-list entry load-bearing: if
+    //    `core/theme.rs` ever stops parsing JSON, this is the test that says so,
+    //    and if the allow-list is reverted while it still parses, this one does.
+    let theme = src_dir().join("core").join("theme.rs");
+    assert!(
+        theme.is_file(),
+        "{} should exist: AGENTS.md 3.1 places theme parsing at src/core/theme.rs",
+        theme.display()
+    );
+    let source = without_comments(
+        &fs::read_to_string(&theme)
+            .unwrap_or_else(|error| panic!("{} should be readable: {error}", theme.display())),
+    );
+    assert!(
+        source.contains("serde_json"),
+        "core/theme.rs is expected to name serde_json -- the whole reason 1D split \
+         the serde token. If the parser moved out of core/, delete the allow-list \
+         entry in the same commit and record why."
+    );
+    assert!(
+        forbidden_serde_mention(&source).is_none(),
+        "core/theme.rs must not name the serde derive crate, and does not."
+    );
+}
+
+/// `errors.rs` sits outside `core/`, which is why it may name `ThemeError`.
 ///
 /// `AGENTS.md` §3.3 makes `ShNexusError` the global error type, and
 /// `Serialization(#[from] serde_json::Error)` is part of it. That is only
@@ -541,11 +741,21 @@ fn network_names_no_gpui() {
 /// "each module may define narrower error types that convert into
 /// `ShNexusError`" is the sanctioned direction of travel.
 ///
-/// Without this test, moving `errors.rs` into `core/` would compile, pass
+/// **Work unit 1D is what made that sentence load-bearing rather than
+/// descriptive.** `core/theme.rs` defines its own `ThemeError` and
+/// `errors.rs` carries `impl From<ThemeError> for ShNexusError`, which is §3.3's
+/// direction of travel used for real: the narrow error is defined by the domain,
+/// the conversion is written by the layer that owns the vocabulary. The
+/// alternative -- `core/theme.rs` returning `ShNexusError` -- is exactly what
+/// `core_reaches_only_its_own_modules` below forbids, and the two would now
+/// contradict each other.
+///
+/// Without this test, moving `errors.rs` into `core/` would compile and pass
 /// `core_names_no_forbidden_dependency` (which scans `core/`, and would then
-/// catch it) -- but the reverse mistake is not caught: a `use serde_json` in
-/// `core/` is caught, while a `core/` that *defines* its own error type and
-/// nothing else is fine. The assertion worth having is the structural one.
+/// catch `errors.rs`'s `use crate::core::theme::ThemeError` as reaching sideways)
+/// -- but the reverse mistake is not caught: a `core/` that *defines* its own
+/// error type and nothing else is fine, and that is the sanctioned shape. The
+/// assertion worth having is the structural one.
 #[test]
 fn errors_is_a_sibling_of_core_not_a_member_of_it() {
     let errors = src_dir().join("errors.rs");

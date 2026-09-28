@@ -58,6 +58,8 @@
 
 use thiserror::Error;
 
+use crate::core::theme::ThemeError;
+
 /// Every way an operation in the client can fail.
 ///
 /// The variant set is `AGENTS.md` §3.3's, verbatim, and the `Display` text of
@@ -221,3 +223,27 @@ pub enum ShNexusError {
 ///
 /// `AGENTS.md` §9.1's doc-comment template writes `Result<T>`, and this is it.
 pub type Result<T> = std::result::Result<T, ShNexusError>;
+
+/// `core/theme.rs`'s rejections arrive here as [`ShNexusError::Theme`].
+///
+/// **The conversion lives in this file and not in `core/theme.rs`, and that
+/// placement is the whole point of it.** This module's own documentation states
+/// the rule: `core/` "does not return a `ShNexusError`; it returns a `bool`, an
+/// `Option`, or a narrower error its own module defines -- §3.3's 'each module
+/// may define narrower error types that convert into `ShNexusError`' is the
+/// sanctioned direction of travel, not the reverse."
+/// `core_reaches_only_its_own_modules` in `crates/sh_nexus/tests/layer_boundary.rs`
+/// fails the build if a `core/` module so much as writes `use crate::errors`,
+/// so the `impl` has to be on this side of the boundary. §3.3's direction of
+/// travel is what makes that possible at all: the narrow error is defined by the
+/// domain and the conversion is written by the layer that owns the vocabulary.
+///
+/// It is a `From` rather than a variant attribute because
+/// [`ShNexusError::Theme`] already carries a `String` and
+/// `tests/errors_display.rs` already pins that. Making the variant hold a
+/// `ThemeError` instead would have changed a public payload to save two words.
+impl From<ThemeError> for ShNexusError {
+    fn from(error: ThemeError) -> Self {
+        Self::Theme(error.to_string())
+    }
+}
