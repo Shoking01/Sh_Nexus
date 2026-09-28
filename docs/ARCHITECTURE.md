@@ -32,6 +32,7 @@ ADR-005.
 | [ADR-005](#adr-005--relaxing-agentsmd-61-62-performance-thresholds) | Relaxing `AGENTS.md` §6.1/§6.2 performance thresholds | **WITHDRAWN** |
 | [ADR-006](#adr-006--row-estimator-for-the-virtualized-message-list) | Row estimator for the virtualized message list | **Proposed** |
 | [ADR-007](#adr-007--deferring-the-from-error-payloads-in-shnexuserror) | Deferring the `#[from]` error payloads in `ShNexusError` | **Accepted (with a dated obligation)** |
+| [ADR-008](#adr-008--adopting-rstest-for-parameterized-tests) | Adopting `rstest` for parameterized tests | **Accepted** |
 
 ---
 
@@ -730,3 +731,81 @@ Additionally, and outside the numbering above because it affects no implementati
 §6.1's table** — "Note: GPUI statically links the renderer" — is **factually false** and was the
 origin of the refuted hypothesis in ADR-005. The binary-size row itself is correct and currently
 met; the note is what needs correcting. See ADR-005.
+
+---
+
+### ADR-008 - Adopting `rstest` for parameterized tests
+
+**Status:** Accepted.
+
+#### Context
+
+`AGENTS.md` §4.3 mandates it: *"Use `rstest` or `test-case` for parameterized tests."*
+Work unit 1A did not comply. It wrote table-driven `for (name, case, expected)`
+loops over named case tables instead, on the reading that §7.2's first criterion -
+"verify no solution exists with current dependencies or the std library" - governs,
+and a `for` loop is a std solution.
+
+**That reading was wrong, and the error is worth recording because it is the same
+error this project made twice already.** Rev 2 of `PLAN.md` silently negated
+`AGENTS.md` §7.3's "uniform row estimator" mandate, and Rev 2 also declared
+§6.2's merge-blocking thresholds to be "targets, not gates". In both cases a
+subordinate document judged the constitution technically naive and overrode it.
+The conformance audit of Rev 2 named that pattern as the sharpest evidence that
+the reconciliation was not settled. Allowing it a third time, on a tooling
+preference, would make the same point three times over.
+
+The two sections do not actually conflict. §7.2 is a *process*: it governs
+adding a dependency, and its first criterion asks whether a solution already
+exists. §4.3 is a *technique*: it names the solution. A `for` loop does exist in
+std, but the constitution has already answered the question of which solution to
+use, and §7.2's job is then to record *why* the dependency is justified - which
+here is "the constitution mandates it", the strongest possible answer to
+criterion 1.
+
+#### Decision
+
+Add `rstest` as a dev-dependency of both workspace crates and use it for
+parameterized tests from work unit 1B onward.
+
+The §7.2 audit, for the record:
+
+| Criterion | Finding |
+|---|---|
+| 1. No std solution | The constitution names this one. `AGENTS.md` §4.3. |
+| 2. Maintained | 0.27.0 published 2026-09-06; prior release 0.26.1 in July 2025. Actively maintained. |
+| 2. >500 downloads/month | 28,006,626 in the last 90 days. |
+| 3. License | `MIT OR Apache-2.0`, compatible with this project's MIT. |
+| 4. Compile-time impact | **One new compile unit**: `rstest_macros`, a proc-macro crate. The other two runtime dependencies (`futures-timer`, `futures-util`) are optional and stay off - this project has no async tests. Crate size 57,880 bytes. |
+| 5. Justification comment | Present above the declaration in the root `Cargo.toml`. |
+
+MSRV is 1.85.0; the toolchain is 1.98.1.
+
+#### Consequences
+
+The 1A test suite is **not** rewritten. It is 4,600 lines of green tests whose
+cases are already named in their assertion messages, and converting them to
+`#[case]` attributes is a large diff that changes no behaviour and risks no
+defect. `docs/COVERAGE.md` records the grandfathering. The rule applies from 1B.
+
+The benefit is real rather than cosmetic. A `for` loop over twenty cases reports
+as one test that failed at some index; `#[rstest]` with `#[case]` reports
+twenty distinct tests, so a failure names the case that broke and the other
+nineteen still show as passing. For a suite with a coverage floor attached to it,
+that difference in signal is worth one proc-macro dependency.
+
+The honest cost: `rstest` will appear in this codebase's test style and not in
+`AGENTS.md`'s examples of it, and a reader who knows only §4.3 will not find an
+example of the mandated form until they reach 1B.
+
+#### Alternatives considered
+
+- **`test-case`** (the other crate §4.3 names) - rejected as less actively
+  maintained and far smaller; `rstest` is the one the ecosystem uses and the one
+  with the download volume to satisfy §7.2's threshold comfortably.
+- **Keep std `for` loops and record a standing deviation** - rejected. It is the
+  third instance of the same override, and a deviation that is always available
+  is not a deviation, it is an amendment this project is not allowed to make.
+- **Rewrite 1A's suite to match** - rejected as churn with no behavioural gain.
+  Grandfathered and recorded instead.
+

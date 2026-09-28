@@ -152,18 +152,28 @@ fn the_wire_crate_depends_on_no_transport_or_platform_crate() {
     }
 }
 
-/// This crate's dependency set is exactly the four the crate root documents.
+/// This crate's dependency set is exactly the six the crate root documents.
 ///
-/// A fifth would be a decision that belongs in the root manifest's §7.2 audit,
+/// A seventh would be a decision that belongs in the root manifest's §7.2 audit,
 /// not slipped in here. The list is spelled out rather than derived so that
 /// adding a dependency breaks this test.
+///
+/// `rstest` is the sixth and was added by ADR-008, which records the §7.2 audit
+/// and why the crate needed a parameterized-test tool at all.
 #[test]
 fn the_wire_crate_dependency_set_is_the_audited_one() {
     let mut names = declared_dependency_names(&manifest());
     names.sort();
     assert_eq!(
         names,
-        vec!["chrono", "proptest", "serde", "serde_json", "thiserror"],
+        vec![
+            "chrono",
+            "proptest",
+            "rstest",
+            "serde",
+            "serde_json",
+            "thiserror"
+        ],
         "sh_nexus_wire's dependency set changed. A new dependency needs an \
          AGENTS.md section 7.2 audit in the root Cargo.toml, and the crate root \
          docs updated if it changes what this crate is allowed to depend on."

@@ -141,3 +141,20 @@ thiserror = "2"
 #   links only through `sh_nexus`.
 # ---------------------------------------------------------------------------
 proptest = { version = "1", default-features = false, features = ["std"] }
+
+# ---------------------------------------------------------------------------
+# rstest 0.27.0 | MIT OR Apache-2.0 | maintained (0.27.0 published
+#   2026-09-06) | 28,006,626 downloads in the last 90 days | MSRV 1.85.0
+#   against our 1.98.1 | crate size 57,880 bytes.
+#   Criterion 1: `AGENTS.md` 4.3 names `rstest` or `test-case` as THE tool for
+#   parameterized tests. That is the constitution answering the question, not a
+#   preference, so criterion 1 is satisfied by citing it. Criterion 5: exactly
+#   ONE new compile unit, `rstest_macros`, a proc-macro crate. The other two
+#   runtime dependencies are optional and stay off -- they exist for rstest's
+#   async support and this project has no async tests.
+#
+#   See `docs/ARCHITECTURE.md` ADR-008, which records why work unit 1A's
+#   std `for` loops did NOT satisfy 4.3 and why they are grandfathered rather
+#   than rewritten.
+# ---------------------------------------------------------------------------
+rstest = "0.27"

@@ -311,9 +311,9 @@ Recorded rather than silently substituted, and the two tools' denominators are n
 identical, so a re-measurement must use the same tool to be comparable. **No owner decision needed —
 this is a fact about the environment, not a preference.**
 
-### 6.2 OPEN QUESTION — parameterized tests: `rstest` / `test-case` vs std-only case loops
+### 6.2 RESOLVED — parameterized tests: `rstest` adopted (see ADR-008)
 
-**`AGENTS.md` §4.3 names `rstest` or `test-case` for parameterized tests. Work unit 1A used neither.**
+**`AGENTS.md` §4.3 names `rstest` or `test-case` for parameterized tests. Work unit 1A used neither. This section originally recorded that as an open question; it is now RESOLVED -- `rstest` is adopted from 1B and the 1A tables are grandfathered. See ADR-008.**
 It used `for (name, case, expected) in cases` loops over named case tables instead, on the reading
 that `AGENTS.md` §7.2's **criterion 1** — *"Verify no solution exists with current dependencies or
 std library"* — governs, and that `std` **is** the solution.
@@ -345,14 +345,32 @@ today**, so adopting it is a new dependency requiring a `PLAN.md` §2 row and a 
 already name every case in the failure message via `{name}` — but they are not what §4.3 names, and
 §4.3 is the constitution.
 
-**This file does not recommend a winner. It is the project owner's call**, and it should be settled
+**This file originally did not recommend a winner and left it as the project owner's call**, and it should be settled
 before 1B, because 1B lands `core/ordering.rs`, `core/markdown.rs` and `core/cache.rs` and will write
 the parameterized tests `AGENTS.md` §4.4's proptest mandates — so the pattern gets entrenched either
 way.
 
-| Option | Cost | Benefit |
-|---|---|---|
-| **`rstest`** | New dev-dependency; `PLAN.md` §2 row + `docs/DEPENDENCIES.md` audit row required | Literal §4.3 compliance; declarative cases |
-| **std case loops** (current) | Not literal §4.3 compliance; ~15 tables to maintain by hand | Zero dependencies; already names every case in the failure message |
+**Recorded as RESOLVED — `rstest` adopted. See ADR-008.** `rstest = "0.27"` is a dev-dependency of both
+workspace crates from work unit 1B onward, with the §7.2 audit in the root `Cargo.toml`: MIT OR
+Apache-2.0, 28,006,626 downloads in 90 days, published 2026-09-06, MSRV 1.85.0, and exactly **one** new
+compile unit (`rstest_macros`, a proc-macro). The other two runtime dependencies are optional and off.
 
-**Recorded as open. Not decided here.**
+**The 1A suite is grandfathered, not rewritten.** The 15 case tables above stay as they are: they are
+green, their cases are named in every failure message, and converting them to `#[case]` attributes is a
+4,600-line diff that changes no behaviour. §4.3 applies from 1B.
+
+**Why this resolves against 1A's original reading.** ADR-008 records it, and the short form is that
+§7.2 and §4.3 never conflicted. §7.2 is a *process* about adding dependencies; its criterion 1 asks
+whether a solution exists. §4.3 is a *technique* that names the solution. 1A read criterion 1 as
+overriding §4.3, which made a std `for` loop a licence to ignore a named mandate. That is the same
+error `PLAN.md` Rev 2 made twice — silently negating §7.3's row-estimator mandate, and declaring §6.2's
+merge-blocking thresholds "targets, not gates" — and the Rev 2 conformance audit named that pattern as
+the reason the reconciliation was not settled. Declining to fix it a third time over a tooling
+preference would make the point three times over. §7.2's job here is to record *why* the dependency is
+justified, and "the constitution mandates it" is the strongest available answer.
+
+**The signal that made the dependency worth it:** a `for` loop over twenty cases reports as one test
+that failed at some index. `#[rstest]` with `#[case]` reports twenty distinct tests, so a failure names
+the case that broke and the other nineteen still show as passing. For a suite with a coverage floor
+attached to it, that difference in signal is worth one proc-macro.
+
