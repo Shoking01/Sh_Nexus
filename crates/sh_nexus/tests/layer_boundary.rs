@@ -17,6 +17,8 @@
 //! | `core/` names no I/O, platform, or serialization crate | §3.2, `PLAN.md` §4, §5 | `core_names_no_forbidden_dependency` |
 //! | `core/models` derives no `Serialize`/`Deserialize` | `PLAN.md` §5 | `core_models_derives_no_serde_traits` |
 //! | `core/` touches no filesystem | `PLAN.md` §4 | `core_names_no_forbidden_dependency` |
+//! | `core/` reads no clock and starts no thread | `core/models/mod.rs` | `core_names_no_clock_and_no_thread` |
+//! | `core/` contains no panicking construct | §7.1 | `core_contains_no_panicking_construct` |
 //! | `network/` names no `gpui` | §3.2 | `network_names_no_gpui` |
 //! | The protocol does not depend on the client | ADR-002 | `the_wire_crate_does_not_depend_on_the_client` |
 //! | The client depends on the protocol | ADR-002 | `the_client_depends_on_the_wire_crate` |
@@ -280,8 +282,129 @@ fn core_reaches_only_its_own_modules() {
     }
 }
 
-/// `network/` names no `gpui`.
+/// Sources of non-determinism `core/` may not reach for.
 ///
+/// `core/models/mod.rs` states the rule before it states the reason: *"Nothing
+/// here performs I/O, reads a clock, or spawns a thread."* Nothing enforced
+/// any of the three, because until work unit 1B `core/` held type definitions
+/// and a type definition cannot read a clock.
+///
+/// Now it can, so the rule is a test. The two that matter most are the clock
+/// and the thread, and they matter for the same reason a socket would: both make
+/// a result depend on something other than the arguments, which is exactly what
+/// makes `core/ordering.rs`'s permutation property untestable and its failures
+/// irreproducible. A `Utc::now()` inside the order key would make every run of
+/// the same batch produce a different order, and a test asserting equality would
+/// fail on a Tuesday and pass on a Wednesday.
+///
+/// `std::env` is here for the same family of reasons: a value read from the
+/// environment is not a function of the arguments either. `std::net` and
+/// `std::process` are already covered by `CORE_FORBIDDEN_TOKENS` above and are
+/// deliberately not repeated.
+#[test]
+fn core_names_no_clock_and_no_thread() {
+    let core_dir = src_dir().join("core");
+    let files = rust_files_under(&core_dir);
+    assert!(
+        !files.is_empty(),
+        "no Rust files found under {}",
+        core_dir.display()
+    );
+
+    for file in &files {
+        let stripped = without_comments(
+            &fs::read_to_string(file)
+                .unwrap_or_else(|error| panic!("{} should be readable: {error}", file.display())),
+        );
+
+        for token in [
+            "Utc::now",
+            "Local::now",
+            "SystemTime::now",
+            "Instant::now",
+            "std::thread",
+            "std::env",
+            "rayon",
+            "rand::",
+        ] {
+            assert!(
+                !stripped.contains(token),
+                "{} names `{token}`. core/ is pure by AGENTS.md 3.2 and \
+                 PLAN.md section 4, and a clock, a thread or the environment \
+                 makes a result depend on something other than the arguments -- \
+                 which is what would make core/ordering.rs's permutation \
+                 property untestable and its failures irreproducible.",
+                file.display()
+            );
+        }
+    }
+}
+
+/// `core/` contains no construct that can panic.
+///
+/// `AGENTS.md` §7.1 bans `unsafe` without a `// SAFETY:` comment and §2.1 bans
+/// `unwrap`/`expect` in production paths; `core/ordering.rs` is the first module
+/// in this layer with executable code, so it is the first place either could be
+/// violated without a compiler objecting. Until now the rule was true by
+/// accident — there was nothing to panic in.
+///
+/// The token list is a **deny-list**, deliberately, unlike the allow-list
+/// `core_names_no_forbidden_dependency` uses. An allow-list of permitted
+/// constructs is not expressible: the point is not which functions `core/` may
+/// call, it is that none of these specific ways of giving up may appear.
+///
+/// **Comments are stripped first, which is load-bearing here and is the whole
+/// reason `expect(` does not trip on `core/ordering.rs`'s doctests.** Those
+/// doctests use `expect`, correctly — `AGENTS.md` §2.1 permits it in tests, and
+/// a doctest is a test.
+///
+/// **Known limit, recorded rather than left for the next reader to trip over:**
+/// this scans source text, so a future unit that puts `#[cfg(test)] mod tests`
+/// *inside* `core/` will fail this test on its own test helpers. That is the
+/// right failure to get wrong: fixing it means teaching the scanner to skip
+/// `#[cfg(test)]` blocks, which means teaching it to parse Rust, and a
+/// hand-written parser that is subtly wrong is worse than a test that has to be
+/// extended. Every test in this project so far lives in `tests/`, so the case
+/// has not arisen.
+#[test]
+fn core_contains_no_panicking_construct() {
+    let core_dir = src_dir().join("core");
+    let files = rust_files_under(&core_dir);
+    assert!(
+        !files.is_empty(),
+        "no Rust files found under {}",
+        core_dir.display()
+    );
+
+    for file in &files {
+        let stripped = without_comments(
+            &fs::read_to_string(file)
+                .unwrap_or_else(|error| panic!("{} should be readable: {error}", file.display())),
+        );
+
+        for token in [
+            "unwrap(",
+            "expect(",
+            "panic!(",
+            "todo!(",
+            "unimplemented!(",
+            "unreachable!(",
+            "unsafe ",
+        ] {
+            assert!(
+                !stripped.contains(token),
+                "{} contains `{token}` after comment stripping. AGENTS.md 2.1 \
+                 forbids unwrap/expect in production paths and 7.1 forbids \
+                 unsafe without a SAFETY comment; a pure domain module has no \
+                 error condition that justifies either, and a panic in core/ \
+                 is a crash on a path with nothing to recover it.",
+                file.display()
+            );
+        }
+    }
+}
+
+/// `network/` names no `gpui`.///
 /// §3.2's rule for `network/` is narrower than for `core/` -- `network/` *will*
 /// import `tokio` in Phase 4 -- but the GPUI prohibition is absolute and is the
 /// one that resolves the §3.2-versus-§7.3 tension. `PLAN.md` §4 puts the seam in
@@ -473,4 +596,44 @@ fn the_comment_stripper_removes_prose_and_never_code() {
         vec!["serde".to_owned(), "gpui".to_owned()],
         "a trailing comment must not hide the import it shares a line with"
     );
+}
+
+/// The two newer scanners see a violation that shares a line with a comment.
+///
+/// Same reasoning as
+/// [`the_comment_stripper_removes_prose_and_never_code`], applied to the token
+/// lists behind `core_names_no_clock_and_no_thread` and
+/// `core_contains_no_panicking_construct`. Both of those pass today, and a
+/// scanner that fails **open** would keep them passing forever while checking
+/// nothing — which is the class of bug this file already has one test for, and
+/// the reason that test exists.
+///
+/// The synthetic source puts each violation on a line that also carries a
+/// trailing comment and, in one case, inside a doc comment, so this asserts the
+/// two halves at once: prose goes, code stays, and the token is found.
+#[test]
+fn the_violation_scanners_see_code_and_not_prose() {
+    let source = concat!(
+        "//! A module doc mentioning Utc::now in prose.\n",
+        "/// An item doc mentioning panic! in prose.\n",
+        "let now = Utc::now(); // a trailing comment about unwrap(\n",
+        "/* a block comment naming expect( */\n",
+        "let value = 1; let risky = value.expect(\"boom\");\n",
+        "let raw = 1; let also_risky = raw.unwrap();\n",
+    );
+    let stripped = without_comments(source);
+
+    assert!(
+        !stripped.contains("in prose"),
+        "prose about a forbidden construct must be stripped, or every doc \
+         comment about the boundary would trip the boundary"
+    );
+    for token in ["Utc::now", "expect(", "unwrap("] {
+        assert!(
+            stripped.contains(token),
+            "the violation `{token}` should survive comment stripping in \
+             `{}`",
+            stripped.trim()
+        );
+    }
 }

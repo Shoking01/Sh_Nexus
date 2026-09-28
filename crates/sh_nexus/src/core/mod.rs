@@ -18,12 +18,15 @@
 //! `sh_nexus_wire`, `reqwest`, `rusqlite`, `std::fs` or `std::io`, after
 //! stripping comments.
 //!
-//! # What is in scope for work unit 1A
+//! # What is in scope
 //!
-//! Only [`models`]. `markdown`, `cache`, `ordering` and `theme` are `AGENTS.md`
-//! §3.1 modules that later Phase 1 work units implement, and they are not
-//! declared here rather than being declared empty: a module that exists and
-//! does nothing is worse than a module that does not exist, because it reads as
-//! finished work and `cargo` will not tell anyone it is hollow.
+//! [`models`] and [`ordering`].
+//!
+//! `markdown`, `cache` and `theme` are `AGENTS.md` §3.1 modules that later
+//! Phase 1 work units implement, and they are not declared here rather than
+//! being declared empty: a module that exists and does nothing is worse than a
+//! module that does not exist, because it reads as finished work and `cargo`
+//! will not tell anyone it is hollow.
 
 pub mod models;
+pub mod ordering;

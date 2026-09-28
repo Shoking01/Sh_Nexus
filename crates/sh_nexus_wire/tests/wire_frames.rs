@@ -33,6 +33,9 @@
 
 mod support;
 
+use std::collections::HashSet;
+
+use rstest::rstest;
 use sh_nexus_wire::dto::{WireAttachment, WireMessage, WireReaction, WireUser, WireUserStatus};
 use sh_nexus_wire::frame::{
     ClientEnvelope, ClientFrame, Direction, FrameKind, ServerEnvelope, ServerFrame,
@@ -860,4 +863,100 @@ fn a_new_envelope_carries_the_current_protocol_version() {
     for frame in every_server_frame() {
         assert_eq!(ServerEnvelope::new(frame).v, PROTOCOL_VERSION);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 6. An envelope's `kind()` reaches through to its frame.
+//
+// One case per frame rather than a loop over a case table, per `AGENTS.md` 4.3
+// and ADR-008: a failure names the frame that broke instead of printing an index
+// into a list, and the frames that still work still report as passing.
+// ---------------------------------------------------------------------------
+
+/// `ClientEnvelope::kind()` reports the kind of the frame it carries.
+///
+/// A delegating accessor, and the whole point of the test is that it delegates
+/// **to the frame it actually holds** -- not to a constant, and not to the wrong
+/// field. It is what a server-side dispatcher calls to route an incoming frame
+/// without matching on the payload, so an accessor that answered wrongly for one
+/// variant would route that frame into the wrong handler.
+#[rstest]
+#[case(ClientFrame::MessageSend { channel_id: "c_1".to_owned(), content: "hello team".to_owned() }, FrameKind::MessageSend)]
+#[case(ClientFrame::ReactionAdd { message_id: "m_1".to_owned(), emoji: "\u{1f44d}".to_owned() }, FrameKind::ReactionAdd)]
+#[case(ClientFrame::TypingStart { channel_id: "c_1".to_owned() }, FrameKind::TypingStart)]
+#[case(ClientFrame::TypingStop { channel_id: "c_1".to_owned() }, FrameKind::TypingStop)]
+#[case(ClientFrame::Resync { channel_id: "c_1".to_owned(), after: stamp() }, FrameKind::Resync)]
+fn a_client_envelope_reports_its_frames_kind(
+    #[case] frame: ClientFrame,
+    #[case] expected: FrameKind,
+) {
+    let envelope = ClientEnvelope::new(SAMPLE_CLIENT_MSG_ID, frame);
+
+    assert_eq!(envelope.kind(), expected);
+}
+
+/// `ServerEnvelope::kind()` reports the kind of the frame it carries.
+///
+/// Not symmetrical with the client one for a reason worth keeping in view: a
+/// `ServerEnvelope` carries no blanket `client_msg_id` (`PLAN.md` section 6 gives
+/// one only to the two frames that answer a send), so the accessor is the *only*
+/// uniform way to ask a server frame what it is. That makes "it delegates
+/// correctly, for all seven" the property that matters, not one variant.
+#[rstest]
+#[case(ServerFrame::MessageAck { client_msg_id: SAMPLE_CLIENT_MSG_ID.to_owned(), message: sample_message() }, FrameKind::MessageAck)]
+#[case(ServerFrame::MessageNew { message: minimal_message() }, FrameKind::MessageNew)]
+#[case(ServerFrame::MessageError { client_msg_id: SAMPLE_CLIENT_MSG_ID.to_owned(), code: "message_too_long".to_owned(), detail: "exceeds 4000 characters".to_owned() }, FrameKind::MessageError)]
+#[case(ServerFrame::ReactionUpdate { message_id: "m_1".to_owned(), emoji: "\u{1f44d}".to_owned(), user_id: "u_1".to_owned() }, FrameKind::ReactionUpdate)]
+#[case(ServerFrame::TypingUpdate { user_id: "u_1".to_owned(), channel_id: "c_1".to_owned(), active: true }, FrameKind::TypingUpdate)]
+#[case(ServerFrame::PresenceUpdate { user_id: "u_1".to_owned(), status: WireUserStatus::Away }, FrameKind::PresenceUpdate)]
+#[case(ServerFrame::Error { code: "auth_expired".to_owned(), detail: "the session token has expired".to_owned() }, FrameKind::Error)]
+fn a_server_envelope_reports_its_frames_kind(
+    #[case] frame: ServerFrame,
+    #[case] expected: FrameKind,
+) {
+    let envelope = ServerEnvelope::new(frame);
+
+    assert_eq!(envelope.kind(), expected);
+}
+
+/// The two case lists above cover the frame registry exactly.
+///
+/// The runtime half of the compile-time guard `server_frame_kind_is_total`
+/// provides for the `match`: if a variant is added to `ClientFrame` or
+/// `ServerFrame` and not to a `#[case]` here, this fails and says which list is
+/// short. Twelve cases, one per protocol frame, asserted against the counts the
+/// registry itself reports -- so the count cannot drift away from the list.
+#[test]
+fn the_envelope_kind_cases_cover_every_frame_type() {
+    let client_cases: HashSet<FrameKind> = HashSet::from([
+        FrameKind::MessageSend,
+        FrameKind::ReactionAdd,
+        FrameKind::TypingStart,
+        FrameKind::TypingStop,
+        FrameKind::Resync,
+    ]);
+    let server_cases: HashSet<FrameKind> = HashSet::from([
+        FrameKind::MessageAck,
+        FrameKind::MessageNew,
+        FrameKind::MessageError,
+        FrameKind::ReactionUpdate,
+        FrameKind::TypingUpdate,
+        FrameKind::PresenceUpdate,
+        FrameKind::Error,
+    ]);
+
+    assert_eq!(client_cases.len(), FrameKind::CLIENT.len());
+    assert_eq!(server_cases.len(), FrameKind::SERVER.len());
+    assert!(
+        FrameKind::CLIENT
+            .iter()
+            .all(|kind| client_cases.contains(kind)),
+        "a client frame has no `kind()` case, so its delegating accessor is untested"
+    );
+    assert!(
+        FrameKind::SERVER
+            .iter()
+            .all(|kind| server_cases.contains(kind)),
+        "a server frame has no `kind()` case, so its delegating accessor is untested"
+    );
 }

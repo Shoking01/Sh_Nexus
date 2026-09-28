@@ -463,6 +463,10 @@ hand-formatted strings.
 // history: each channel has its own last_message_at and its own unread count.
 { "v": 1, "type": "resync",          "client_msg_id": "<uuid>", "channel_id": "...", "after": "2026-09-27T12:00:00Z" }
 
+// The server's reply MUST carry a watermark. Without it gap detection is not
+// merely imprecise, it is impossible -- see the note below this block.
+{ "v": 1, "type": "resync.result",    "channel_id": "...", "after": "...", "watermark": "2026-09-27T12:00:03Z", "messages": [ /* ... */ ] }
+
 // ---- Server -> Client ----
 { "v": 1, "type": "message.ack",     "client_msg_id": "<uuid>", "message": { /* wire Message */ } }
 { "v": 1, "type": "message.new",     "message": { /* wire Message */ } }
@@ -486,6 +490,17 @@ hand-formatted strings.
   own per-channel `last_message_at` model and making §8.1's Reconnect Flow ("no duplicates, no
   gaps") unsatisfiable.
 - **Malformed JSON.** Rev 1 read `{ "type: "presence", ...` — unquoted key.
+- **No watermark on the resync reply.** Revs 1-3 had no way for a client to know whether it had
+  received everything in the requested interval, which makes §8.1's Reconnect Flow ("no gaps")
+  unverifiable rather than merely unmeasured. `core/ordering.rs` (work unit 1B) made the consequence
+  explicit: with no watermark, a gap is not something a client can *find* but something the server
+  has to *assert*, so **every resync reports `Unverifiable`** — which is a refusal to claim
+  continuity, not a pass. A "maximum idle gap" heuristic is not a substitute: a channel where nobody
+  spoke for two hours produces the same signal, so it would report the quietest healthy channel as
+  broken and train the user to ignore it. Added: `resync.result` carries `watermark`, the server's
+  assertion that the reply contains **every** message in `(after, watermark]`. A gap is then a
+  message in that named interval the client does not hold. The interval is named; its size is never
+  invented, because that would need a server sequence number, which is a separate protocol decision.
 
 ### REST Endpoints
 
