@@ -1,0 +1,897 @@
+//! Message ordering, deduplication, and gap detection.
+//!
+//! This is the module that makes a chat client **correct** rather than merely
+//! functional. Three failure modes live here, and all three are silent when they
+//! are wrong:
+//!
+//! 1. A message that arrives late is shown **twice**.
+//! 2. A message that never arrived is **invisible** — the user reads a
+//!    conversation that is missing a turn and has no way to know.
+//! 3. Two clients holding the same set of messages show them in **different
+//!    orders**, and a resync reshuffles the scrollback under the reader's eyes.
+//!
+//! Nothing here performs I/O, reads a clock, spawns a thread, or knows that
+//! `gpui` or `tokio` exist (`AGENTS.md` §3.2, `PLAN.md` §4). It takes messages
+//! in and hands back an ordered, deduplicated collection plus a report of what
+//! was dropped, what disagreed, and what cannot be known.
+//!
+//! # 1. Ordering: the total order, and what it costs
+//!
+//! [`compare`] sorts ascending by the tuple **`(timestamp, id, client_msg_id)`**.
+//! Every component is load-bearing, and the last two exist only because the
+//! first is not a total order.
+//!
+//! **Why `timestamp` first.** `Message::timestamp` is the server's acceptance
+//! time, and its own documentation says every ordering guarantee is defined on
+//! it. It is the only field that reflects an event the server agreed happened.
+//!
+//! **Why `id` is the tiebreaker.** Two messages can share a millisecond — a
+//! burst, a batch resync, two users pressing Enter together — and `PLAN.md` §5
+//! timestamps at millisecond resolution. Ties are *normal*, not a defect.
+//!
+//! The ideal tiebreaker is a **server sequence number**: monotonic, dense, and
+//! identical on every client. `PLAN.md` §6 has no such field, and inventing one
+//! is a protocol decision, not this module's to make. Between the two ids
+//! available:
+//!
+//! - `client_msg_id` is a UUID minted *per client*, so it is not globally
+//!   meaningful as an ordering key, and a message that has not been
+//!   acknowledged yet does not have a server identity at all.
+//! - `id` is documented as "unique and never reused". Two distinct messages
+//!   cannot share one, which makes `(timestamp, id)` a **strict** total order
+//!   over every message the server has assigned an identity to.
+//!
+//! So `id` is the tiebreaker, compared as bytes. **The cost is stated plainly:**
+//! it is lexicographic, not numeric, so `m_10` sorts before `m_2`. That is
+//! visible only between two messages inside the same millisecond, and it buys
+//! something that numeric ids would not: two clients holding the same set render
+//! the same bytes in the same order, and a list rebuilt from SQLite reproduces
+//! the on-screen order exactly. Numeric ids bought tidiness inside a tie and
+//! cost reproducibility across a reload; a chat list that reshuffles on every
+//! resync is a far worse defect than a `m_2` above a `m_10` for one millisecond.
+//!
+//! **Why `client_msg_id` is the last component.** Without it the comparator is
+//! *not* a total order on the values the domain type can actually hold: two
+//! messages that have not yet been acknowledged both have an empty `id`, and a
+//! comparator that returns `Equal` for distinct values leaves the result of
+//! `sort_by` unspecified — which is precisely the reshuffle bug above, arriving
+//! through a different door. `client_msg_id` is unique per message by
+//! construction (§7.4), so the tuple is strictly total and `sort_by`'s stability
+//! is never load-bearing.
+//!
+//! **What deliberately does not participate**, by construction rather than by
+//! discipline: `edited_at` and `thread_id` are not in the key, so they *cannot*
+//! affect the order. An edit arriving as a whole new value with the same ids
+//! must not move a message; a thread reply is a root message as far as
+//! top-level ordering is concerned and interleaves by time with everything else.
+//! The thread panel asks this module about a filtered set — that is a caller's
+//! decision, made by passing different messages in.
+//!
+//! **Direction is ascending** (oldest first) and that is the contract. A chat
+//! view wants the newest message last, which is the same order; a bottom-anchored
+//! list reverses it with [`slice::reverse`]. Ascending is also the direction a
+//! cursor walk takes (`PLAN.md` §6's `after`), so pagination and ordering agree.
+//!
+//! # 2. Deduplication: `client_msg_id`, not `id`
+//!
+//! **Identity is `client_msg_id`; position is `(timestamp, id, client_msg_id)`.
+//! Those are different questions and get different keys.** `Message::id` would
+//! be the obvious identity and is the wrong one: a message the client sent but
+//! the server has not acknowledged has no server id, and the moment its ACK
+//! arrives it would be a *different* message under an `id` key — so the user's
+//! own message would appear twice, which is failure mode 1 above, generated by
+//! the identity function itself.
+//!
+//! `client_msg_id` is the one field that survives the whole lifecycle: optimistic
+//! send, a re-send after a reconnect, the ACK, and a resync all carry the same
+//! UUID, unchanged, by `AGENTS.md` §7.4 and by `Message::client_msg_id`'s own
+//! contract.
+//!
+//! **A repeat collapses; a disagreement is reported.** A second copy of a
+//! `client_msg_id` that is *equal* in every field is the same message twice and
+//! produces [`IngestOutcome::Collapsed`]. A second copy that *differs* is not a
+//! duplicate, and this module refuses to guess which of the several real causes
+//! it is — see below.
+//!
+//! **What the caller gets back is the point.** [`OrderedMessages::outcomes`] has
+//! one entry per message *handed in*, in input order, so the caller can say
+//! which of its own messages were new, which were repeats, and which disagreed
+//! — without re-deriving identity itself. That is the difference between a
+//! module that answers a question and one that returns a `Vec` and leaves the
+//! reasoning to whoever calls it next.
+//!
+//! # 3. A disagreement is reported, never merged
+//!
+//! Two copies of one `client_msg_id` that differ in any field are reported as
+//! [`IngestOutcome::Conflicting`], naming **which fields differ** — ids and field
+//! names, never the content (`AGENTS.md` §7.5).
+//!
+//! The two leading *legitimate* causes are both documented elsewhere in the
+//! codebase, and this module is the reason their documentation is honest:
+//!
+//! - **The ACK handoff.** `PLAN.md` §6's `message.ack` returns the stored
+//!   message with the same `client_msg_id` and a real server `id`, where the
+//!   optimistic copy had an empty one. [`precedence`] is explicit about this: a
+//!   real `id` beats an empty one, so the acknowledged copy is the one retained,
+//!   and the caller learns that the `id` field is what changed.
+//! - **An edit.** `Message::edited_at` documents that an edit arrives as a whole
+//!   new value of the struct carrying the original ids. A later `edited_at`
+//!   wins, so the edited copy is retained and the caller is told the text moved.
+//!
+//! The causes this module genuinely **cannot** distinguish — and therefore does
+//! not pretend to — are a server that sent two different messages under one
+//! `client_msg_id`, and a reaction or attachment change arriving folded into a
+//! resent message. The merge policy belongs to `state/actions.rs`, which
+//! `AGENTS.md` §3.2 makes the sole owner of mutations. This module's job is to
+//! make the disagreement **visible and specific**, which is what turns "a message
+//! changed and nobody knows why" into a report the caller can log, surface, or
+//! resolve.
+//!
+//! # 4. What a gap is, and why the obvious definition is wrong
+//!
+//! [`assess_sync`] answers "is this set continuous with the channel?", and the
+//! answer is a [`SyncStatus`]. The definition of a gap is the interesting part,
+//! so it is worth being blunt about the two tempting wrong answers.
+//!
+//! **A timestamp jump is not a gap.** A channel where nobody speaks for two
+//! hours produces exactly that, and it is a completely normal channel. A
+//! "maximum idle gap" threshold would report the quietest healthy channel as
+//! broken and train the user to ignore the warning. It is also not even
+//! detectable from the data, because `timestamp` is the server's clock and the
+//! server's clock can be wrong.
+//!
+//! **A missing sequence number would be a gap, and there is no sequence number.**
+//! `PLAN.md` §6 gives every message a `client_msg_id` and a timestamp and
+//! nothing dense or monotonic. So a gap is not something this module can *find*;
+//! it is something the **server has to assert**.
+//!
+//! The definition used here follows from that:
+//!
+//! > If the server states that a response contains **every** message in
+//! > `(cursor, watermark]`, then a gap is a message in that interval the client
+//! > does not hold. The interval is named; its size is not knowable without a
+//! > sequence number, and is never invented.
+//!
+//! which makes [`SyncExpectation::watermark`] the load-bearing input. `PLAN.md` §6
+//! does not define that field yet, so **on the protocol as it stands today every
+//! resync is [`SyncStatus::Unverifiable`]** — and that is the correct answer, not
+//! a missing feature. A client that answered "no gaps" from a timestamp cursor
+//! would be asserting something it cannot know, and `AGENTS.md` §8.1's Reconnect
+//! Flow ("no duplicates, no gaps") is a claim about evidence, not about optimism.
+//! The detector is written and tested now so that the field is a one-line
+//! protocol addition when it lands, not a new module.
+//!
+//! The three states the caller must tell apart, plus the fourth that makes the
+//! third honest:
+//!
+//! | State | Meaning |
+//! |---|---|
+//! | [`SyncStatus::NeverSynced`] | No cursor. The set is a whole history, not a suffix; continuity is not a question about it. |
+//! | [`SyncStatus::Unverifiable`] | A cursor exists, the server stated no watermark. **Not a pass.** |
+//! | [`SyncStatus::Complete`] | No gap is detectable, and the set is consistent with the cursor. |
+//! | [`SyncStatus::Gap`] | The set is missing everything in a named interval. |
+//!
+//! [`SyncStatus::is_healthy`] is `true` for `Complete` alone, so a caller that
+//! gates on it cannot accidentally accept "cannot tell" as "fine".
+//!
+//! # What a gap does when one is found
+//!
+//! **It is surfaced, never filled.** A [`SyncStatus::Gap`] names the interval
+//! `(after, before]` and nothing else. This module does not synthesize a
+//! placeholder row, does not renumber anything, and does not quietly widen the
+//! cursor past the hole. The honest response is to re-request exactly that
+//! interval — the same `resync` frame with an `after` of `after` — and to show
+//! the user that something is missing. A chat client that invents the missing
+//! turn is worse than one that admits it is missing it, because the invention is
+//! indistinguishable from the truth once it is on screen.
+//!
+//! # The property that makes this module correct
+//!
+//! `AGENTS.md` §4.4 mandates it, and it is the real specification:
+//!
+//! > for any permutation of a batch of messages, the ordered result is identical
+//! > and contains no duplicates
+//!
+//! Both halves are load-bearing and both are tested as properties in
+//! `tests/ordering.rs`. Permutation-invariance is what makes a resync safe to
+//! re-run; no-loss is what stops a dedup pass from eating a message. Together
+//! they mean the output is a function of the *set* of messages and nothing else
+//! — not of arrival order, not of which frame happened to land first.
+//!
+//! The one documented exception, and it is a documented exception rather than a
+//! hidden hole: see [`precedence`].
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
+use smallvec::SmallVec;
+use uuid::Uuid;
+
+use super::models::message::Message;
+
+/// One `SmallVec` inline buffer sized for the common case.
+///
+/// A disagreement is almost always one or two fields, so four inline keeps the
+/// whole batch reporting allocation-free in the normal case, per `AGENTS.md`
+/// §2.3. The cap is 9 in the worst case (every field differs), and it spills
+/// rather than truncating, because a silently truncated list of differing fields
+/// would be a lie about what changed.
+type FieldList = SmallVec<[DifferingField; 4]>;
+
+/// The total order this module applies: ascending by
+/// `(timestamp, id, client_msg_id)`.
+///
+/// # Arguments
+///
+/// * `left` - the first message.
+/// * `right` - the second message.
+///
+/// # Returns
+///
+/// `Ordering::Less` when `left` is **older** than `right` in the channel's
+/// timeline, so sorting by this comparator puts the newest message last.
+///
+/// # Why three components
+///
+/// [`timestamp`](Message::timestamp) alone is not a total order: a burst of
+/// messages shares a millisecond, and `PLAN.md` §5 timestamps at millisecond
+/// resolution. [`id`](Message::id) breaks such ties because the server issues it
+/// uniquely and never reuses it, and [`client_msg_id`](Message::client_msg_id)
+/// breaks the ties `id` cannot — two messages that have not been acknowledged
+/// yet, and therefore share an empty `id`. `client_msg_id` is unique per message
+/// by construction (`AGENTS.md` §7.4), so the tuple is **strictly** total: two
+/// distinct messages never compare `Equal`, and the result of sorting does not
+/// depend on the input order.
+///
+/// [`edited_at`](Message::edited_at) and [`thread_id`](Message::thread_id) are
+/// absent from the key on purpose, which makes their exclusion a property of
+/// the type rather than a rule somebody has to remember.
+///
+/// # Example
+///
+/// Two messages in the same millisecond, ordered by the server's id.
+///
+/// ```
+/// use std::cmp::Ordering;
+///
+/// use chrono::{TimeZone, Utc};
+/// use sh_nexus::core::models::Message;
+/// use sh_nexus::core::ordering::compare;
+/// use uuid::Uuid;
+///
+/// fn message(id: &str, client: u128) -> Message {
+///     Message {
+///         id: id.to_owned(),
+///         client_msg_id: Uuid::from_u128(client),
+///         channel_id: "c_1".to_owned(),
+///         user_id: "u_1".to_owned(),
+///         content: String::new(),
+///         // The same millisecond for both: the tie is the interesting case.
+///         timestamp: Utc
+///             .timestamp_opt(1_789_000_000, 0)
+///             .single()
+///             .expect("in range"),
+///         edited_at: None,
+///         reactions: smallvec::SmallVec::new(),
+///         thread_id: None,
+///         attachments: smallvec::SmallVec::new(),
+///     }
+/// }
+///
+/// let tenth = message("m_10", 10);
+/// let second = message("m_2", 2);
+/// // Same timestamp, so the server id decides -- lexicographically, which is
+/// // the cost the module docs name and accept: `m_10` sorts BEFORE `m_2`.
+/// assert_eq!(compare(&tenth, &second), Ordering::Less);
+/// ```
+pub fn compare(left: &Message, right: &Message) -> Ordering {
+    left.timestamp
+        .cmp(&right.timestamp)
+        .then_with(|| left.id.cmp(&right.id))
+        .then_with(|| left.client_msg_id.cmp(&right.client_msg_id))
+}
+
+/// Orders and deduplicates a batch of messages.
+///
+/// The whole contract is: **the result is a function of the set of messages
+/// handed in, and of nothing else.** Arrival order does not affect the order,
+/// the number of messages, or — for any batch without an unresolvable
+/// disagreement — which copy of a repeated message is kept.
+///
+/// # Arguments
+///
+/// * `messages` - the messages, in any order. Ownership is taken rather than
+///   borrowed so the caller does not have to clone a batch it is about to hand
+///   over; a caller that needs to keep them can pass `message.clone()`.
+///
+/// # Returns
+///
+/// [`OrderedMessages`]: ascending, one message per `client_msg_id`, and one
+/// [`IngestOutcome`] per message *handed in*, in input order.
+///
+/// # Errors
+///
+/// None. Nothing here can fail, and that is deliberate rather than incidental:
+/// this module cannot open a socket, read a file, or read a clock, so there is
+/// no error condition to invent. A `Result` here would be an error type with
+/// exactly one impossible variant.
+///
+/// # Example
+///
+/// ```
+/// use chrono::{TimeZone, Utc};
+/// use sh_nexus::core::models::Message;
+/// use sh_nexus::core::ordering::{reconcile, IngestOutcome};
+/// use smallvec::SmallVec;
+/// use uuid::Uuid;
+///
+/// fn message(id: &str, client: u128, second: u32) -> Message {
+///     Message {
+///         id: id.to_owned(),
+///         client_msg_id: Uuid::from_u128(client),
+///         channel_id: "c_1".to_owned(),
+///         user_id: "u_1".to_owned(),
+///         content: format!("body of {id}"),
+///         timestamp: Utc
+///             .timestamp_opt(1_789_000_000 + i64::from(second), 0)
+///             .single()
+///             .expect("in range"),
+///         edited_at: None,
+///         reactions: SmallVec::new(),
+///         thread_id: None,
+///         attachments: SmallVec::new(),
+///     }
+/// }
+///
+/// // Delivered out of order: the second message arrived first.
+/// let out = reconcile(vec![message("m_2", 2, 2), message("m_1", 1, 1)]);
+///
+/// assert_eq!(out.messages()[0].id, "m_1");
+/// assert_eq!(out.messages()[1].id, "m_2");
+/// // One outcome per message handed in, in input order.
+/// assert_eq!(out.outcomes(), &[IngestOutcome::Added, IngestOutcome::Added]);
+/// assert!(out.is_clean());
+/// ```
+pub fn reconcile(messages: impl IntoIterator<Item = Message>) -> OrderedMessages {
+    // `retained` holds at most one message per `client_msg_id`, and
+    // `positions` maps that id to its slot so a repeat is an O(1) lookup rather
+    // than a scan -- a resync of ten thousand messages is ten thousand lookups,
+    // not a quadratic walk.
+    let mut retained: Vec<Message> = Vec::new();
+    let mut positions: HashMap<Uuid, usize> = HashMap::new();
+    let mut outcomes: Vec<IngestOutcome> = Vec::new();
+
+    for message in messages {
+        match positions.get(&message.client_msg_id) {
+            None => {
+                positions.insert(message.client_msg_id, retained.len());
+                retained.push(message);
+                outcomes.push(IngestOutcome::Added);
+            }
+            Some(&slot) => {
+                let held = &retained[slot];
+                if *held == message {
+                    outcomes.push(IngestOutcome::Collapsed);
+                } else {
+                    let fields = differing_fields(held, &message);
+                    // The later truth wins. `precedence` can only report
+                    // `Equal` for a disagreement in a field it does not
+                    // compare, and that case is documented there as a server
+                    // defect; here it falls through to keeping the held copy.
+                    let incoming_is_later = precedence(held, &message).is_lt();
+                    if incoming_is_later {
+                        retained[slot] = message;
+                    }
+                    outcomes.push(IngestOutcome::Conflicting {
+                        this_copy_was_retained: incoming_is_later,
+                        fields,
+                    });
+                }
+            }
+        }
+    }
+
+    retained.sort_by(compare);
+    OrderedMessages {
+        messages: retained,
+        outcomes,
+    }
+}
+
+/// Orders messages and reports, per message handed in, whether it was new, a
+/// repeat, or a disagreement.
+///
+/// The fields are private and the type is built only by [`reconcile`], because
+/// the invariant worth protecting is the correspondence between the two
+/// collections: `outcomes` has exactly one entry per input message, in input
+/// order. A caller that could construct the struct itself could construct one
+/// whose outcomes did not line up with its messages, and the mistake would be
+/// invisible until a message was rendered twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderedMessages {
+    messages: Vec<Message>,
+    outcomes: Vec<IngestOutcome>,
+}
+
+impl OrderedMessages {
+    /// The ordered, deduplicated messages: **ascending**, one per
+    /// `client_msg_id`.
+    ///
+    /// Empty when the batch was empty. Never contains two messages with the
+    /// same [`client_msg_id`](Message::client_msg_id).
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// What became of each message handed to [`reconcile`], in input order.
+    ///
+    /// `outcomes()[i]` describes the `i`th message passed in, so a caller that
+    /// delivered frames in a known order can zip the two together and know
+    /// exactly which of its own messages were repeats and which disagreed.
+    /// Always the same length as the input.
+    pub fn outcomes(&self) -> &[IngestOutcome] {
+        &self.outcomes
+    }
+
+    /// Whether every message in the batch was either new or an exact repeat.
+    ///
+    /// `false` means at least one pair of copies disagreed, and
+    /// [`outcomes`](Self::outcomes) says which fields. Note that a *legitimate*
+    /// event produces this — the ACK handoff and an edit both do — so `false` is
+    /// not a failure state; it means the caller has decisions to make. A caller
+    /// that gates on continuity should use [`SyncStatus::is_healthy`] instead.
+    pub fn is_clean(&self) -> bool {
+        self.outcomes
+            .iter()
+            .all(|outcome| !matches!(outcome, IngestOutcome::Conflicting { .. }))
+    }
+}
+
+/// What became of one message handed to [`reconcile`].
+///
+/// Three cases, and the third is deliberately not a merge: a disagreement
+/// between two copies of one `client_msg_id` is reported with the fields that
+/// differ, and resolving it belongs to `state/actions.rs` (`AGENTS.md` §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestOutcome {
+    /// A `client_msg_id` not seen before in this batch.
+    ///
+    /// The message is in [`OrderedMessages::messages`], at the position
+    /// [`compare`] gives it.
+    Added,
+    /// A repeat of a `client_msg_id` already in the batch, **equal in every
+    /// field** to the copy held.
+    ///
+    /// The two are the same message by any reading, so one is kept and this
+    /// outcome carries no payload: which copy was kept cannot matter, because
+    /// they are indistinguishable. A resync that re-sends the last page is the
+    /// ordinary case.
+    Collapsed,
+    /// A repeat of a `client_msg_id` already in the batch whose value
+    /// **differs**.
+    ///
+    /// # Fields
+    ///
+    /// * `this_copy_was_retained` - whether the copy just handed in is the one
+    ///   [`OrderedMessages::messages`] holds, or whether the copy already held
+    ///   was kept. The retention rule is [`precedence`]; this flag tells the
+    ///   caller which of *its* two values survived, which is the question it
+    ///   actually has to answer.
+    /// * `fields` - which fields disagreed, by name and never by value
+    ///   (`AGENTS.md` §7.5 forbids putting message content in anything that can
+    ///   reach a log).
+    ///
+    /// The leading legitimate causes are the ACK handoff (only
+    /// [`DifferingField::Id`] differs) and an edit
+    /// ([`DifferingField::EditedAt`] and usually [`DifferingField::Content`]).
+    /// A cause this module cannot identify — two genuinely different messages
+    /// sharing one `client_msg_id` — looks exactly the same from here, which is
+    /// the reason the report is a report and not a guess.
+    Conflicting {
+        /// Whether the copy handed in is the retained one.
+        this_copy_was_retained: bool,
+        /// The fields the two copies disagreed about.
+        fields: FieldList,
+    },
+}
+
+/// A field of [`Message`] that two copies of one message disagreed about.
+///
+/// Named, not valued, and deliberately: the caller is told *what* moved so it
+/// can decide, and is not handed a second copy of the text to log. Nine
+/// variants, matching the nine comparable fields of `Message` — the compiler
+/// does not enforce that they stay in step, which is why
+/// `differing_fields` is written as nine adjacent `if`s and covered field by
+/// field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DifferingField {
+    /// [`Message::id`]. Differs on the ACK handoff, when a message that had no
+    /// server id gains one.
+    Id,
+    /// [`Message::channel_id`]. One `client_msg_id` in two channels is a server
+    /// defect.
+    ChannelId,
+    /// [`Message::user_id`]. So is a message that changed author.
+    UserId,
+    /// [`Message::content`]. The ordinary case for an edit.
+    Content,
+    /// [`Message::timestamp`]. The server re-dated a message; see
+    /// [`compare`] for why this also moves the message in the list.
+    Timestamp,
+    /// [`Message::edited_at`]. Present on the edited copy and `None` on the
+    /// original — the signal that a difference is an edit rather than a defect.
+    EditedAt,
+    /// [`Message::reactions`]. Reaction state folded into a resent message.
+    Reactions,
+    /// [`Message::thread_id`]. A message promoted into, or removed from, a
+    /// thread.
+    ThreadId,
+    /// [`Message::attachments`]. Attachment state folded into a resent message.
+    Attachments,
+}
+
+impl DifferingField {
+    /// The field's name, as it is spelled on [`Message`].
+    ///
+    /// The spelling is the point: a report that names `edited_at` can be read
+    /// next to the struct definition, and a future field's name is the name the
+    /// compiler already uses. Deliberately not [`Debug`]: `Debug` for a
+    /// unit-only enum prints the variant name, which happens to match today and
+    /// is not a contract.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use sh_nexus::core::ordering::DifferingField;
+    ///
+    /// assert_eq!(DifferingField::EditedAt.as_str(), "edited_at");
+    /// ```
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::ChannelId => "channel_id",
+            Self::UserId => "user_id",
+            Self::Content => "content",
+            Self::Timestamp => "timestamp",
+            Self::EditedAt => "edited_at",
+            Self::Reactions => "reactions",
+            Self::ThreadId => "thread_id",
+            Self::Attachments => "attachments",
+        }
+    }
+}
+
+/// Decides which of two disagreeing copies of one message is kept.
+///
+/// This is **not** [`compare`]. Identity is "is this the same message?" and
+/// this answers a different question: "of the two values we hold for it, which
+/// is the later truth?". Only the first disagreement in the chain is a judgement;
+/// the rest exist to make the comparison total.
+///
+/// The chain, and why each step is there:
+///
+/// 1. **`edited_at`** — `None` sorts below `Some`, so an edited copy beats the
+///    unedited one and a later edit beats an earlier one. This is the one step
+///    that is not arbitrary: an edit *is* the later truth, and
+///    [`Message::edited_at`] documents that it arrives as a whole new value
+///    carrying the original ids.
+/// 2. **`id` emptiness** — a real server id beats an empty one, so the ACK
+///    handoff is decided by rule rather than by lexicographic luck. An
+///    unacknowledged message has no server id, and `""` sorts before every real
+///    id, so the common case already came out right; making it explicit means a
+///    caller that uses a non-empty local placeholder still gets the
+///    acknowledged copy.
+/// 3. **`timestamp`, then `id`, then `content`** — pure tie-breaking, and
+///    arbitrary. `content` is compared because it must be *something* and because
+///    two copies whose text differs but whose everything-else matches are
+///    genuinely indistinguishable without it.
+///
+/// # The one documented limit
+///
+/// Two copies that agree on all five of the above and differ in `user_id`,
+/// `channel_id`, `thread_id`, or in the *contents* of `reactions` /
+/// `attachments` compare **equal**, and the copy already held is kept. That makes
+/// the retained value depend on input order, which is the one thing this module
+/// otherwise guarantees it does not.
+///
+/// It cannot be fixed here: a total order over `Message` would need `Ord` on
+/// [`Reaction`] and [`Attachment`], and this work unit does not touch
+/// `core/models`. Such a batch is a server defect — one message whose author
+/// changed, or whose reactions changed, with no edit and no new timestamp — and
+/// it is *reported* as [`IngestOutcome::Conflicting`] either way. The gap is
+/// recorded here rather than papered over with an arbitrary ninth comparison
+/// over fields this module has no opinion about.
+fn precedence(left: &Message, right: &Message) -> Ordering {
+    left.edited_at
+        .cmp(&right.edited_at)
+        .then_with(|| {
+            // `bool::cmp` puts `true` higher, so the operands are reversed to
+            // say what is meant: **an empty id is the earlier truth.** Getting
+            // this the wrong way round keeps the optimistic copy and drops the
+            // server's, which is the ACK handoff failing in the direction the
+            // user notices.
+            left.id.is_empty().cmp(&right.id.is_empty()).reverse()
+        })
+        .then_with(|| left.timestamp.cmp(&right.timestamp))
+        .then_with(|| left.id.cmp(&right.id))
+        .then_with(|| left.content.cmp(&right.content))
+}
+
+/// Every field on which two copies of one message disagree.
+///
+/// Ordered as the fields are declared on `Message`, so the report reads in the
+/// order a reader scanning the struct will meet them.
+fn differing_fields(left: &Message, right: &Message) -> FieldList {
+    let mut fields = FieldList::new();
+    if left.id != right.id {
+        fields.push(DifferingField::Id);
+    }
+    if left.channel_id != right.channel_id {
+        fields.push(DifferingField::ChannelId);
+    }
+    if left.user_id != right.user_id {
+        fields.push(DifferingField::UserId);
+    }
+    if left.content != right.content {
+        fields.push(DifferingField::Content);
+    }
+    if left.timestamp != right.timestamp {
+        fields.push(DifferingField::Timestamp);
+    }
+    if left.edited_at != right.edited_at {
+        fields.push(DifferingField::EditedAt);
+    }
+    if left.reactions != right.reactions {
+        fields.push(DifferingField::Reactions);
+    }
+    if left.thread_id != right.thread_id {
+        fields.push(DifferingField::ThreadId);
+    }
+    if left.attachments != right.attachments {
+        fields.push(DifferingField::Attachments);
+    }
+    fields
+}
+
+/// What the client knows about one channel's resync position.
+///
+/// `PLAN.md` §6: resync is **per channel**, carrying `after` as a
+/// `DateTime<Utc>`; "a single global timestamp cannot reconstruct per-channel
+/// history".
+///
+/// Both fields are `Option` and the two `None`s mean opposite things, which is
+/// why they are named rather than positional:
+///
+/// - `cursor: None` — this channel has never been synced. The caller holds a
+///   whole history, not a suffix, and continuity is not a question about it.
+/// - `watermark: None` — the channel *is* synced, but the server stated nothing
+///   about how far the response reaches, so continuity cannot be established.
+///   This is the state every resync is in on the protocol as specified today, and
+///   it is **not** a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SyncExpectation {
+    /// The `after` cursor the client resumed from: the timestamp of the newest
+    /// message it is assumed to already hold.
+    ///
+    /// Treated as **exclusive**: `PLAN.md` §6's `after` means "strictly later
+    /// than", and [`SyncStatus::Outside`] reports a response that ignored that.
+    pub cursor: Option<DateTime<Utc>>,
+    /// The newest message the server says existed in the channel when it built
+    /// the response, i.e. "this response contains every message in
+    /// `(cursor, watermark]`".
+    ///
+    /// This is the field that makes gap detection possible at all, and
+    /// `PLAN.md` §6 does not define it yet. See the module docs.
+    pub watermark: Option<DateTime<Utc>>,
+}
+
+impl SyncExpectation {
+    /// An expectation for a channel that has never been synced.
+    ///
+    /// The `Default`, and named so a caller constructing this inline says what
+    /// it means rather than leaving a bare `..Default::default()`.
+    pub const fn never_synced() -> Self {
+        Self {
+            cursor: None,
+            watermark: None,
+        }
+    }
+}
+
+/// What can be established about an ordered set's continuity with its channel.
+///
+/// Deliberately **not** a `bool`. A two-valued answer would have to say "no
+/// gaps" in every case where gaps could not be checked, and the whole point of
+/// this module is that a client must not claim continuity it cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStatus {
+    /// No cursor: this channel has never been synced, so the set is a whole
+    /// history and "is there a gap" has no meaning against it.
+    ///
+    /// Distinct from [`SyncStatus::Unverifiable`] because the two need different
+    /// responses: nothing has gone wrong, and a first sync is what is missing.
+    NeverSynced,
+    /// A cursor exists, but the server stated no watermark for the response, so
+    /// continuity is **not established**.
+    ///
+    /// The honest state for the protocol in `PLAN.md` §6, and explicitly not a
+    /// pass: [`is_healthy`](Self::is_healthy) is `false` here.
+    Unverifiable {
+        /// The cursor that was resumed from.
+        cursor: DateTime<Utc>,
+    },
+    /// No gap is detectable, and the set is consistent with the cursor.
+    ///
+    /// Precisely: the set's newest message is at or beyond the watermark, or the
+    /// set is empty and the watermark is not beyond the cursor. The *interior*
+    /// cannot be checked without a server sequence number, so this is "no gap is
+    /// detectable", not a proof of continuity — which is why it requires the
+    /// server's assertion to mean anything.
+    Complete {
+        /// The newest timestamp in the set, or `None` when the set is empty and
+        /// the watermark showed there was nothing to receive.
+        newest: Option<DateTime<Utc>>,
+    },
+    /// The set is missing **every** message in `(after, before]`.
+    ///
+    /// Named interval, not a count: without a server sequence number the number
+    /// of missing messages is not knowable, and inventing one would put a
+    /// fabricated figure in front of the user. `after: None` means the set holds
+    /// nothing after the cursor at all.
+    Gap {
+        /// The newest timestamp the set *does* hold, or `None` if it holds
+        /// nothing in the interval.
+        after: Option<DateTime<Utc>>,
+        /// The watermark the server stated: the far end of the interval.
+        before: DateTime<Utc>,
+    },
+    /// The set contains a message at or before the cursor.
+    ///
+    /// **Not a gap**, and named separately so it cannot be mistaken for one. A
+    /// resync asked for "strictly after `cursor`", so this response is not what
+    /// was asked for: either the server ignored `after`, or the client recorded
+    /// a resume position it had not actually reached. Either way the client's
+    /// idea of where it is in the channel is wrong, which is worth surfacing
+    /// before it turns into duplicated history.
+    Outside {
+        /// The oldest timestamp in the set.
+        oldest: DateTime<Utc>,
+        /// The cursor the response should have been exclusive of.
+        cursor: DateTime<Utc>,
+    },
+}
+
+impl SyncStatus {
+    /// Whether the set is provably good enough to render as continuous.
+    ///
+    /// `true` for [`SyncStatus::Complete`] **only**.
+    ///
+    /// Every other state is `false` on purpose, including
+    /// [`SyncStatus::Unverifiable`]: a caller that gates "no duplicates, no gaps"
+    /// on this and treats `Unverifiable` as success would be asserting
+    /// continuity it has no evidence for. Callers that want to distinguish
+    /// "cannot tell" from "broken" must [`match`](Self) on the enum.
+    pub const fn is_healthy(self) -> bool {
+        matches!(self, Self::Complete { .. })
+    }
+}
+
+/// Assesses whether an ordered set is continuous with its channel.
+///
+/// Pure, and the whole of the gap story: the module detects a gap **only** from
+/// a server assertion about how far the response reaches, because the protocol
+/// carries no sequence number and a timestamp cursor cannot imply continuity.
+/// See the module docs for why the two obvious alternative definitions are both
+/// wrong.
+///
+/// # Arguments
+///
+/// * `ordered` - the reconciled set, as [`reconcile`] returned it. Takes the
+///   reconciled type rather than a slice so a caller cannot accidentally assess
+///   a set that was never deduplicated or ordered.
+/// * `expectation` - the channel's cursor and the server's stated watermark.
+///
+/// # Returns
+///
+/// A [`SyncStatus`]. Precedence is documented on each variant; the order the
+/// checks are applied in is:
+///
+/// 1. no cursor → [`SyncStatus::NeverSynced`];
+/// 2. the set holds something at or before the cursor →
+///    [`SyncStatus::Outside`], because a response that ignored `after` is not
+///    the response the rest of these checks reason about;
+/// 3. no watermark → [`SyncStatus::Unverifiable`];
+/// 4. otherwise [`SyncStatus::Complete`] or [`SyncStatus::Gap`].
+///
+/// # Errors
+///
+/// None; see [`reconcile`].
+///
+/// # Example
+///
+/// ```
+/// use sh_nexus::core::ordering::{assess_sync, reconcile, SyncExpectation, SyncStatus};
+///
+/// # fn at(second: i64) -> chrono::DateTime<chrono::Utc> {
+/// #     use chrono::TimeZone;
+/// #     chrono::Utc
+/// #         .timestamp_opt(1_789_000_000 + second, 0)
+/// #         .single()
+/// #         .expect("in range")
+/// # }
+/// # fn message(id: &str, second: i64) -> sh_nexus::core::models::Message {
+/// #     use smallvec::SmallVec;
+/// #     use uuid::Uuid;
+/// #     sh_nexus::core::models::Message {
+/// #         id: id.to_owned(),
+/// #         client_msg_id: Uuid::from_u128(u128::from(id.as_bytes()[1] - b'0')),
+/// #         channel_id: "c_1".to_owned(),
+/// #         user_id: "u_1".to_owned(),
+/// #         content: String::new(),
+/// #         timestamp: at(second),
+/// #         edited_at: None,
+/// #         reactions: SmallVec::new(),
+/// #         thread_id: None,
+/// #         attachments: SmallVec::new(),
+/// #     }
+/// # }
+/// let out = reconcile(vec![message("m1", 10)]);
+///
+/// // No cursor at all: a whole history, and nothing to be inconsistent with.
+/// assert_eq!(
+///     assess_sync(&out, SyncExpectation::never_synced()),
+///     SyncStatus::NeverSynced
+/// );
+///
+/// // A cursor but no watermark: continuity cannot be established, which is not
+/// // the same as continuity holding.
+/// let expectation = SyncExpectation { cursor: Some(at(0)), watermark: None };
+/// let status = assess_sync(&out, expectation);
+/// assert!(!status.is_healthy());
+/// assert_eq!(status, SyncStatus::Unverifiable { cursor: at(0) });
+/// ```
+pub fn assess_sync(ordered: &OrderedMessages, expectation: SyncExpectation) -> SyncStatus {
+    let Some(cursor) = expectation.cursor else {
+        return SyncStatus::NeverSynced;
+    };
+
+    // `reconcile` leaves the set ascending, so the first element is the oldest
+    // and the last is the newest. No scan: the set is already ordered, which is
+    // the other half of what this function needs.
+    let oldest = ordered.messages().first().map(|message| message.timestamp);
+    if let Some(oldest) = oldest {
+        if oldest <= cursor {
+            return SyncStatus::Outside { oldest, cursor };
+        }
+    }
+
+    let Some(watermark) = expectation.watermark else {
+        return SyncStatus::Unverifiable { cursor };
+    };
+
+    let newest = ordered.messages().last().map(|message| message.timestamp);
+
+    match newest {
+        // Nothing at all, and the server said there was something after the
+        // cursor: everything in the interval is missing.
+        None if watermark > cursor => SyncStatus::Gap {
+            after: None,
+            before: watermark,
+        },
+        // Nothing, and the watermark is behind the cursor: the channel is
+        // quiet, and an empty suffix is the right answer, not a gap.
+        None => SyncStatus::Complete { newest: None },
+        // The set stops short of what the server said it sent.
+        Some(newest) if newest < watermark => SyncStatus::Gap {
+            after: Some(newest),
+            before: watermark,
+        },
+        // The set reaches the watermark. Any message still missing from the
+        // interior would be undetectable without a sequence number, which is
+        // why the watermark has to be the server's assertion.
+        Some(newest) => SyncStatus::Complete {
+            newest: Some(newest),
+        },
+    }
+}

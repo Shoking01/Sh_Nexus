@@ -20,9 +20,10 @@
 //!    the announced version is the client least able to parse a frame stamped
 //!    with it. `rejection_frame_advertises_our_version_not_theirs` pins it.
 
+use rstest::rstest;
 use sh_nexus_wire::frame::{ClientEnvelope, ServerEnvelope, ServerFrame};
 use sh_nexus_wire::version::{UnsupportedVersion, PROTOCOL_VERSION, SUPPORTED_MAJOR_VERSIONS};
-use sh_nexus_wire::{negotiate, WireError, UNSUPPORTED_VERSION_CODE};
+use sh_nexus_wire::{negotiate, ProtocolVersion, WireError, UNSUPPORTED_VERSION_CODE};
 
 /// Every version this build can speak is accepted, and nothing else is.
 #[test]
@@ -249,4 +250,52 @@ fn unsupported_version_reports_both_versions_in_its_display() {
     assert!(text.contains("unsupported protocol version"), "{text}");
     assert_eq!(error.received, 5);
     assert_eq!(error.supported, SUPPORTED_MAJOR_VERSIONS);
+}
+
+/// A [`ProtocolVersion`] displays as the **bare major number**.
+///
+/// `PLAN.md` §6 defines `v` as a bare JSON integer -- not `"1"`, not `"v1"`, not
+/// a dotted `1.0` -- and this impl is the text form of that same field. It is
+/// what goes into a log line or a `detail` string, so the two questions worth
+/// asking are whether it is the bare integer, and whether it agrees with
+/// [`ProtocolVersion::get`]. A `Display` that rendered `"v1"` would be a
+/// display bug that no decoder would ever catch.
+///
+/// Parameterized per `AGENTS.md` §4.3 and ADR-008, one case per major this
+/// build speaks, with [`the_display_cases_cover_every_supported_version`] as the
+/// guard that makes a new major a test failure rather than a silent gap.
+#[rstest]
+#[case(PROTOCOL_VERSION)]
+fn a_protocol_version_displays_as_its_bare_major_number(#[case] major: u16) {
+    let version = negotiate(major).unwrap_or_else(|error| {
+        panic!("{major} is in SUPPORTED_MAJOR_VERSIONS, so it must negotiate: {error}")
+    });
+
+    assert_eq!(
+        version.to_string(),
+        major.to_string(),
+        "the rendering must be the bare integer `PLAN.md` section 6 puts in `v`"
+    );
+    assert_eq!(
+        version.to_string(),
+        version.get().to_string(),
+        "`Display` and `get` are two spellings of one fact and must agree"
+    );
+}
+
+/// The `Display` case list above covers [`SUPPORTED_MAJOR_VERSIONS`] exactly.
+///
+/// Redundant with the `assert_eq!` in
+/// `the_supported_version_set_is_the_single_documented_constant`, and kept
+/// because it is the check that fails when a **second** major is added: the set
+/// widens, the guard notices, and the `#[case]` has to be added. Without it, a
+/// multi-version build would render one of its majors untested and nothing would
+/// say so.
+#[test]
+fn the_display_cases_cover_every_supported_version() {
+    assert_eq!(SUPPORTED_MAJOR_VERSIONS, [PROTOCOL_VERSION]);
+    assert_eq!(
+        ProtocolVersion::CURRENT.to_string(),
+        PROTOCOL_VERSION.to_string()
+    );
 }
