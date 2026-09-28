@@ -87,9 +87,11 @@ flamegraph.svg
 *.flamegraph.svg
 perf.data*
 
-# Local benchmark output. Benchmarks are code (committed); their output is not.
-target/criterion/
-bench-out/
+# CodeGraph's local index. A machine-local SQLite knowledge graph of the
+# workspace that `gentle-ai codegraph init` writes into the project root. It is
+# regenerated from the source on demand and is specific to this checkout, so it
+# is disposable exactly like `target/`.
+.codegraph/
 
 # Locally generated test data. AGENTS.md section 8.2 requires large message
 # histories to come from proptest generators rather than checked-in files, so

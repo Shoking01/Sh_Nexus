@@ -93,6 +93,7 @@ identified.
 
 | File | Regions | Missed regions | Region cover | Missed lines | Line cover |
 |---|---|---|---|---|---|
+| `sh_nexus\src\core\cache.rs` | 125 | 1 | **99.20%** | 0 | **100.00%** |
 | `sh_nexus\src\core\markdown.rs` | 846 | 36 | **95.74%** | 31 | **94.98%** |
 | `sh_nexus\src\core\ordering.rs` | 190 | 0 | **100.00%** | 0 | **100.00%** |
 | `sh_nexus\src\lib.rs` | 148 | 58 | 60.81% | 32 | 67.68% |
@@ -101,31 +102,62 @@ identified.
 | `sh_nexus_wire\src\error.rs` | 4 | 0 | 100.00% | 0 | 100.00% |
 | `sh_nexus_wire\src\frame.rs` | 169 | 2 | 98.82% | 0 | 100.00% |
 | `sh_nexus_wire\src\version.rs` | 17 | 0 | 100.00% | 0 | 100.00% |
-| **TOTAL** | **1712** | **105** | **93.87%** | **70** | **94.42%** |
+| **TOTAL** | **1837** | **106** | **94.23%** | **70** | **94.79%** |
 
 Paths are as the tool reports them — Windows separators, workspace-relative to each crate.
 
-**`core/markdown.rs` is the new row, and 95.74% is not 100% — §4.7 says exactly which 36 regions
-and why.** 79 of 79 functions executed. Every one of the 31 missed lines is a *defensive* arm
-guarding a case the parser has already excluded, not an untested decision; §4.7 enumerates all 31
-so the claim can be checked rather than taken on trust.
+**`core/cache.rs` is the new row: 125 regions, 1 missed, 20 of 20 functions executed, 88 of 88
+lines.** The single missed region is the `None` arm of an `if let` in `promote`, unreachable
+because every caller has already established the key is live. Removing it would trade a §2.1
+safety property for one region, which is the wrong trade; §4.8 records it.
 
-`core/ordering.rs` is unchanged to the decimal from 1B, which is the control that makes the rest of
-the table readable: 1C-1 did not touch that file, and the tool reports exactly what it reported
-before.
+**An arithmetic correction, recorded rather than quietly fixed.** Work unit 1C-2a first reported
+`core/` at 95.94% using a denominator of 1,171. That denominator is a summation error: the layer
+is `ordering.rs` 190 + `markdown.rs` 846 + `cache.rs` 125 = **1,161**, not 1,171. With the correct
+denominator the layer is 1,124 / 1,161 = **96.81%**, a **rise** of 0.28 points rather than the
+0.59-point fall that was reported and built a narrative on. The underlying advice — gate a
+per-layer threshold on the floor, not on the previous total — survives the correction; the
+evidence offered for it did not, and the "second consecutive fall" claim was false.
+
+`core/ordering.rs` is unchanged to the decimal for the second consecutive work unit, which is
+the control that makes the rest of the table readable.
+
+### 2.1.1 The `core/` layer arithmetic, stated so it can be checked
+
+| | 1B | 1C-1 | 1C-2a |
+|---|---|---|---|
+| files | 1 | 2 | 3 |
+| regions | 190 | 1036 | 1161 |
+| missed | 0 | 36 | 37 |
+| covered | 190 | 1000 | 1124 |
+| **region cover** | **100.00%** | **96.53%** | **96.81%** |
+| floor | 90% | 90% | 90% |
+| margin | +10.00 | +6.53 | +6.81 |
+
+1C-1's recorded prediction was that a new file landing near `markdown.rs`'s ~96% would settle the
+layer near 97%, and one landing at `ordering.rs`'s 100% would settle above 98%. `cache.rs` landed
+at 99.20% and the layer settled at 96.81% — inside neither band. The prediction compared a new
+file's own score against a *layer total*, and a new file is a minority of the denominator: 125 new
+regions at 99.20% lift the total by 0.28 points, where an equal-to-average addition would give
+roughly 1.5. The prediction is left standing as a refutation.
 
 ### 2.2 Crate and layer aggregates
 
 | Aggregate | Region cover | Line cover |
 |---|---|---|
-| **`core/`** | **96.53%** (1000/1036 regions) | **95.93%** (730/761 lines) |
+| **`core/`** | **96.81%** (1124/1161 regions) | **96.46%** (818/848 lines) |
 | **`sh_nexus_wire` as a crate** | **98.95%** (188/190 regions) | **100.00%** (159/159 lines) |
-| `sh_nexus` as a crate | 93.23% (1419/1522 regions) | 93.61% (1026/1096 lines) |
+| `sh_nexus` as a crate | 93.96% (1571/1672 regions) | 94.06% (1077/1145 lines) |
 
-`core/` now covers **two** files. It covered one in 1B, and that one was at 100%; §2.7 is the delta
-and §4.7 is the detail. The aggregate **fell**, and that is the honest reading: a layer is measured
-by everything in it, and a new file at 95.74% moves the number whether or not 95.74% is good. It is
-good — 5.53 points above the floor — and the file is characterised rather than waved through.
+`core/` now covers **three** files. One in 1B at 100%, two in 1C-1 at 96.53%, three in 1C-2a at
+**96.81%** — a rise of 0.28 points, because `cache.rs` landed at 99.20% with a single missed
+region, which is above the layer average and therefore lifts the total. The full three-column
+arithmetic is in §2.1.1 so it can be checked rather than believed; the first report of this figure
+used a denominator of 1,171 instead of 1,161 and stated a fall, and that correction is recorded in
+§2.1 rather than applied silently.
+
+It is 6.81 points above the floor. `ordering.rs` remains the highest-scoring file in the
+workspace at 100% regions, 100% functions and 100% lines.
 
 
 ### 2.3 Files that do not appear in the report at all

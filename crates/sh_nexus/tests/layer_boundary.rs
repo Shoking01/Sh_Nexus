@@ -423,6 +423,68 @@ fn core_contains_no_panicking_construct() {
     }
 }
 
+/// `core/cache.rs` contains no interior mutability.
+///
+/// `AGENTS.md` 4.2's cache row ends with "thread safety", and that clause has
+/// two halves. Work unit 1C-2a owns the **type-level** half -- `LruCache` is
+/// `Send + Sync` whenever its parameters are, and that is proved at compile time
+/// by `the_cache_is_send_and_sync` in `tests/cache.rs`. This test is what
+/// proves it structurally, rather than by whoever happens to remember.
+///
+/// A reader who finds a `Mutex` in this module should be surprised, because the
+/// whole point of the design is that it is a plain struct the caller owns and
+/// mutates: every method that changes it takes `&mut self`, and the other half of
+/// the thread-safety question -- whether two threads may hold `&mut` to one
+/// cache at once, and therefore whether it needs internal synchronisation -- is
+/// work unit 1C-2b's decision, not a detail this module settles by accident.
+///
+/// **Scoped to this one file, unlike the tests above, and the reason is
+/// specific rather than lazy.** Interior mutability is not wrong in `core/` in
+/// general; a pure value type may legitimately want a `Cell` for a cache of its
+/// own. What is forbidden *here* is a lock or a cell in a structure whose
+/// documented contract is "no interior mutability, and therefore `Send + Sync`
+/// whenever the parameters are". That contract is the thing 1C-2b will build its
+/// synchronisation decision on, and a `Mutex` added to make some caller
+/// convenient would quietly revoke it -- so it is a boundary rather than a
+/// review comment.
+///
+/// Comments are stripped first, so this file's own module documentation may
+/// discuss `Mutex` and `RwLock` at length, which it does.
+#[test]
+fn core_cache_contains_no_interior_mutability() {
+    let cache = src_dir().join("core").join("cache.rs");
+    assert!(
+        cache.is_file(),
+        "{} should exist: AGENTS.md 3.1 places the LRU cache at src/core/cache.rs",
+        cache.display()
+    );
+
+    let stripped = without_comments(
+        &fs::read_to_string(&cache)
+            .unwrap_or_else(|error| panic!("{} should be readable: {error}", cache.display())),
+    );
+
+    for token in [
+        "Mutex",
+        "RwLock",
+        "RefCell",
+        "Cell<",
+        "UnsafeCell",
+        "OnceCell",
+        "LazyLock",
+    ] {
+        assert!(
+            !stripped.contains(token),
+            "core/cache.rs contains `{token}`. The LRU cache is documented as a \
+             plain struct with no interior mutability, which is what makes it \
+             Send + Sync whenever its parameters are -- the half of AGENTS.md 4.2's \
+             'thread safety' clause that work unit 1C-2a owns. Whether it needs \
+             internal synchronisation at all is 1C-2b's decision, and it cannot be \
+             made by a lock appearing here."
+        );
+    }
+}
+
 /// `network/` names no `gpui`.///
 /// §3.2's rule for `network/` is narrower than for `core/` -- `network/` *will*
 /// import `tokio` in Phase 4 -- but the GPUI prohibition is absolute and is the
