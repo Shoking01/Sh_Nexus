@@ -98,6 +98,7 @@ architecture is unaffected, because GPUI is confined to `ui/` and `app.rs`.
 | Persistence | rusqlite (SQLite, `bundled`) | Local message cache, outbox, preferences |
 | Serialization | serde + serde_json | Message encoding/decoding |
 | Error types | thiserror | `ShNexusError` derive — mandated by AGENTS.md §2.2/§3.3 |
+| Parameterized tests | rstest (dev) | Mandated by AGENTS.md §4.3 — see ADR-008 |
 | Identifiers | uuid | `client_msg_id` per §7.4 |
 | Time | chrono | `DateTime<Utc>` per §2.1 |
 | Small collections | smallvec | `SmallVec` for reactions/attachments per §2.3 |

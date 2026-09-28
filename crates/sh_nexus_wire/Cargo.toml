@@ -67,3 +67,4 @@ thiserror = { workspace = true }
 # feature choice and for why a second copy of proptest (the first arrives via
 # `gpui_platform/test-support`) is the accepted cost.
 proptest = { workspace = true }
+rstest = { workspace = true }

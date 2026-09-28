@@ -89,3 +89,4 @@ smallvec = { workspace = true }
 # the cost of a second copy of proptest (the first arrives via
 # gpui_platform/test-support) are recorded in the root Cargo.toml.
 proptest = { workspace = true }
+rstest = { workspace = true }
