@@ -158,3 +158,55 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 #   than rewritten.
 # ---------------------------------------------------------------------------
 rstest = "0.27"
+
+# ---------------------------------------------------------------------------
+# pulldown-cmark 0.13.4 | MIT | actively maintained (0.13.4 released
+#   2026-05-20) | 48,413,256 downloads in the last 90 days | MSRV 1.71.1
+#   against our 1.98.1 | crate size 155,043 bytes.
+#
+#   Criterion 1 -- "verify no solution exists with current dependencies or the
+#   std library". Nothing else in this tree parses CommonMark: `AGENTS.md` 4.2
+#   names a mandatory test target of "markdown bold/italic/code/links, nested
+#   formatting, never panics, injection safety", and `PLAN.md` 2 already lists
+#   `pulldown-cmark` in the tech stack and 8 Phase 1 already names
+#   `core/markdown.rs` as "Markdown to styled segment tree". Hand-rolling a
+#   CommonMark parser is the exact case the criterion exists to exclude, and it
+#   would be the one module in the workspace whose correctness is argued rather
+#   than tested. This declaration closes a gap `PLAN.md` 2 had already recorded.
+#
+#   Criterion 2 -- maintained: released 2026-05-20, the most recent 0.13.x, and
+#   the crate the entire Rust Markdown ecosystem (including Zed itself, whose
+#   own markdown rendering is built on it) depends on.
+#
+#   Criterion 3 -- license: `MIT`, confirmed in BOTH the repository `LICENSE`
+#   file and the published crate's `license` field. MIT is one of the licenses
+#   `AGENTS.md` 7.2 names as compatible, and this project's own LICENSE is MIT
+#   (root `Cargo.toml` `workspace.package.license`, which the `rstest` block
+#   above records was corrected to match the LICENSE file).
+#
+#   Criterion 4 -- compile-time impact, and this is the figure that differs from
+#   every other entry in this file: `AGENTS.md` 7.2's usual "no new compile
+#   units, it was already in the tree via GPUI" argument does NOT apply. At 1C-1
+#   `Cargo.lock` held no `pulldown-cmark` and no `unicase`; `bitflags 2.13.2`
+#   and `memchr 2.8.3` were already present transitively. So the honest figure
+#   is TWO new compile units -- `pulldown-cmark` itself and `unicase`, pulled
+#   in by the `getopts` feature and needed for case-insensitive HTML tag-name
+#   matching. Measured in the Phase 1 timings pass. Both are small, pure Rust,
+#   no C, no build script, no proc-macros.
+#
+#   Criterion 5 -- justification comment: this one.
+#
+#   Feature choice: `default-features = false`, and this is the interesting
+#   decision. The default set is `["getopts", "html"]`. `html` pulls
+#   `pulldown-cmark-escape` and exists solely to serve `pulldown_cmark::html`,
+#   the HTML *renderer* -- a thing this project does not have and must not want:
+#   `PLAN.md` 2's row is "Markdown parsing into a styled segment tree", and
+#   `ui/` renders GPUI elements, not HTML. Enabling it would add a dependency
+#   whose sole purpose is to escape text for a renderer we do not ship.
+#   `getopts` compiles a small command-line flag parser that is only reachable
+#   from the crate's `pulldown-cmark` binary target, which a library dependency
+#   does not build. Both stay off deliberately, and `getopts` being off does not
+#   remove `unicase` (see the criterion-4 note: it is a non-optional runtime
+#   dependency).
+# ---------------------------------------------------------------------------
+pulldown-cmark = { version = "0.13", default-features = false }

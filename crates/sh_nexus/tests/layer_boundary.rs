@@ -143,8 +143,27 @@ fn use_statements(stripped: &str) -> Vec<(usize, String)> {
 /// `crate` and `super` are allowed because `core/` necessarily refers to its own
 /// submodules; [`core_reaches_only_its_own_modules`] is the separate test that
 /// checks *which* internal paths it reaches.
-const CORE_ALLOWED_CRATES: [&str; 8] = [
-    "std", "core", "alloc", "chrono", "smallvec", "uuid", "crate", "super",
+///
+/// **`pulldown-cmark` was added here in work unit 1C-1, in the same commit that
+/// added it to `Cargo.toml`.** That is the property that makes an allow-list
+/// worth maintaining: the dependency was *rejected* until the decision was
+/// recorded, so the two files cannot drift. It is also the narrowest addition
+/// this list could take -- `core/markdown.rs` is the only file that names it, it
+/// parses a string and returns data, and it has no I/O, no clock, no thread and
+/// no handle on anything the caller does not already hold. The parsing crates
+/// `PLAN.md` section 2 lists for other layers stay out on purpose: `syntect`
+/// (syntax highlighting) is a Phase 5 concern and `notify` is a filesystem
+/// watcher, which is `platform/file_watch.rs`.
+const CORE_ALLOWED_CRATES: [&str; 9] = [
+    "std",
+    "core",
+    "alloc",
+    "chrono",
+    "smallvec",
+    "uuid",
+    "pulldown_cmark",
+    "crate",
+    "super",
 ];
 
 /// Crates `core/` may never name.
