@@ -431,25 +431,34 @@ fn core_contains_no_panicking_construct() {
 /// by `the_cache_is_send_and_sync` in `tests/cache.rs`. This test is what
 /// proves it structurally, rather than by whoever happens to remember.
 ///
-/// A reader who finds a `Mutex` in this module should be surprised, because the
-/// whole point of the design is that it is a plain struct the caller owns and
-/// mutates: every method that changes it takes `&mut self`, and the other half of
-/// the thread-safety question -- whether two threads may hold `&mut` to one
-/// cache at once, and therefore whether it needs internal synchronisation -- is
-/// work unit 1C-2b's decision, not a detail this module settles by accident.
+/// **Work unit 1C-2b settled the other half, and this test is now what enforces
+/// its decision rather than merely documenting it.** The decision is that the
+/// cache has **no internal synchronisation**: `PLAN.md` section 4 makes
+/// `state/bridge.rs` the sole owner of `cx.update_global` / `cx.update`, so every
+/// network callback reaches application state through the main thread, and a
+/// cache reached only from there is main-thread-owned and needs no lock. A caller
+/// that ever needs cross-thread access wraps the cache in its own `Mutex`
+/// *outside* `core/`, which the type-level half is what makes possible.
+///
+/// **So the two halves are now load-bearing for each other, and this is the
+/// mechanical guard on that.** A `Mutex` added "to make some caller convenient"
+/// would not merely be a style objection: it would silently revoke the property
+/// that makes external wrapping work, put a lock on every frame-path read of the
+/// cache against `AGENTS.md` 2.3, and add a poisoned-lock policy to a module that
+/// `AGENTS.md` 2.1 forbids from having one. `the_bounded_cache_is_send_and_sync`
+/// in `tests/cache_ceiling.rs` is the compile-time half; this is the structural
+/// half, and between them the decision cannot be revoked by accident.
 ///
 /// **Scoped to this one file, unlike the tests above, and the reason is
 /// specific rather than lazy.** Interior mutability is not wrong in `core/` in
 /// general; a pure value type may legitimately want a `Cell` for a cache of its
 /// own. What is forbidden *here* is a lock or a cell in a structure whose
 /// documented contract is "no interior mutability, and therefore `Send + Sync`
-/// whenever the parameters are". That contract is the thing 1C-2b will build its
-/// synchronisation decision on, and a `Mutex` added to make some caller
-/// convenient would quietly revoke it -- so it is a boundary rather than a
-/// review comment.
+/// whenever the parameters are" -- a contract the documented thread-safety
+/// decision now rests on.
 ///
 /// Comments are stripped first, so this file's own module documentation may
-/// discuss `Mutex` and `RwLock` at length, which it does.
+/// discuss `Mutex` and `RwLock` at length, which `core/cache.rs` section 13 does.
 #[test]
 fn core_cache_contains_no_interior_mutability() {
     let cache = src_dir().join("core").join("cache.rs");
@@ -477,10 +486,15 @@ fn core_cache_contains_no_interior_mutability() {
             !stripped.contains(token),
             "core/cache.rs contains `{token}`. The LRU cache is documented as a \
              plain struct with no interior mutability, which is what makes it \
-             Send + Sync whenever its parameters are -- the half of AGENTS.md 4.2's \
-             'thread safety' clause that work unit 1C-2a owns. Whether it needs \
-             internal synchronisation at all is 1C-2b's decision, and it cannot be \
-             made by a lock appearing here."
+             Send + Sync whenever its parameters are. Work unit 1C-2b decided \
+             (core/cache.rs section 13) that it needs no internal \
+             synchronisation: PLAN.md section 4 makes state/bridge.rs the sole \
+             owner of cx.update_global, so the cache is main-thread-owned. A \
+             lock here would revoke the type-level property that lets a caller \
+             wrap one for cross-thread use, would put a lock on every frame-path \
+             read, and would add a poisoned-lock policy that AGENTS.md 2.1 \
+             forbids. If a worker thread really must reach a cache, wrap it in \
+             the layer that owns the thread -- and say so in section 13."
         );
     }
 }

@@ -91,6 +91,9 @@ perf.data*
 # workspace that `gentle-ai codegraph init` writes into the project root. It is
 # regenerated from the source on demand and is specific to this checkout, so it
 # is disposable exactly like `target/`.
+# Agent skill registry: the local index this environment resolves skills through.
+# Per-machine, regenerated on demand, and of no use to a reader of the repository.
+.atl/
 .codegraph/
 
 # Locally generated test data. AGENTS.md section 8.2 requires large message

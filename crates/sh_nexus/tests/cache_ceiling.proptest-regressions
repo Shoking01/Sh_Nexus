@@ -1,0 +1,14 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8838be8be248f864e4a80cf833c0e972fbca23962e26f05b708727f717c3cbe0 # shrinks to capacity = 0, ops = [], raised_to = 0, remove = false
+cc c8ef2e381c053595bd3513ffa26680b172c25db1703a2fd2e622d781d18be76b # shrinks to capacity = 0, initial_budget = None, ops = [Insert { key: 0, value: 0, cost: 0 }]
+cc 4e07c2b92dd0bf5e232a6b669331eb92969c5a408149cb9440f2828c8b4fcb51 # shrinks to capacity = 2, ops = [Insert { key: 0, value: 0, cost: 18446744073709551615 }], raised_to = 0, remove = false
+cc f40f48d4c42e6159b69fc875f1d2bbbb6be4aeae1134ae195adf56e17c5cfb96 # shrinks to capacity = 1, initial_budget = Some(1), ops = [Insert { key: 0, value: 0, cost: 0 }, Insert { key: 0, value: 0, cost: 288230376151711743 }]
+cc 6612fb157c6549dc26962206fd24e4fc6e94cab92e72db11362e347018a6815a # shrinks to capacity = 0, budget = 23, setup = [Insert { key: 0, value: 0, cost: 0 }], key = 0, cost = 128
+cc 07f338630fd942ba4d372de7b3234d6d9866d4cc425ab78a8fc9d795178bab98 # shrinks to capacity = 0, ops = [Insert { key: 0, value: 0, cost: 0 }]
+cc 528b8ad89e11d72b6334efd0316354f511588942cd1c8c7a3ecebeaadadde1f5 # shrinks to capacity = 0, ops = [Insert { key: 0, value: 0, cost: 0 }], raised_to = 0, remove = false
+cc 28842601e5062c184d5d029afc03068c51920eb030a466b2cfb5a2c2d89b8f09 # shrinks to capacity = 0, ops = [], key = 0, cost = 0

@@ -1,6 +1,6 @@
 # Sh_Nexus — Measured Coverage Baseline
 
-This file records the **measured** coverage of the workspace, most recently as of work unit 1C-1, so
+This file records the **measured** coverage of the workspace, most recently as of work unit 1C-2b, so
 the numbers are not lost and later work has something concrete to regress against.
 
 `AGENTS.md` §2.3: *"Profile before optimizing. Measure, don't guess."* `AGENTS.md` §6.3 makes a
@@ -9,23 +9,38 @@ coverage drop merge-blocking, which requires a baseline to drop *from*. This fil
 It is a **record of measurement, not a claim of compliance.** Where a floor cannot yet be measured,
 §3 says so explicitly rather than letting an absent row read as a pass.
 
-**Recorded:** 2026-09-27 · **work unit 1C-1** · Windows, MSVC, rustc 1.98.1
+**Recorded:** 2026-09-28 · **work unit 1C-2b** · Windows, MSVC, rustc 1.98.1
+**Prior:** 2026-09-27 · work unit 1C-2a · same environment
+**Prior:** 2026-09-27 · work unit 1C-1 · same environment
 **Prior:** 2026-09-27 · work unit 1B · same environment
 **Baseline recorded:** 2026-09-27 · work unit 1A · same environment
 
 `AGENTS.md` §6.3 makes a coverage drop merge-blocking, and a drop is only
-meaningful against a prior number, so **all three** recordings are kept: 1B's figures are
-in §2.5 as a delta table against 1A, 1C-1's delta is §2.7, and 1C-1's are the live tables in
-§2.1–§2.2. Where a prior recording made a prediction that measurement then refuted, that is recorded
+meaningful against a prior number, so **every** recording is kept: 1B's figures are
+in §2.5 as a delta table against 1A, 1C-1's delta is §2.7, 1C-2a's live figures were the
+§2.1–§2.2 tables this recording replaced, and 1C-2b's delta is **§2.8**. Where a prior
+recording made a prediction that measurement then refuted, that is recorded
 as a refutation rather than quietly corrected — `PLAN.md` Rev 2's whole history is predictions that
 measurement did not support.
 
-**The headline of 1C-1 is a number that went *down*, and it is the interesting
-one.** `core/`'s aggregate fell from 100.00% to 96.53% because a second file
-entered the denominator at 95.74% rather than at 100%. The floor is still met
-with 6.53 points to spare. §2.7 sets out the full arithmetic, because a coverage
-file that only recorded improvements would be a coverage file nobody could use
-as a baseline.
+**The headline of 1C-2b is that no aggregate regressed, and the interesting part is a pair of
+arithmetic errors in the recording immediately before this one.** `core/cache.rs` grew from 125
+regions to 178 by being extended with the memory-ceiling policy and the thread-safety decision, and
+it grew coverage with it: 99.20% → 99.44%, with the missed-region count unchanged at one. `core/`
+therefore **rose** 0.14 points to 96.95%, the workspace total rose 0.16 to 94.39% with its
+missed-region count unchanged at 106, and `sh_nexus` as a crate rose 0.20 — **the last of those
+only after its baseline was corrected**, which is the finding worth reading this file for.
+
+**Two arithmetic corrections are recorded rather than applied silently, and both are in the 1C-2a
+recording.** §2.4's `core/` **line** figure was published as `818/848 = 96.46%`; the denominator
+should have been **849**, so the correct figure is `818/849 = 96.35%`. §2.2's `sh_nexus` crate
+figure was published as `93.96% (1571/1672)` on both columns; **neither number in either fraction
+can be reproduced from the per-file table beside it**, and the correct figures are
+`1543/1647 = 93.69%` regions and `1114/1184 = 94.09%` lines. §4.9 gives the arithmetic and four
+independent cross-checks. **The `core/` region column, which is what ADR-004's floors rest on, was
+correct throughout.** §1 records the rule this recording adopts as a result: every aggregate is
+recomputed from §2.1's per-file rows rather than carried forward, and the crates are checked to sum
+to the tool's TOTAL.
 
 ---
 
@@ -42,21 +57,29 @@ cargo install cargo-llvm-cov --version 0.9.1 --locked
 cargo llvm-cov --workspace --all-targets --summary-only
 ```
 
-The `--all-targets` flag is kept from 1A so the two recordings share a
+The `--all-targets` flag is kept from 1A so every recording shares a
 denominator. It makes no difference to the numbers here — there are no benches or
 examples in the workspace — and `cargo llvm-cov --workspace --summary-only` was
-run as well and produced **byte-identical** per-file figures. That is worth one
+run as well and produced **byte-identical** per-file figures in 1C-2b, the third
+consecutive recording in which the two agree. That is worth one
 sentence because a flag whose absence would have silently changed the
 denominator is exactly the sort of thing §6.3's regression gate should not
 depend on.
 
 **Tool versions verified for this recording:** `cargo-llvm-cov 0.9.1`, same as
-1A and 1B. `rustc 1.98.1 (MSVC)`, 12 logical CPUs, MSVC Build Tools 2022, Windows SDK
-10.0.26100.0. **1C-1 added a dependency to the workspace** (`pulldown-cmark 0.13.4`, plus `unicase`
-2.9.0 as its only new non-optional runtime dependency) and the tool was re-verified rather than
-assumed, because a different instrumentation set would invalidate the comparison against 1B's
-figures. It did not: the `--all-targets` denominator and the eight reportable files are the same
-shape, with `core/markdown.rs` added.
+1A, 1B, 1C-1 and 1C-2a. `rustc 1.98.1 (MSVC)`, 12 logical CPUs, MSVC Build Tools 2022, Windows SDK
+10.0.26100.0. **1C-2b added no dependency**, so the instrumented region set is
+comparable by construction rather than by inspection — the first work unit since 1C-1 that can say
+that, and the reason the comparison needed no re-verification this time. The `--all-targets`
+denominator and the nine reportable files are the same shape as 1C-2a's.
+
+**One thing that did change the measurement inputs, and it is recorded because it affects
+reproducibility rather than the denominator:** 1C-2b's proptest properties found failing cases during
+development, and proptest wrote them to
+`crates/sh_nexus/tests/cache_ceiling.proptest-regressions`, which is committed. Those seeds are
+replayed before any novel case is generated, so the suite is *more* reproducible than it was before
+them, and the file must not be deleted as noise. §2.6's recommendation of a fixed seed is unaffected
+— the regressions file is the per-case mechanism, not a global one.
 
 ### Tool substitution — `cargo-tarpaulin` → `cargo llvm-cov`
 
@@ -80,84 +103,138 @@ same way `AGENTS.md` §6.1's false binary-size note is handled (`docs/ARCHITECTU
 **Every figure in this file is from the `cargo-llvm-cov` run above.** No figure is estimated,
 interpolated, or rounded.
 
+### The rule this recording adopted after finding two arithmetic errors
+
+**Every aggregate in §2.2 and every delta in §2.5/§2.7/§2.8 is recomputed from §2.1's per-file
+rows at the moment of writing, and the two crates are checked to sum to the tool's TOTAL.** It is
+recorded as a rule rather than a remark because §4.9 found two wrong aggregates in the immediately
+preceding recording, and both were *derived* figures — hand-computed from a transcription rather than
+read from the tool. A propagated aggregate has no transcription step to catch a mistake, which is
+the mechanism of both. §4.9 gives the arithmetic and the four cross-checks; §5.5 carries the audit
+of the older recordings as an open action, and deliberately does not do it here, because rewriting a
+prior recording's figures destroys the record the file exists to keep.
+
 ---
 
 ## 2. Measured results
 
 ### 2.1 Per file
 
-Modal run, per §2.6's practice: the case that most runs produce. Two runs were taken and
-`mapping.rs` differed between them; `core/markdown.rs` was **byte-identical in both**, which is
-recorded in §2.6 because it is the first evidence that the fluctuation is confined to the file 1B
-identified.
+Modal run, per §2.6's practice: the case that most runs produce. Two runs were taken in 1C-2b and
+**every row was byte-identical between them**, including `mapping.rs`, which is the file 1B
+identified as the fluctuating one. That is the first recording in which §2.6's instability did not
+reproduce, and §2.6 says so rather than leaving the claim standing unchallenged.
 
 | File | Regions | Missed regions | Region cover | Missed lines | Line cover |
 |---|---|---|---|---|---|
-| `sh_nexus\src\core\cache.rs` | 125 | 1 | **99.20%** | 0 | **100.00%** |
+| `sh_nexus\src\core\cache.rs` | 178 | 1 | **99.44%** | 0 | **100.00%** |
 | `sh_nexus\src\core\markdown.rs` | 846 | 36 | **95.74%** | 31 | **94.98%** |
-| `sh_nexus\src\core\ordering.rs` | 190 | 0 | **100.00%** | 0 | **100.00%** |
+| `sh_nexus\src\core\ordering.rs` | 190 | 0 | **100.00%** | 0 | 100.00% |
 | `sh_nexus\src\lib.rs` | 148 | 58 | 60.81% | 32 | 67.68% |
 | `sh_nexus\src\main.rs` | 7 | 7 | 0.00% | 7 | 0.00% |
 | `sh_nexus\src\network\mapping.rs` | 331 | 2 | 99.40% | 0 | 100.00% |
 | `sh_nexus_wire\src\error.rs` | 4 | 0 | 100.00% | 0 | 100.00% |
 | `sh_nexus_wire\src\frame.rs` | 169 | 2 | 98.82% | 0 | 100.00% |
 | `sh_nexus_wire\src\version.rs` | 17 | 0 | 100.00% | 0 | 100.00% |
-| **TOTAL** | **1837** | **106** | **94.23%** | **70** | **94.79%** |
+| **TOTAL** | **1890** | **106** | **94.39%** | **70** | **94.95%** |
 
 Paths are as the tool reports them — Windows separators, workspace-relative to each crate.
 
-**`core/cache.rs` is the new row: 125 regions, 1 missed, 20 of 20 functions executed, 88 of 88
-lines.** The single missed region is the `None` arm of an `if let` in `promote`, unreachable
-because every caller has already established the key is live. Removing it would trade a §2.1
-safety property for one region, which is the wrong trade; §4.8 records it.
+**Both columns reconcile for the first time in this file's history, and the arithmetic is here so
+it can be checked rather than believed.**
 
-**An arithmetic correction, recorded rather than quietly fixed.** Work unit 1C-2a first reported
-`core/` at 95.94% using a denominator of 1,171. That denominator is a summation error: the layer
-is `ordering.rs` 190 + `markdown.rs` 846 + `cache.rs` 125 = **1,161**, not 1,171. With the correct
-denominator the layer is 1,124 / 1,161 = **96.81%**, a **rise** of 0.28 points rather than the
-0.59-point fall that was reported and built a narrative on. The underlying advice — gate a
-per-layer threshold on the floor, not on the previous total — survives the correction; the
-evidence offered for it did not, and the "second consecutive fall" claim was false.
+```text
+regions: 178 + 846 + 190 + 148 +   7 + 331 +   4 + 169 +  17 = 1890
+missed:   1 +  36 +   0 +  58 +   7 +   2 +   0 +   2 +   0 =  106
+covered: 1890 − 106 = 1784        1784 / 1890 = 94.39%
 
-`core/ordering.rs` is unchanged to the decimal for the second consecutive work unit, which is
+lines:  132 + 618 + 143 +  99 +   7 + 229 +   3 + 139 +  17 = 1387
+missed:   0 +  31 +   0 +  32 +   7 +   0 +   0 +   0 +   0 =   70
+covered: 1387 −  70 = 1317        1317 / 1387 = 94.95%
+```
+
+**`core/cache.rs` is the changed row: 178 regions, 1 missed, 30 of 30 functions executed, 132 of 132
+lines.** At 1C-2a it was 125 regions, 1 missed, 20 of 20 functions, 88 of 88 lines. The 53 new
+regions are the memory-ceiling policy and the thread-safety decision, and **every one of them is
+covered** — the missed-region count did not move, which is the number that says the new code was
+exercised rather than merely present. The one missed region is still the `None` arm of an `if let`
+in `promote`, unreachable because every caller has already established the key is live. Removing it
+would trade an `AGENTS.md` §2.1 safety property for one region, which is the wrong trade; §4.8
+records it. §4.8 is where the ceiling's *behaviour* is characterised, because behaviour is what
+coverage cannot see.
+
+**An arithmetic correction to the previous recording, recorded rather than quietly fixed — and it is
+in the line column, not the region column.** §2.2 at 1C-2a published `core/` at `818/848 = 96.46%`
+lines. The denominator is wrong: `cache.rs` had **88** lines at 1C-2a, so the layer's line count was
+`88 + 618 + 143 = 849`, not 848. The correct 1C-2a figure is `818/849 = 96.35%`. The cause is
+identified in §2.4: the hand arithmetic there listed `618 + 143 + 99 + 7 + 229 + 3 + 139 + 17 =
+1255` and **omitted `cache.rs` entirely** — the file had not been written when §2.4's arithmetic was
+first performed, and it was never revised. §2.1's own TOTAL line figure at 1C-2a was correct
+(`1273/1343 = 94.79%`), so the tool never disagreed; the document did. **The region column, which is
+what ADR-004's floors rest on, was correct at every recording and is unchanged.**
+
+`core/ordering.rs` is unchanged to the decimal for the **third** consecutive work unit, which is
 the control that makes the rest of the table readable.
 
 ### 2.1.1 The `core/` layer arithmetic, stated so it can be checked
 
-| | 1B | 1C-1 | 1C-2a |
-|---|---|---|---|
-| files | 1 | 2 | 3 |
-| regions | 190 | 1036 | 1161 |
-| missed | 0 | 36 | 37 |
-| covered | 190 | 1000 | 1124 |
-| **region cover** | **100.00%** | **96.53%** | **96.81%** |
-| floor | 90% | 90% | 90% |
-| margin | +10.00 | +6.53 | +6.81 |
+| | 1B | 1C-1 | 1C-2a | 1C-2b |
+|---|---|---|---|---|
+| files | 1 | 2 | 3 | 3 |
+| regions | 190 | 1036 | 1161 | **1214** |
+| missed | 0 | 36 | 37 | **37** |
+| covered | 190 | 1000 | 1124 | **1177** |
+| **region cover** | **100.00%** | **96.53%** | **96.81%** | **96.95%** |
+| floor | 90% | 90% | 90% | 90% |
+| margin | +10.00 | +6.53 | +6.81 | **+6.95** |
+| lines | 143 | 761 | 849 | **893** |
+| missed lines | 0 | 31 | 31 | **31** |
+| line cover | 100.00% | 95.93% | 96.35% | **96.53%** |
 
-1C-1's recorded prediction was that a new file landing near `markdown.rs`'s ~96% would settle the
-layer near 97%, and one landing at `ordering.rs`'s 100% would settle above 98%. `cache.rs` landed
-at 99.20% and the layer settled at 96.81% — inside neither band. The prediction compared a new
-file's own score against a *layer total*, and a new file is a minority of the denominator: 125 new
-regions at 99.20% lift the total by 0.28 points, where an equal-to-average addition would give
-roughly 1.5. The prediction is left standing as a refutation.
+Each figure from its own numerator and denominator, spelled out:
+
+```text
+1C-2b regions:  178 (cache) + 846 (markdown) + 190 (ordering) = 1214
+1C-2b missed:     1        +  36         +    0            =   37
+1C-2b covered: 1214 − 37 = 1177          1177 / 1214 = 96.95%
+
+1C-2b lines:    132       + 618         + 143             =  893
+1C-2b missed:     0       +  31         +   0             =   31
+1C-2b covered:  893 − 31 = 862            862 / 893 = 96.53%
+```
+
+**The denominator moved by 53 and the numerator by 53, and the missed count by zero.** That is the
+whole story of 1C-2b's region figure: `cache.rs` gained 53 regions of policy and every one of them
+was executed, so the layer's ratio rose from 96.81% to 96.95% and its margin over the floor grew
+from 6.81 to 6.95 points. **1C-1's recorded prediction is still standing as a refutation** — it
+compared a new *file's* score against a *layer total*, which is the wrong comparison, and 1C-2b
+adds a third data point against it: 53 new regions at 99.44% lifted the total by 0.14 points, where
+an equal-to-average addition would have given roughly 0.3.
 
 ### 2.2 Crate and layer aggregates
 
 | Aggregate | Region cover | Line cover |
 |---|---|---|
-| **`core/`** | **96.81%** (1124/1161 regions) | **96.46%** (818/848 lines) |
+| **`core/`** | **96.95%** (1177/1214 regions) | **96.53%** (862/893 lines) |
 | **`sh_nexus_wire` as a crate** | **98.95%** (188/190 regions) | **100.00%** (159/159 lines) |
-| `sh_nexus` as a crate | 93.96% (1571/1672 regions) | 94.06% (1077/1145 lines) |
+| `sh_nexus` as a crate | 93.88% (1596/1700 regions) | 94.30% (1158/1228 lines) |
 
-`core/` now covers **three** files. One in 1B at 100%, two in 1C-1 at 96.53%, three in 1C-2a at
-**96.81%** — a rise of 0.28 points, because `cache.rs` landed at 99.20% with a single missed
-region, which is above the layer average and therefore lifts the total. The full three-column
-arithmetic is in §2.1.1 so it can be checked rather than believed; the first report of this figure
-used a denominator of 1,171 instead of 1,161 and stated a fall, and that correction is recorded in
-§2.1 rather than applied silently.
+`core/` now covers **three** files and every one of them is a logic module: `ordering.rs` at 100%
+since 1B, `markdown.rs` at 95.74% since 1C-1, and `cache.rs` at **99.44%**, up from 99.20% at 1C-2a
+because the 53 regions of ceiling policy were added *and covered*. The layer is **6.95 points above
+the floor**, up from 6.81, and the movement is a genuine improvement rather than a denominator
+effect in the flattering direction: 1C-1 and 1C-2a both moved this aggregate the *other* way, and
+both are recorded in §2.7 rather than quietly overwritten.
 
-It is 6.81 points above the floor. `ordering.rs` remains the highest-scoring file in the
+`sh_nexus` as a crate is at **93.88% (1596/1700)**, up 0.20 points from a **corrected** 1C-2a
+baseline of 93.69% (1543/1647). **§4.9 records why the correction was necessary and why 1C-2b nearly
+published a fall built on the uncorrected figure.** The crate aggregate is still dominated by
+`lib.rs` at 60.81% and `main.rs` at 0.00% — the window-opening path §4.1–§4.2 characterise and
+Phase 2 moves — so it remains arithmetic rather than a signal, and §4.9 says what to gate on instead.
+
+It is 6.95 points above the floor. `ordering.rs` remains the highest-scoring file in the
 workspace at 100% regions, 100% functions and 100% lines.
+
 
 
 ### 2.3 Files that do not appear in the report at all
@@ -174,51 +251,72 @@ for them and they produce no report row at all:
 Each was read and confirmed to contain no `fn` and no `impl` block. The absence is a **true zero for
 executable code**, not a measurement gap.
 
-**This is the list that made §3.3 unmeasurable in 1A, and it is now two files shorter.** Two
-files have left this category: `core/ordering.rs` in 1B (now §2.1 at 100.00%) and
-`core/markdown.rs` in 1C-1 (now §2.1 at 95.74%). **Both are the only `core/` files to have ever
-appeared in the region report**, and every remaining member of the layer is still type definitions
-and `pub mod` declarations. `core/cache.rs` (1C-2) and `core/theme.rs` (1D) remain in this category
-until they are written, and when they land they enter §2.1 — and §2.7 is the arithmetic for what
-that will do to the aggregate.
-
+**This is the list that made §3.3 unmeasurable in 1A, and it is now three files shorter.**
+Three
+files have left this category: `core/ordering.rs` in 1B (now §2.1 at 100.00%), `core/markdown.rs` in
+1C-1 (now §2.1 at 95.74%) and `core/cache.rs` in 1C-2a (now §2.1 at 99.44%, and §4.8).
+**Every `core/` file that has ever contained executable code is in the region report**, and every
+remaining member of the layer is still type definitions and `pub mod` declarations. `core/theme.rs`
+(1D) is the only logic module left to write; §2.9 states the falsifiable prediction for when it lands,
+in both directions.
 ### 2.4 Reconciliation note on the line column
 
-**Both columns reconcile in 1C-1, and continue to.** 1A found the *line* column
-non-reconciling and 1B recorded that the contradiction had gone away without
-explaining it; 1C-1 adds a second consecutive clean run, which is worth one
-sentence because the anomaly 1A reported was in the column this project would
-have used as a gate.
+**The tool's own TOTAL has always reconciled in both columns, and this recording is the first in
+which the *document's* hand arithmetic reconciles too.** That distinction matters, because 1A
+reported a non-reconciling *line* column and three later recordings recorded that the anomaly had
+gone away "without explaining it". The explanation is now available and it is not in the tool.
 
-The **region** column:
-
-```text
-regions:      846 + 190 + 148 +   7 + 331 +   4 + 169 +  17 = 1712
-missed:        36 +   0 +  58 +   7 +   2 +   0 +   2 +   0 =  105
-covered:     1712 − 105 = 1607       1607 / 1712 = 93.87%
-```
-
-The **line** column:
+**§2.4's original hand arithmetic omitted `core/cache.rs` from the line column entirely.** It read:
 
 ```text
-lines:        618 + 143 +  99 +   7 + 229 +   3 + 139 +  17 = 1255
+lines:        618 + 143 +  99 +   7 + 229 +   3 + 139 +  17 = 1255   <- cache.rs absent
 missed:        31 +   0 +  32 +   7 +   0 +   0 +   0 +   0 =   70
 covered:     1255 −  70 = 1185       1185 / 1255 = 94.42%
 ```
 
-Per-file missed lines sum to the TOTAL in both columns, and the per-file line counts sum to the
-TOTAL line count. **The cause of 1A's anomaly is still not verified** and this file does not claim
-it is; what has changed is that there are now two independent clean measurements rather than one.
+`core/cache.rs` did not exist when that arithmetic was first written — it was composed at 1C-1, when
+the layer held `ordering.rs` and `markdown.rs` — and it was never revised when 1C-2a added the file.
+**That is the whole cause of 1A's anomaly: a stale hand sum in this document, not a measurement
+defect.** §2.1's TOTAL line figure was computed by the tool and was correct at every recording
+(`1273/1343 = 94.79%` at 1C-2a), which is why the two figures in this file disagreed with each other
+rather than with the tool.
 
-**The consequence, unchanged from 1A.** ADR-004's floors are stated as region
-coverage, the region column reconciles to the last decimal, and **§3's verdicts
-rest on regions**. The line column is recorded for completeness and must still be
-re-derived from a single report before it gates anything under §6.3.
+Corrected, with `cache.rs` at its 1C-2a size of 88 lines:
+
+```text
+lines:         88 + 618 + 143 +  99 +   7 + 229 +   3 + 139 +  17 = 1343
+missed:         0 +  31 +   0 +  32 +   7 +   0 +   0 +   0 +   0 =   70
+covered:     1343 −  70 = 1273       1273 / 1343 = 94.79%   <- matches 2.1's TOTAL exactly
+```
+
+The **region** column, the one ADR-004's floors rest on, was never affected:
+
+```text
+regions:      178 + 846 + 190 + 148 +   7 + 331 +   4 + 169 +  17 = 1890
+missed:        1 +  36 +   0 +  58 +   7 +   2 +   0 +   2 +   0 =  106
+covered:     1890 − 106 = 1784       1784 / 1890 = 94.39%   <- matches 2.1's TOTAL exactly
+```
+
+**The consequence, unchanged and now on firmer ground.** ADR-004's floors are stated as region
+coverage, the region column reconciles to the last decimal from a single report, and **§3's verdicts
+rest on regions**. The line column now reconciles as well, so it is no longer disqualified from
+gating — but it is still recorded as secondary, because the lesson of §2.4 is that a hand-kept sum
+in a coverage document decays silently, and that is a property of the document rather than of the
+column.
+
 
 ### 2.5 The 1B baseline, retained for regression
 
 1B's figures, kept verbatim so §6.3's "any coverage drop blocks the merge" has
 something to drop from. **Every aggregate improved; no aggregate regressed.**
+
+> **Scope of verification, stated rather than implied.** §4.9 found two arithmetic errors in the
+> 1C-2a recording, which is the one 1C-2b compares against, and corrected both. **1C-2b did not
+> re-derive the aggregates in this table or in §2.7** — they are reproduced verbatim because they are
+> the historical record, and rewriting a prior recording's figures destroys the thing the record is
+> for. **No claim is made that they are correct.** A full audit of 1A, 1B and 1C-1's aggregates is
+> an open action, and it is recorded as one in §5.5 rather than left implied by the fact that the two
+> most recent recordings are now clean.
 
 | Aggregate | 1A | 1B | Δ |
 |---|---|---|---|
@@ -259,8 +357,12 @@ holds.
 | 3 missed regions | 2 | **91.92%** |
 | 2 missed regions (1C-1, run 1) | 4 | **92.03%** |
 | 3 missed regions (1C-1, run 1) | 2 | **91.92%** |
+| 2 missed regions (1C-2b, both runs) | 4 | **94.39%** |
 
-Eight measurements, different commits, same tool, same environment, different numbers.
+Ten measurements, different commits, same tool, same environment, mostly different numbers — with
+the two most recent agreeing, which is the anomaly this section now has to account for. The
+workspace TOTAL column is not comparable across rows, because the denominator grew with each work
+unit; only the `mapping.rs` column is, and it is the one that matters.
 
 **What is verified, and how:**
 
@@ -314,12 +416,38 @@ mechanism. The project's own file predicted the failure mode before it was
 observed in the column the project gates on. That is worth more than a clean
 number.
 
-**The tables in §2.1–§2.2 report the modal case (2 missed, 93.87%),** because
-that is what most runs produce, it is what both prior recordings recorded for
-every other row, and `core/`'s figure — the one §3.3 turns on — is identical in
-every run and is not affected by any of this. Where a figure could be read either
-way, §2.6 says so. **The 1C-1 range for the workspace TOTAL is 93.81–93.87%**,
-and every floor in §3 passes at the lower end as well.
+**The tables in §2.1–§2.2 report the 1C-2b measurement (1890 regions, 106 missed, 94.39%),** and
+**the two runs taken in 1C-2b were byte-identical — including `mapping.rs`, the file this whole
+section is about.** That is the first recording in which the fluctuation did not reproduce, across
+ten measurements on four commits, and it is recorded here rather than being quietly dropped,
+because a section that quietly drops its own most consequential finding is worse than one that
+never had it.
+
+**What 1C-2b's non-reproduction does and does not establish.** It does *not* refute the finding:
+two agreeing runs after eight disagreeing ones is weak evidence, and the honest position is the one
+1A took about `frame.rs`'s residuals — *not verified either way*. It does establish that **the
+fluctuation is intermittent rather than constant**, which is what §2.6's inference about proptest's
+per-run randomness already predicted and could not confirm. The most likely explanation remains the
+one §2.6 gives, and the file says so.
+
+**Practical consequence, unchanged and now better supported.** A gate on the exact decimal of
+`mapping.rs` would have fired a phantom regression in roughly one run in three across 1B, 1C-1 and
+1C-2a, and did not fire in 1C-2b — which is the worst possible property for a merge gate, because it
+is unreliable in the one direction that wastes a reviewer's time. **The two recommendations stand:**
+
+1. **A fixed seed, or the committed regressions files.** 1C-2b took the second option for free:
+   `crates/sh_nexus/tests/cache_ceiling.proptest-regressions` now exists and is committed, and
+   `ordering.proptest-regressions` and `proptest_boundary.proptest-regressions` already did. A
+   regressions file makes the *recorded* cases deterministic and leaves novel generation random, so
+   it is a partial fix and a cheap one — **which is why it is recommended rather than a global
+   fixed seed.**
+2. **The per-file gate on `mapping.rs` should be the floor, not the decimal.** ADR-004 states
+   `network/`'s floor at 80%; the measurement is 99.40% at the modal figure. The floor is stable, the
+   decimal is not, and §6.3 should be expressed in terms of the one that does not move.
+
+**The 1C-1 range for the workspace TOTAL was 93.81–93.87%,** and every floor in §3 passed at the
+lower end as well. **The 1C-2b figure has no range**, because both runs agreed; the floors would pass
+at any figure this tool has produced for this tree.
 
 ### 2.7 The 1C-1 delta, including the regression
 
@@ -362,50 +490,129 @@ gate should be keyed to the **layer** and not to the 1B figure of 100.00%, which
 was a statement about a single file.
 
 
+### 2.8 The 1C-2b delta, including the one aggregate that fell
+
+The new numbers first, then the one that moved the wrong way, stated without softening.
+
+| Aggregate | 1C-2a | 1C-2b | Δ |
+|---|---|---|---|
+| `sh_nexus\src\core\cache.rs` | 99.20% / 100.00% (125 regions, 1 missed, 88 lines) | **99.44% / 100.00%** (178 regions, 1 missed, 132 lines) | **+0.24 / none** |
+| `sh_nexus\src\core\markdown.rs` | 95.74% / 94.98% | 95.74% / 94.98% | **none** |
+| `sh_nexus\src\core\ordering.rs` | 100.00% / 100.00% | 100.00% / 100.00% | **none** |
+| `sh_nexus\src\lib.rs` | 60.81% / 67.68% | 60.81% / 67.68% | **none** |
+| `sh_nexus\src\main.rs` | 0.00% / 0.00% | 0.00% / 0.00% | **none** |
+| `sh_nexus\src\network\mapping.rs` | 99.40% / 100.00% (modal) | 99.40% / 100.00% | **none** (see §2.6) |
+| `sh_nexus_wire\src\error.rs` | 100.00% / 100.00% | 100.00% / 100.00% | **none** |
+| `sh_nexus_wire\src\frame.rs` | 98.82% / 100.00% | 98.82% / 100.00% | **none** |
+| `sh_nexus_wire\src\version.rs` | 100.00% / 100.00% | 100.00% / 100.00% | **none** |
+| **`core/` as a layer** | **96.81%** (1124/1161) | **96.95%** (1177/1214) | **+0.14** |
+| `sh_nexus_wire` as a crate | 98.95% / 100.00% | 98.95% / 100.00% | **none** |
+| `sh_nexus` as a crate | **93.69% / 94.09%** (1543/1647) — **corrected, see §4.9** | **93.88% / 94.30%** (1596/1700) | **+0.20 / +0.21** |
+| **Workspace total** | **94.23% / 94.79%** (1837 regions, 106 missed) | **94.39% / 94.95%** (1890 regions, 106 missed) | **+0.16 / +0.17** |
+
+**Eight rows are unchanged to the decimal**, and that is the control. 1C-2b touched no line of
+`ordering.rs`, `markdown.rs`, `lib.rs`, `main.rs`, `mapping.rs` or any wire-crate file, and the tool
+reports exactly what 1C-2a reported for all eight. A coverage table whose untouched rows moved would
+mean the denominator moved, and then no delta in the table could be read.
+
+**`core/` rose by 0.14 and that is a real improvement, not a denominator effect.** Both the
+numerator and the denominator grew by 53 and the missed count grew by **zero**: the 53 regions of
+ceiling policy and thread-safety decision were all executed. This is the mirror image of 1C-1 and
+1C-2a, where a new file entered the denominator below the layer average and pushed the aggregate
+down; here an existing file gained well-covered regions and pushed it up. The distinction is only
+visible because the missed count is reported alongside the ratio, and **a ratio without its missed
+count cannot tell the two apart** — which is the practical form of the lesson of §2.1.1.
+
+**`sh_nexus` as a crate rose 0.20 points, and only after its 1C-2a baseline was corrected.** The
+published 1C-2a figure was 93.96% (1571/1672), and **neither number in that fraction matches the
+1C-2a per-file table**: the table sums to 1647 regions with 104 missed, which is `1543/1647 =
+93.69%`. On that corrected baseline the crate rose to 93.88%, and the line column rose from
+`1114/1184 = 94.09%` to 94.30%. **§4.9 is the entry, and it is the more useful half of this
+recording**: 1C-2b nearly published a second wrong number, and the reason it caught it is that it
+recomputed the baseline from the per-file table instead of carrying the previous recording's
+aggregate forward.
+
+**A crate-level aggregate is still not a useful regression signal for this repository, and the
+corrected figures say so for a better reason than the incorrect ones did.** It is dominated by
+`lib.rs` at 60.81% and `main.rs` at 0.00% — the window-opening path that §4.1–§4.2 characterise and
+that Phase 2 moves — so it moves when the denominator moves rather than when the code does. **The
+per-layer aggregate (`core/` at 96.95%) and the per-file figures are the signals; the crate figure
+is arithmetic.**
+
+### 2.9 The 1C-2b prediction, and whether it held
+
+1C-1 and 1C-2a both left a falsifiable prediction standing: `core/cache.rs` (1C-2) and
+`core/theme.rs` (1D) would move the `core/` aggregate, and the direction was stated rather than left
+to be discovered. **1C-2a falsified the first half of that prediction** by extending `cache.rs`
+rather than only adding it, so the question for 1C-2b was whether 53 well-covered regions inside an
+existing file would lift the layer as they would have lifted a new one. **They did: +0.14 points,
+and the prediction that a well-covered addition lifts the total held.**
+
+`core/theme.rs` (1D) is the remaining half and is untouched. Its prediction stands unchanged: a new
+file at `markdown.rs`'s ~96% would pull the layer down by roughly 0.5 points and a file at
+`ordering.rs`'s 100% would push it up by roughly 0.4, on a denominator of about 1,214. **Both
+directions are recorded in advance so that 1D cannot quietly report whichever one it likes.**
+
 ---
 
 ## 3. Verdict against each floor
 
 ### 3.1 `AGENTS.md` §6.1 — workspace total: 75% minimum / 85% target
 
-**93.87% region coverage — PASSES THE TARGET.** 8.87 points above the 85% target and 18.87 points
-above the 75% minimum, and 1.84 points above the 1B baseline. The line column reads 94.42% and points
-the same way.
+**94.39% region coverage — PASSES THE TARGET.** 9.39 points above the 85% target and 19.39 points
+above the 75% minimum, and 0.16 points above the 1C-2a baseline. The line column reads 94.95% and
+points the same way.
 
-**The regional figure is 93.81–93.87%** depending on the run, per §2.6, and **passes the target by
-8.81 points at the lower end as well.** The verdict does not depend on which run produced it; the
-decimal does, and §2.6 says so.
+**The two runs taken in 1C-2b were byte-identical**, so unlike 1C-1 through 1C-2a there is no range
+to quote: the figure is 94.39% and not 94.39%-something. §2.6 explains what changed, and it is worth
+saying that the file's most consequential finding **failed to reproduce** rather than being quietly
+dropped.
 
 ### 3.2 ADR-004 — `sh_nexus_wire` ≥80%
 
-**98.95% region coverage — PASSES.** 18.95 points above the floor, unchanged from 1B. See §2.2. This
-is the floor that matters most (§3.4), because `AGENTS.md` §4.2's serde round-trip mandate and
+**98.95% region coverage — PASSES.** 18.95 points above the floor, unchanged since 1B. See §2.2.
+This is the floor that matters most (§3.4), because `AGENTS.md` §4.2's serde round-trip mandate and
 §7.4's version rejection both live in this crate.
 
 **It is not 100%, and the reason is recorded in §4.4.** 1A predicted that closing the three named
 residuals would take this crate to 100% region coverage. Measurement says otherwise: 188/190. The
 prediction is refuted by 2 regions, and §4.4 says what is and is not known about them.
 
-**1C-1 changed nothing in this crate and is recorded as unchanged**, which is the useful outcome: the
-two figures `frame.rs`'s residual produces are the same two regions 1B found, on a tree where the
-dependency graph grew by two crates.
+**1C-2b changed nothing in this crate**, which is the fourth consecutive recording in which it is
+unchanged. 1C-2b added no dependency and touched no wire-crate line, and the two figures
+`frame.rs`'s residual produces are the same two regions 1B found.
 
-### 3.3 `AGENTS.md` §4.1 — `core/` ≥90%: **MEASURABLE, AND MET — for two files now**
+### 3.3 `AGENTS.md` §4.1 — `core/` ≥90%: **MEASURABLE, AND MET — for all three files**
 
-**`core/` measures 96.53% — 1000 of 1036 regions, 730 of 761 lines, 97 of 97 functions executed,
-36 regions missed. The 90% floor passes with 6.53 points of margin.** `core/ordering.rs` is still
-190/190 and `core/markdown.rs` is 810/846.
+**`core/` measures 96.95% — 1177 of 1214 regions, 862 of 893 lines, 127 of 127 functions executed,
+37 regions missed. The 90% floor passes with 6.95 points of margin, up from 6.81.**
+`core/ordering.rs` is still 190/190, `core/markdown.rs` is still 810/846, and `core/cache.rs` is
+now **177/178** across a file that grew by 53 regions since 1C-2a.
 
-What is new in 1C-1, stated precisely so the number is not read as more than it is:
+What is new in 1C-2b, stated precisely so the number is not read as more than it is:
 
-- **The floor is met for a second module, and the layer aggregate moved the *wrong* way.** 1B
-  recorded `core/` at 100.00% on the strength of one file. Adding a second file at 95.74% took the
-  layer to 96.53%. §2.7 is the arithmetic. It is a denominator effect and not a regression —
-  `ordering.rs` is unchanged to the decimal — but it **is** a fall under §6.3's rule, and it is
-  recorded as one. The lesson for §6.3 is that a per-layer gate must be keyed to the layer, not to
-  whatever figure a single-file layer happened to report.
-- **The strictest floor in the project now has a denominator worth the name.** 90% against pure
-  logic with no excuse available, met with two logic modules in the denominator rather than one.
+- **The floor is now met for every logic module in the layer, and the aggregate moved the *right*
+  way.** `core/cache.rs` gained 53 regions of memory-ceiling policy and gained coverage with them:
+  1 missed region at 1C-2a, 1 missed region at 1C-2b. §2.8 is the arithmetic. **A ratio reported
+  without its missed count could not distinguish this from 1C-1's fall**, and that is the practical
+  form of §2.1.1's lesson.
+- **The strictest floor in the project has a denominator worth the name, and every file in it is
+  logic.** 90% against pure code with no excuse available, met with three logic modules — not one,
+  not two — in the denominator. The two remaining `core/` files contain no executable code (§2.3).
+- **The `core/` architectural obligations needed no widening in 1C-2b, and that is a result rather
+  than an omission.** The ceiling policy is `Option<u64>` comparisons and a `while` loop: no new
+  dependency, so `CORE_ALLOWED_CRATES` is untouched. ADR-003's boundary held for 53 new regions of
+  policy without a single edit to the allow-list that guards it.
+- **The thread-safety decision is enforced mechanically, and coverage is the wrong instrument for
+  it.** `AGENTS.md` §4.2's cache row ends with "thread safety" and 1C-2b decided it: no internal
+  synchronisation, on the grounds that `PLAN.md` §4 makes `state/bridge.rs` the sole owner of
+  `cx.update_global`. Two tests hold that, and neither is a coverage number:
+  `the_bounded_cache_is_send_and_sync` is a **compile-time** assertion that fails to build if a
+  `Cell` or an atomic ever appears, and
+  `core_cache_contains_no_interior_mutability` is a **structural** guard that fails the build if the
+  tokens `Mutex`, `RwLock`, `RefCell`, `Cell<`, `UnsafeCell`, `OnceCell` or `LazyLock` ever appear
+  in `core/cache.rs`. 1C-2b rewrote the second one's failure message, because it still said the
+  decision was 1C-2b's and that had stopped being true.
 - **The security-relevant work is the part coverage cannot see, and this file says so rather than
   letting 95.74% stand in for it.** `core/markdown.rs` is a parser for attacker-controlled text.
   Its correctness is pinned by 241 tests, of which the mandatory ones are named in `AGENTS.md` §4.2
@@ -413,33 +620,26 @@ What is new in 1C-1, stated precisely so the number is not read as more than it 
   proptest properties over arbitrary input. §4.7 says which claim each one carries. A coverage
   number would be the wrong instrument for all of it, and 1A §4.6 already made this point about
   `ordering.rs`.
-- **`core/`'s architectural obligations are enforced, and the allow-list had to be widened.** ADR-003
-  keeps the layer free of `gpui` and `tokio`. `core/markdown.rs` is the first `core/` module to
-  depend on anything outside `std` and the four domain crates, so
-  `crates/sh_nexus/tests/layer_boundary.rs`'s `CORE_ALLOWED_CRATES` allow-list was extended with
-  `pulldown_cmark` **in the same commit that added it to `Cargo.toml`** — which is the property
-  that makes an allow-list worth maintaining: the dependency was rejected until somebody recorded
-  the decision. All 11 boundary tests pass, including the three 1B added to hold the no-panic and
-  no-clock rules mechanically.
-- **`core/`'s remaining two logic modules are `cache.rs` (1C-2) and `theme.rs` (1D).** They do not
-  exist, so this floor is met for half the layer. §2.7 states the falsifiable prediction for when
-  they land.
+- **`core/`'s remaining logic module is `theme.rs` (1D).** It does not exist, so this floor is met
+  for three of the layer's four files and §2.9 states the falsifiable prediction for when it lands —
+  in **both** directions, so that 1D cannot report whichever one it likes.
 
 ### 3.4 Summary
 
 | Floor | Source | Measured | Verdict |
 |---|---|---|---|
-| Workspace total ≥75% min / ≥85% target | `AGENTS.md` §6.1 | **93.87%** regions (93.81–93.87%) | **PASSES target** |
+| Workspace total ≥75% min / ≥85% target | `AGENTS.md` §6.1 | **94.39%** regions (two identical runs) | **PASSES target** |
 | `sh_nexus_wire` ≥80% | ADR-004 decision 3 | **98.95%** regions | **PASSES** |
-| `core/` ≥90% | `AGENTS.md` §4.1, ADR-004 decision 2 | **96.53%** regions (1000/1036) | **PASSES — 36 missed, all defensive (§4.7)** |
-| New code ≥80% | `AGENTS.md` §5.1, ADR-004 | `markdown.rs` **95.74%** | **PASSES** |
-| `network/` ≥80% | `AGENTS.md` §4.1 | `mapping.rs` **99.40%** regions (99.09–99.40%, §2.6) | **PASSES** |
-| `state/`, `db/`, utilities ≥80/85% | `AGENTS.md` §4.1 | directories do not exist yet | Not applicable in 1C-1 |
+| `core/` ≥90% | `AGENTS.md` §4.1, ADR-004 decision 2 | **96.95%** regions (1177/1214) | **PASSES — 37 missed, 36 of them markdown's defensive arms (§4.7)** |
+| New code ≥80% | `AGENTS.md` §5.1, ADR-004 | `cache.rs` **99.44%** (177/178) | **PASSES** |
+| `network/` ≥80% | `AGENTS.md` §4.1 | `mapping.rs` **99.40%** regions | **PASSES** |
+| `state/`, `db/`, utilities ≥80/85% | `AGENTS.md` §4.1 | directories do not exist yet | Not applicable in 1C-2b |
 
-**Every floor with a denominator passes in 1C-1**, and none of them passes by a
+**Every floor with a denominator passes in 1C-2b**, and none of them passes by a
 margin that depends on a file nobody can test: the two sub-80% files are
 `lib.rs` and `main.rs`, both characterised in §4.1–§4.2 as the window-opening
 path that Phase 2 moves, and neither is in a directory §4.1 names.
+
 
 
 
@@ -447,10 +647,11 @@ path that Phase 2 moves, and neither is in a directory §4.1 names.
 
 ## 4. The sub-floor files, characterised
 
-**Two files sit below 80% in 1C-1, down from four in 1A.** Both are structural: the window-opening
+**Two files sit below 80% in 1C-2b, down from four in 1A, and the count has not moved in three
+work units.** Both are structural: the window-opening
 path that Phase 2 restructures into `src/app.rs`, in a file §4.1's directory-keyed floors do not
-name. None of them is a quality problem in the code that was written, and neither is new in 1C-1 —
-both are byte-identical to 1A and measure identically (§2.7).
+name. None of them is a quality problem in the code that was written, and **neither has been touched
+since 1A** — both are byte-identical to 1A and measure identically (§2.8).
 
 The three that 1A characterised here and that are now **closed or nearly so** —
 `version.rs` at 76.47%, `frame.rs` at 94.08%, and the nine-line residual of §5 — are §4.3, §4.4 and
@@ -459,8 +660,9 @@ The three that 1A characterised here and that are now **closed or nearly so** �
 
 ### 4.1 `sh_nexus\src\lib.rs` — 60.81% regions, 67.68% lines
 
-**Unchanged in 1C-1, and unchanged for the reason 1A gave:** no work unit since has touched a line
-of this file, and the tool reports exactly what it reported then (§2.7).
+**Unchanged in 1C-2b, and unchanged for the reason 1A gave:** no work unit since 1A has touched a
+line of this file, and the tool reports exactly what it reported then (§2.8). Four consecutive
+recordings now report 60.81% / 67.68% to the decimal, which is the strongest control in this file.
 
 **What it holds:** the Phase 0 spike's GPUI root view (`RootView`) and the window-startup path.
 
@@ -569,15 +771,17 @@ names as the thing that must not rot — and it is where `AGENTS.md` §2.1's "va
 payload before it touches state" is enforced. Recorded here because a baseline that only lists
 failures hides the result that matters most.
 
-**Unchanged in 1C-1, to the modal figure** (§2.7): 1C-1 touched no line of it, and the two missed regions
-remain the two 1A recorded. **The one file whose figure is not reproducible to the decimal — see
-§2.6**, which is why this sentence says "modal" and not "exactly".
+**Unchanged in 1C-2b, to the modal figure** (§2.8): no work unit since 1A has touched a line of
+it, and the two missed regions remain the two 1A recorded. **This was the one file whose figure was
+not reproducible to the decimal — see §2.6** — and 1C-2b's two runs did not reproduce the
+fluctuation either, so the "modal" qualifier is retained rather than upgraded to "exactly" on the
+strength of two agreeing runs.
 
 ### 4.6 `sh_nexus\src\core\ordering.rs` — 100.00% regions, 100.00% lines
 
 **190 regions, 0 missed, 143 lines, 0 missed, 18 functions executed. Unchanged to the decimal in
-1C-1**, which is the control §2.7 relies on. It is in this section because §4 is where the *detail*
-behind a number lives.
+1C-1, in 1C-2a and in 1C-2b** — three consecutive recordings, which is the control §2.8 relies on. It
+is in this section because §4 is where the *detail* behind a number lives.
 
 **What 100% means here, stated so it is not over-read.** It means every region the instrumenter
 emitted was executed, which for this module includes the private comparators `precedence` and
@@ -692,9 +896,120 @@ looking only at the top of it. That is the same class of defect as the tight-lis
 draft had, found by a different route, and it is the argument for asserting on the tree rather than
 on the text: `plain_text` was **correct** in that case, and only the structure was wrong.
 
----
+### 4.8 `sh_nexus\src\core\cache.rs` — 99.44% regions, 100.00% lines
 
-## 5. Carried-forward actions
+**178 regions, 1 missed, 30 of 30 functions executed, 132 of 132 lines, 0 missed lines.** At 1C-2a
+this file was 125 regions, 1 missed, 20 of 20 functions, 88 of 88 lines. It is in this section
+because a coverage number is a particularly poor description of what a *cache policy* has to get
+right, and because the single missed region is the same one 1C-2a recorded.
+
+**The one missed region is unchanged and still deliberate.** It is the `None` arm of the `if let` in
+`promote`, unreachable because every caller has already established the key is live. Removing it
+would trade an `AGENTS.md` §2.1 safety property for one region, which is the wrong trade.
+
+**What 100% of lines does not tell you about a policy, stated as a table rather than a paragraph.**
+Every region the instrumenter emitted was executed, which for this file means the refusal check, the
+combined trim loop, `set_budget`'s immediate eviction, both over-budget tests and the eviction
+counter all ran. It does **not** mean the policy is right: a cache that evicted the wrong entry, or
+admitted an oversized one, or forgot to discharge a cost, would execute every one of those regions
+and report the same 177/178. **That is the whole reason §5.3 exists**, and §5.3's table is the
+instrument for the claims below.
+
+| Claim | Held by | Kind |
+|---|---|---|
+| An entry costing more than the whole budget is never admitted | `an_entry_whose_own_cost_exceeds_the_budget_is_never_admitted` (5 cases), `an_oversized_entry_is_refused_at_any_point_of_any_sequence` | 5 cases + **proptest** |
+| A refusal changes *nothing* — not cost, length, counters, or the live set | `a_refused_insert_leaves_the_cache_exactly_as_it_found_it`, `a_refused_insert_moves_no_counter_at_all` (2), `a_refused_insert_changes_nothing_at_any_point_of_any_sequence` | hand-written + **proptest** |
+| A refused *replacement* leaves the old value resident | `a_refused_insert_leaves_the_cache_exactly_as_it_found_it`, `the_outcome_separates_a_refusal_from_a_replacement` (5) | hand-written |
+| A refusal does not disturb the recency order | `a_refused_insert_does_not_change_which_entry_the_next_eviction_takes` (2) | behavioural, because the order is not exposed |
+| A lowered budget is honoured on the same call, with no window | `lowering_the_budget_honours_it_on_the_same_call` (4), `a_lowered_budget_is_honoured_wherever_it_lands_in_a_sequence` | 4 cases + **proptest** |
+| A raised or removed budget evicts nothing | `setting_a_budget_the_cache_is_already_within_evicts_nothing` (4), `removing_the_budget_evicts_nothing_and_stops_enforcing`, `a_raised_or_removed_budget_evicts_nothing_at_any_point_of_a_sequence` | cases + **proptest** |
+| The two bounds compose; `min(capacity, budget)` is what survives | `the_ceiling_and_the_capacity_bound_the_cache_together` (8), `no_operation_sequence_can_disagree_with_an_independently_derived_model` | 8 cases + **proptest** |
+| A costless entry is bounded by capacity alone — and this is a stated limit, not a hole | `a_zero_cost_entry_is_bounded_by_capacity_and_by_nothing_else` (4) | cases |
+| One insert evicts at most the entries it displaced | `one_insert_never_displaces_more_entries_than_it_holds`, `one_insert_never_evicts_more_entries_than_it_displaced` | hand-written + **proptest** |
+| The worst-case cascade is reached only by near-free declared costs, and its size is *measured* | `the_worst_case_eviction_cascade_is_exactly_what_the_adversarial_shape_predicts` (4) | cases, asserting an **exact** count |
+| The ceiling holds after **every** step, not only at the end of a sequence | `no_operation_sequence_can_leave_the_cache_over_its_budget` | **proptest** |
+| Adding the policy did not perturb 1C-2a's mechanism | `a_budget_loose_enough_never_to_bind_changes_nothing` | **proptest** |
+
+**The one row that is a test of a *limit* rather than of a behaviour**, and it is the most
+interesting thing 1C-2b found: `total_cost` is an *incremental* accumulator with saturating
+arithmetic, and saturation is **path-dependent**. With no ceiling, insert `u64::MAX` then `1` and
+the accumulator reads `MAX + 1` as `MAX`; remove the `MAX` entry and it reads `MAX − MAX` as `0`
+while the one live entry really costs `1`. So in the saturating regime `total_cost()` is not a
+function of the live set at all, **and no reference model can predict it.** This was found by the
+model property failing, not by inspection, and it is handled three ways rather than one:
+
+1. **Stated** in `core/cache.rs` §12, with the direction of the error named: the report
+   *under*-states, so a cache can in truth hold more than its budget says.
+2. **Pinned** by `the_ceiling_is_enforced_on_the_reported_total_even_when_the_true_sum_overflows`
+   (2 cases) and by `the_saturating_regime_needs_a_budget_no_client_would_configure`, which does
+   the multiplication: at `AGENTS.md` §6.2's ~2^27 budgets, exceeding `u64::MAX` needs about
+   `2^37` entries.
+3. **Kept out of the model property's cost generator** — and this is the part worth arguing about.
+   Bounding the generator is the standard way to avoid testing a fiction, and the alternative was to
+   make the model replicate a path-dependent accumulator, at which point it agrees by construction
+   and tests nothing. **The cost of that choice is stated rather than hidden: the model property
+   does not cover the `u64::MAX` cost, and the coverage it gives up is bought back by (2) naming the
+   limit explicitly.** The three proptest seeds that recorded the original failures are committed in
+   `crates/sh_nexus/tests/cache_ceiling.proptest-regressions`.
+
+### 4.9 A second arithmetic error in the previous recording, found by recomputing its baseline
+
+**The 1C-2a recording published `sh_nexus` as a crate at `93.96% (1571/1672 regions)` and
+`94.06% (1077/1145 lines)`. Both fractions are wrong, and neither numerator nor denominator can be
+reproduced from the 1C-2a per-file table it sits beside.** Recomputed from that table:
+
+```text
+regions:  125 (cache) + 846 (markdown) + 190 (ordering) + 148 (lib) +   7 (main) + 331 (mapping) = 1647
+missed:     1        +  36         +    0        +  58      +   7        +   2               =  104
+covered:  1647 - 104 = 1543          1543 / 1647 = 93.69%      <- published 93.96% (1571/1672)
+
+lines:     88        + 618         + 143        +  99       +   7        + 229               = 1184
+missed:     0        +  31         +   0        +  32       +   7        +   0               =   70
+covered:  1184 -  70 = 1114          1114 / 1184 = 94.09%      <- published 94.06% (1077/1145)
+```
+
+**Two independent cross-checks confirm 1543/1647 and 1114/1184, and refute the published figures.**
+A crate aggregate plus the other crate must equal the workspace TOTAL the tool printed, in the
+denominator and in the covered count, on both columns:
+
+```text
+regions:  1647 + 190 = 1837  == the tool's TOTAL 1837            published: 1672 + 190 = 1862 != 1837
+covered:  1543 + 188 = 1731  == 1837 - 106 = 1731               published: 1571 + 188 = 1759 != 1731
+lines:    1184 + 159 = 1343  == the tool's TOTAL 1343            published: 1145 + 159 = 1304 != 1343
+covered:  1114 + 159 = 1273  == 1343 -  70 = 1273               published: 1077 + 159 = 1236 != 1273
+```
+
+**All four checks fail for the published figures and all four pass for the recomputed ones.** The
+published 1C-2a `sh_nexus` crate row was not a rounding difference; it was a different set of numbers.
+
+**This is the second arithmetic defect in this file, and the first was in the *same* recording's
+line column (§2.4).** Both are recorded rather than applied silently, and the pattern is worth
+naming because it is a process failure and not a carelessness one: **§2.1's tables are written by
+reading the tool's output, and §2.2's and §5.3's aggregates are written by carrying the previous
+recording's aggregate forward and adjusting it.** The first is a transcription; the second is a
+propagation step with no transcription to catch it. 1C-2a reported a *fall* in `sh_nexus` built on
+the wrong baseline, and 1C-2b nearly reported a *fall* in the same aggregate because it trusted that
+number instead of recomputing it.
+
+**The rule this recording therefore adopts, stated so the next one cannot skip it: every aggregate
+in §2.2 and every Δ in §2.5/§2.7/§2.8 is recomputed from §2.1's per-file rows, and the sum of the
+crates is checked against the tool's TOTAL.** A coverage document's aggregates are derived data, and
+derived data is exactly what a hand-maintained document gets wrong. §2.4 is the precedent that this
+is not hypothetical: its error sat unnoticed for two work units.
+
+**What it cost and what it changed.** The 1C-2a `sh_nexus` crate figure is 0.27 points lower than
+published, so 1C-2b's movement in that aggregate is a **rise of 0.20 points**, not a fall of 0.08 —
+and **no aggregate regressed in 1C-2b**: `core/` +0.14, `sh_nexus_wire` unchanged, `sh_nexus` +0.20,
+workspace +0.16. That is a better result than 1C-2b was about to publish, and it is also a warning:
+**the correction made the work unit look better, which is exactly the situation in which a
+verification step is most likely to be skipped.**
+
+**And the limit of what this entry establishes.** 1C-2b verified the recording it was comparing
+against, and found two errors in it. **It did not verify the recordings before that**: §2.5's and
+§2.7's aggregates are reproduced verbatim and are not claimed to be correct. §5.5 carries that as an
+open action, because the honest generalisation from two errors in one recording is not "the others
+are fine" but "aggregates in this document have been derived by hand for five work units and two of
+the four most recent are wrong."
 
 ### 5.1 1A's nine-line residual — **CLOSED in 1B, with one refuted prediction**
 
@@ -751,14 +1066,102 @@ forward as an action, for two reasons that are different from each other and bot
 `core/theme.rs` (1D) will move the `core/` aggregate, and the direction of that move is stated
 rather than left to be discovered.
 
-### 5.3 Not carried forward
+### 5.3 The `core/cache.rs` mutation table
 
-`lib.rs` and `main.rs` are **not** on this list, in 1C-1 exactly as in 1B and 1A. Their gaps are the
-window-opening path (§4.1, §4.2), which Phase 2 restructures into `src/app.rs` and which no test can
-reach in its current shape. Adding a test for `spike_window_options` would require a live `App`, and
-adding one for `main()` is not possible. These are **resolves-it-by-moving cases, not
-closes-it-with-a-test cases**, and they are tracked against Phase 2's app shell instead. Neither file
-moved in 1C-1 and both measure identically (§2.7).
+**Why this table exists at all, and it is not decoration.** `AGENTS.md` §6.1 makes coverage a CI
+metric, and §4.8's is the sharpest illustration of why that is not sufficient for this file:
+**a cache policy whose eviction order is wrong, or whose refusal rule is absent, executes every
+region it has and reports 177/178 all the same.** The bug class of a cache is *plausible wrong
+output* — a cache that works, holding the wrong things — and a coverage number is structurally blind
+to it. §5.1 and §5.2 are both about regions and lines; this is about the decisions.
+
+**Method.** Five deliberate defects were introduced into `core/cache.rs` one at a time, the **full**
+suite was run with `cargo test --no-fail-fast` (so one broken target cannot hide another), the number
+of failing tests was recorded, and the defect was reverted. Each mutant is a one-line change to the
+line named. **Every mutant was caught**, which is the only result that makes the table worth keeping.
+
+| # | Deliberate defect | Line changed | Tests that caught it | From 1C-2a | From 1C-2b | Doctests |
+|---|---|---|---|---|---|---|
+| M1 | Evict the **most** recently used entry instead of the least | `evict_least_recently_used`: `order.remove(0)` → `order.remove(len - 1)` | **34** | 20 | 11 | 3 |
+| M2 | Admit the oversized entry (refusal check disabled) | `insert_with_outcome`: `if self.exceeds_budget_on_its_own(cost)` → `if false && …` | **21** | 0 | 16 | 5 |
+| M3 | Forget to discharge an evicted entry's cost | `evict_least_recently_used`: drop the `saturating_sub` | **39** | 9 | 25 | 5 |
+| M4 | Store a lowered budget but do not honour it | `set_budget`: `self.trim_to_bounds()` → `let _ = …; 0` | **5** | 0 | 4 | 1 |
+| M5 | Double-evict — two entries dropped per trim iteration | `trim_to_bounds`: two `evict_least_recently_used()` calls | **51** | 27 | 19 | 5 |
+
+**Reading the table, and the three things it says that a count alone would not.**
+
+**1. The mechanism's mutants are caught by both suites, and the policy's only by 1C-2b's — which
+is the split working as intended.** M1 (wrong entry evicted) is caught 20 times by
+`tests/cache.rs` and 11 times by `tests/cache_ceiling.rs`; M3 (cost not discharged) 9 and 25; M5
+(double-evict) 27 and 19. **M2 and M4 are caught zero times by 1C-2a's suite, and that is correct
+rather than a gap**: they are policy defects, and a suite scoped to the mechanism has no reason to
+hold a policy claim. The relationship is one-directional, which is the asymmetry worth naming —
+**1C-2b's suite does catch mechanism defects, because the ceiling is implemented in terms of the
+eviction order, and it should.** What protects 1C-2a's mechanism from a *silent* policy change is not
+that 1C-2a would notice but the dedicated property
+`a_budget_loose_enough_never_to_bind_changes_nothing`, which asserts that a non-binding budget is
+indistinguishable from no budget at all.
+
+**2. M4's count of 5 is the thinnest net in the table, and it is reported rather than smoothed.** The
+defect it introduces — *"a lowered budget is silently ignored"* — is precisely the kind that ships:
+nothing crashes, nothing looks wrong, and the cache quietly holds 3x its stated ceiling. It is
+caught by `lowering_the_budget_honours_it_on_the_same_call` (3 of its 4 cases; the fourth sets a
+budget the cache is already within, so it correctly does not fire), by
+`a_lowered_budget_is_honoured_wherever_it_lands_in_a_sequence` (the proptest), and by the
+`set_budget` doctest. **The asymmetry with M2's 21 is the point: M2 has a whole section of tests
+because the refusal rule is the decision this work unit was given, while a lowered budget is one
+decision with one hand-written test and one property.** Three more catchers would cost about forty
+lines; the honest reading is that 5 is enough to fail the build and thin enough that a future
+refactor could plausibly thin it further without noticing.
+
+**3. Doctests are load-bearing here, and 1C-2a did not have a single one catching a mutant.** M2 is
+caught by five of them and M3 by five, because every public method on this type carries an example
+that asserts on `total_cost()`. **A doctest that asserts a number is a test**, and for a structure
+whose contract is a number, they are the most direct ones available. That is worth recording as a
+convention rather than an accident: **the examples on `cache.rs`'s accessors are not
+documentation, they are the last line of the mutation net.**
+
+**What is *not* in this table, and should be.** No mutant targets the **thread-safety** decision,
+because it is not a line of code that can be changed — it is the *absence* of a lock, and §4.8's two
+guard tests (`the_bounded_cache_is_send_and_sync` and
+`core_cache_contains_no_interior_mutability`) fail the **build** rather than a test, so a mutation
+table has no row for them. **That is a real asymmetry in this file's methodology and it is stated
+rather than papered over:** a coverage file and a mutation table both work on code that exists, and
+this project's most consequential decision for `cache.rs` is code that deliberately does not.
+
+### 5.4 Not carried forward
+
+`lib.rs` and `main.rs` are **not** on this list, in 1C-2b exactly as in 1C-2a, 1C-1, 1B and 1A.
+Their gaps are the window-opening path (§4.1, §4.2), which Phase 2 restructures into `src/app.rs`
+and which no test can reach in its current shape. Adding a test for `spike_window_options` would
+require a live `App`, and adding one for `main()` is not possible. These are **resolves-it-by-moving
+cases, not closes-it-with-a-test cases**, and they are tracked against Phase 2's app shell instead.
+Neither file has moved since 1A and both measure identically (§2.8).
+
+### 5.5 OPEN — re-derive the aggregates of every recording before 1C-2a
+
+**Opened by 1C-2b, and it is the only open action this recording adds.**
+
+§4.9 found two arithmetic errors in the 1C-2a recording: §2.4's `core/` line denominator (848 where
+it should be 849) and §2.2's `sh_nexus` crate fractions (`1571/1672` and `1077/1145`, where neither
+number can be reproduced from the per-file table). **Both were in derived figures — aggregates
+computed by hand from a transcription of the tool's output rather than read from it** — and both sat
+in the file for one to two work units before being caught, one of them by pure luck.
+
+| What | Why it is open | What closes it |
+|---|---|---|
+| 1A's, 1B's and 1C-1's aggregates in §2.5 and §2.7 | **1C-2b did not verify them and makes no claim that they are correct.** Two errors in the two most recent recordings is not evidence about the three before them | Re-derive each from its own §2.1 per-file rows, and check the crates sum to the tool's TOTAL — the same four cross-checks §4.9 uses |
+
+**This is deliberately left as an action rather than done here**, for a reason worth stating: doing
+it would mean rewriting four prior recordings' figures in a document whose purpose is to be a
+historical record, and **a record that is quietly corrected is no longer a record.** The 1C-2a
+corrections were made because 1C-2b needed that baseline to be true; the older ones are not needed by
+anything, and a reader who wants them re-derived should be able to see that they have not been.
+
+**The cheaper structural fix, and it is the one §1 now states as a rule:** derive every aggregate
+from §2.1's rows at the moment of writing, never by carrying the previous recording's figure
+forward. A propagated aggregate has no transcription step to catch it, which is the whole mechanism
+of both errors found here.
 
 
 ---
