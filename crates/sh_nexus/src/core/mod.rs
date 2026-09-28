@@ -20,13 +20,19 @@
 //!
 //! # What is in scope
 //!
-//! [`models`] and [`ordering`].
+//! [`models`], [`ordering`] and [`markdown`].
 //!
-//! `markdown`, `cache` and `theme` are `AGENTS.md` §3.1 modules that later
-//! Phase 1 work units implement, and they are not declared here rather than
-//! being declared empty: a module that exists and does nothing is worse than a
-//! module that does not exist, because it reads as finished work and `cargo`
-//! will not tell anyone it is hollow.
+//! `cache` and `theme` are `AGENTS.md` §3.1 modules that later Phase 1 work
+//! units implement, and they are not declared here rather than being declared
+//! empty: a module that exists and does nothing is worse than a module that
+//! does not exist, because it reads as finished work and `cargo` will not tell
+//! anyone it is hollow.
+//!
+//! [`markdown`] is the first `core/` module to take a *dependency*, and the
+//! allow-list in `crates/sh_nexus/tests/layer_boundary.rs` was widened to admit
+//! it in the same commit. That is the point of an allow-list: the crate was
+//! rejected until somebody added it to the list and wrote down why.
 
+pub mod markdown;
 pub mod models;
 pub mod ordering;

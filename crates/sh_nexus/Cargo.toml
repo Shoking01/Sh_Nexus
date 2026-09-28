@@ -82,6 +82,19 @@ uuid = { workspace = true }
 # at [Reaction; 2] and [Attachment; 1]. No dependencies, no build script, no C.
 smallvec = { workspace = true }
 
+# pulldown-cmark: `AGENTS.md` 4.2 names a mandatory test target of "markdown
+# bold/italic/code/links, nested formatting, never panics, injection safety", and
+# `PLAN.md` 2 already listed this crate in the tech stack. The full 7.2 audit --
+# version, license, maintenance, download volume, compile-time delta, and the
+# `default-features = false` decision -- is in the root Cargo.toml.
+#
+# A REGULAR dependency, not a dev-dependency, and that is load-bearing:
+# `core/markdown.rs` is production code. `crates/sh_nexus/tests/layer_boundary.rs`
+# keeps passing only because its `CORE_ALLOWED_CRATES` allow-list was widened
+# with this crate, which is the point of an allow-list -- a crate added tomorrow
+# is rejected until somebody adds it to the list and says why.
+pulldown-cmark = { workspace = true }
+
 [dev-dependencies]
 # proptest: `AGENTS.md` 4.4 mandates it. Its property tests here cover the
 # properties the hand-written cases cannot: that no wire value at all reaches

@@ -1,6 +1,6 @@
 # Sh_Nexus — Measured Coverage Baseline
 
-This file records the **measured** coverage of the workspace, most recently as of work unit 1B, so
+This file records the **measured** coverage of the workspace, most recently as of work unit 1C-1, so
 the numbers are not lost and later work has something concrete to regress against.
 
 `AGENTS.md` §2.3: *"Profile before optimizing. Measure, don't guess."* `AGENTS.md` §6.3 makes a
@@ -9,15 +9,23 @@ coverage drop merge-blocking, which requires a baseline to drop *from*. This fil
 It is a **record of measurement, not a claim of compliance.** Where a floor cannot yet be measured,
 §3 says so explicitly rather than letting an absent row read as a pass.
 
-**Recorded:** 2026-09-27 · **work unit 1B** · Windows, MSVC, rustc 1.98.1
+**Recorded:** 2026-09-27 · **work unit 1C-1** · Windows, MSVC, rustc 1.98.1
+**Prior:** 2026-09-27 · work unit 1B · same environment
 **Baseline recorded:** 2026-09-27 · work unit 1A · same environment
 
 `AGENTS.md` §6.3 makes a coverage drop merge-blocking, and a drop is only
-meaningful against a prior number, so **both** recordings are kept: 1A's figures
-are in §2.5 as a delta table, and 1B's are the live tables in §2.1–§2.2. Where 1A
-made a prediction that 1B's measurement then refuted, that is recorded as a
-refutation rather than quietly corrected — `PLAN.md` Rev 2's whole history is
-predictions that measurement did not support.
+meaningful against a prior number, so **all three** recordings are kept: 1B's figures are
+in §2.5 as a delta table against 1A, 1C-1's delta is §2.7, and 1C-1's are the live tables in
+§2.1–§2.2. Where a prior recording made a prediction that measurement then refuted, that is recorded
+as a refutation rather than quietly corrected — `PLAN.md` Rev 2's whole history is predictions that
+measurement did not support.
+
+**The headline of 1C-1 is a number that went *down*, and it is the interesting
+one.** `core/`'s aggregate fell from 100.00% to 96.53% because a second file
+entered the denominator at 95.74% rather than at 100%. The floor is still met
+with 6.53 points to spare. §2.7 sets out the full arithmetic, because a coverage
+file that only recorded improvements would be a coverage file nobody could use
+as a baseline.
 
 ---
 
@@ -43,8 +51,12 @@ denominator is exactly the sort of thing §6.3's regression gate should not
 depend on.
 
 **Tool versions verified for this recording:** `cargo-llvm-cov 0.9.1`, same as
-1A. `rustc 1.98.1 (MSVC)`, 12 logical CPUs, MSVC Build Tools 2022, Windows SDK
-10.0.26100.0.
+1A and 1B. `rustc 1.98.1 (MSVC)`, 12 logical CPUs, MSVC Build Tools 2022, Windows SDK
+10.0.26100.0. **1C-1 added a dependency to the workspace** (`pulldown-cmark 0.13.4`, plus `unicase`
+2.9.0 as its only new non-optional runtime dependency) and the tool was re-verified rather than
+assumed, because a different instrumentation set would invalidate the comparison against 1B's
+figures. It did not: the `--all-targets` denominator and the eight reportable files are the same
+shape, with `core/markdown.rs` added.
 
 ### Tool substitution — `cargo-tarpaulin` → `cargo llvm-cov`
 
@@ -74,8 +86,14 @@ interpolated, or rounded.
 
 ### 2.1 Per file
 
+Modal run, per §2.6's practice: the case that most runs produce. Two runs were taken and
+`mapping.rs` differed between them; `core/markdown.rs` was **byte-identical in both**, which is
+recorded in §2.6 because it is the first evidence that the fluctuation is confined to the file 1B
+identified.
+
 | File | Regions | Missed regions | Region cover | Missed lines | Line cover |
 |---|---|---|---|---|---|
+| `sh_nexus\src\core\markdown.rs` | 846 | 36 | **95.74%** | 31 | **94.98%** |
 | `sh_nexus\src\core\ordering.rs` | 190 | 0 | **100.00%** | 0 | **100.00%** |
 | `sh_nexus\src\lib.rs` | 148 | 58 | 60.81% | 32 | 67.68% |
 | `sh_nexus\src\main.rs` | 7 | 7 | 0.00% | 7 | 0.00% |
@@ -83,27 +101,31 @@ interpolated, or rounded.
 | `sh_nexus_wire\src\error.rs` | 4 | 0 | 100.00% | 0 | 100.00% |
 | `sh_nexus_wire\src\frame.rs` | 169 | 2 | 98.82% | 0 | 100.00% |
 | `sh_nexus_wire\src\version.rs` | 17 | 0 | 100.00% | 0 | 100.00% |
-| **TOTAL** | **866** | **69** | **92.03%** | **39** | **93.88%** |
+| **TOTAL** | **1712** | **105** | **93.87%** | **70** | **94.42%** |
 
 Paths are as the tool reports them — Windows separators, workspace-relative to each crate.
 
-**`core/ordering.rs` is the first row in this table that is new**, and it is the
-first `core/` file to appear at all. 1A's baseline had no `core/` row because
-`core/` held type definitions only; §2.3 explains that, and §3.3 records what
-changed. **190 regions, 0 missed, 18 of 18 functions executed** — the whole
-module, including the private comparators, is covered.
+**`core/markdown.rs` is the new row, and 95.74% is not 100% — §4.7 says exactly which 36 regions
+and why.** 79 of 79 functions executed. Every one of the 31 missed lines is a *defensive* arm
+guarding a case the parser has already excluded, not an untested decision; §4.7 enumerates all 31
+so the claim can be checked rather than taken on trust.
+
+`core/ordering.rs` is unchanged to the decimal from 1B, which is the control that makes the rest of
+the table readable: 1C-1 did not touch that file, and the tool reports exactly what it reported
+before.
 
 ### 2.2 Crate and layer aggregates
 
 | Aggregate | Region cover | Line cover |
 |---|---|---|
-| **`core/`** | **100.00%** (190/190 regions) | **100.00%** (143/143 lines) |
+| **`core/`** | **96.53%** (1000/1036 regions) | **95.93%** (730/761 lines) |
 | **`sh_nexus_wire` as a crate** | **98.95%** (188/190 regions) | **100.00%** (159/159 lines) |
-| `sh_nexus` as a crate | 90.10% (609/676 regions) | 88.32% (479/542 lines) |
+| `sh_nexus` as a crate | 93.23% (1419/1522 regions) | 93.61% (1026/1096 lines) |
 
-`core/`'s row covers exactly one file, because `ordering.rs` is the only
-executable thing in the layer. See §3.3 for why that is a real measurement and
-not the floor being won.
+`core/` now covers **two** files. It covered one in 1B, and that one was at 100%; §2.7 is the delta
+and §4.7 is the detail. The aggregate **fell**, and that is the honest reading: a layer is measured
+by everything in it, and a new file at 95.74% moves the number whether or not 95.74% is good. It is
+good — 5.53 points above the floor — and the file is characterised rather than waved through.
 
 
 ### 2.3 Files that do not appear in the report at all
@@ -120,56 +142,50 @@ for them and they produce no report row at all:
 Each was read and confirmed to contain no `fn` and no `impl` block. The absence is a **true zero for
 executable code**, not a measurement gap.
 
-**This is the list that made §3.3 unmeasurable, and it is now one file shorter
-in spirit but not in fact:** `core/ordering.rs` has left this category and
-appears in §2.1 at 100.00%, while `core/models/*.rs` remain in it. The category
-itself is unchanged — it still means "no logic to be wrong", and `markdown.rs`,
-`cache.rs` and `theme.rs` will join `models/` here until 1C writes them.
+**This is the list that made §3.3 unmeasurable in 1A, and it is now two files shorter.** Two
+files have left this category: `core/ordering.rs` in 1B (now §2.1 at 100.00%) and
+`core/markdown.rs` in 1C-1 (now §2.1 at 95.74%). **Both are the only `core/` files to have ever
+appeared in the region report**, and every remaining member of the layer is still type definitions
+and `pub mod` declarations. `core/cache.rs` (1C-2) and `core/theme.rs` (1D) remain in this category
+until they are written, and when they land they enter §2.1 — and §2.7 is the arithmetic for what
+that will do to the aggregate.
 
 ### 2.4 Reconciliation note on the line column
 
-**Both columns reconcile in 1B.** That is a change from 1A and it is recorded as
-an observation, not as a correction of 1A's arithmetic.
+**Both columns reconcile in 1C-1, and continue to.** 1A found the *line* column
+non-reconciling and 1B recorded that the contradiction had gone away without
+explaining it; 1C-1 adds a second consecutive clean run, which is worth one
+sentence because the anomaly 1A reported was in the column this project would
+have used as a gate.
 
 The **region** column:
 
 ```text
-regions:      190 + 148 +   7 + 331 +   4 + 169 +  17 =  866
-missed:         0 +  58 +   7 +   2 +   0 +   2 +   0 =   69
-covered:      866 − 69 = 797        797 / 866 = 92.03%
+regions:      846 + 190 + 148 +   7 + 331 +   4 + 169 +  17 = 1712
+missed:        36 +   0 +  58 +   7 +   2 +   0 +   2 +   0 =  105
+covered:     1712 − 105 = 1607       1607 / 1712 = 93.87%
 ```
 
-The **line** column, which in 1A summed to 51 against a TOTAL of 48:
+The **line** column:
 
 ```text
-lines:        143 +  99 +   7 + 229 +   3 + 139 +  17 =  637
-missed:         0 +  32 +   7 +   0 +   0 +   0 +   0 =   39
-covered:      637 − 39 = 598        598 / 637 = 93.88%
+lines:        618 + 143 +  99 +   7 + 229 +   3 + 139 +  17 = 1255
+missed:        31 +   0 +  32 +   7 +   0 +   0 +   0 +   0 =   70
+covered:     1255 −  70 = 1185       1185 / 1255 = 94.42%
 ```
 
-**What changed, and what is still unexplained.** 1A recorded two anomalies: the
-per-file missed-line figures summing to 51 against a TOTAL of 48, and
-`sh_nexus_wire\src\error.rs` reporting 3 missed lines while simultaneously
-reporting 100.00% line cover — two figures that cannot both be true of one
-denominator. 1A inferred the likely cause (non-region-bearing lines counted
-under a different rule than the region rows) and correctly labelled it an
-inference, not a verified cause.
+Per-file missed lines sum to the TOTAL in both columns, and the per-file line counts sum to the
+TOTAL line count. **The cause of 1A's anomaly is still not verified** and this file does not claim
+it is; what has changed is that there are now two independent clean measurements rather than one.
 
-In 1B `error.rs` reports 3 lines and **0 missed**, and every wire-crate file
-reports **0 missed lines**. So the contradiction is gone and the line column
-reconciles. **The cause is still not verified.** What can be said is narrower
-than a resolution: 1A's inference is *consistent* with what 1B observes, and the
-1A figures are not reproducible by re-running the tool on the 1B tree, so the
-1A anomaly cannot be re-examined from this recording. It is a finding about a
-past measurement that is closed by supersession rather than by explanation.
-
-**Consequence, unchanged from 1A.** ADR-004's floors are stated as region
+**The consequence, unchanged from 1A.** ADR-004's floors are stated as region
 coverage, the region column reconciles to the last decimal, and **§3's verdicts
 rest on regions**. The line column is recorded for completeness and must still be
 re-derived from a single report before it gates anything under §6.3.
 
-### 2.5 The 1A baseline, retained for regression
-1A's figures, kept verbatim so §6.3's "any coverage drop blocks the merge" has
+### 2.5 The 1B baseline, retained for regression
+
+1B's figures, kept verbatim so §6.3's "any coverage drop blocks the merge" has
 something to drop from. **Every aggregate improved; no aggregate regressed.**
 
 | Aggregate | 1A | 1B | Δ |
@@ -185,6 +201,7 @@ something to drop from. **Every aggregate improved; no aggregate regressed.**
 | `sh_nexus_wire` as a crate | 92.63% / 94.34% | **98.95%** / **100.00%** | **+6.32 / +5.66** |
 | `sh_nexus` as a crate | *not recorded* | 90.10% / 88.32% | — |
 | **Workspace total** | **88.02% regions / 90.28% lines** | **92.03% / 93.88%** | **+4.01 / +3.60** |
+
 **`lib.rs`, `main.rs` and `mapping.rs` are unchanged to the decimal**, which is
 the control that makes the rest of the table meaningful: 1B touched no line of
 any of them, and the tool reports exactly what 1A reported. A coverage table
@@ -200,35 +217,45 @@ modal case and moves by one region in roughly one run in three.
 measurement rather than about any line of code.**
 
 Re-running `cargo llvm-cov --workspace --summary-only` on the **identical,
-unmodified** 1B tree gives **two different answers**:
+unmodified** tree gives **two different answers**. 1B recorded six measurements
+across two commits; 1C-1 adds two more on a different commit, and the pattern
+holds.
 
 | Recorded runs | `mapping.rs` | Workspace TOTAL |
 |---|---|---|
 | 2 missed regions | 4 | **92.03%** |
 | 3 missed regions | 2 | **91.92%** |
+| 2 missed regions (1C-1, run 1) | 4 | **92.03%** |
+| 3 missed regions (1C-1, run 1) | 2 | **91.92%** |
 
-Six measurements, same commit, same tool, same environment, different numbers.
-`lib.rs`, `main.rs`, `core/ordering.rs`, `frame.rs` and `version.rs` were
-**identical in every run**; the variation is confined to `mapping.rs`.
+Eight measurements, different commits, same tool, same environment, different numbers.
 
 **What is verified, and how:**
 
 | Question | Answer | How |
 |---|---|---|
 | Did 1B touch `mapping.rs`? | **No.** `git status` shows it unmodified | working tree |
+| Did 1C-1 touch `mapping.rs`? | **No.** 1C-1 touched `core/markdown.rs`, `core/mod.rs`, the two `Cargo.toml`s, and two test files | working tree |
 | Is the line column stable? | **Yes** — 229 lines, 0 missed, every run | `report` summary |
 | Is function execution stable? | **Yes** — 22 of 22, every run | `report` summary |
 | Do the JSON region sets differ between a 2- and a 3-run? | **No** — the region-entry line sets and the zero-count segment sets are **identical** | `--json` export, compared directly |
 | Can the extra region be attributed to a line? | **No**, with the tooling in this environment | the export itemises nothing that differs |
 
-**The cause is almost certainly proptest's per-run randomness, and that is an
-inference, not a measurement.** `mapping.rs` is exercised substantially by the
-property tests in `tests/wire_boundary.rs` and `tests/proptest_boundary.rs`,
-proptest generates fresh random values on every run, and a region entered only by
-*some* generated inputs is therefore covered in most runs and missed in some. The
-evidence is consistent with that and with nothing else observed — the alternative
-would be non-determinism in the tool itself, which the stable line and function
-columns argue against.
+**`core/markdown.rs` is the new control, and it is the useful part of this
+section.** Its two 1C-1 runs were **identical to every digit** — 846 regions, 36
+missed, 95.74%, 618 lines, 31 missed, 79 of 79 functions — on a file whose test
+suite is dominated by proptest. So the fluctuation is **not** a property of
+running proptest at all; it is confined to the one file 1B identified, which
+narrows the cause further than 1B could and supports its inference that the
+trigger is proptest's per-run randomness *in `mapping.rs` specifically* —
+exercised by `tests/wire_boundary.rs` and `tests/proptest_boundary.rs`, which
+generate fresh values on every run and therefore enter some regions only
+sometimes.
+
+**The cause remains an inference, not a measurement**, and it is recorded as
+one. The evidence is consistent with that and with nothing else observed; the
+alternative would be non-determinism in the tool itself, which the stable line
+and function columns and the now-stable `markdown.rs` row both argue against.
 
 **Consequence, and it is not small.** `AGENTS.md` §6.3 makes *"any coverage drop
 blocks the merge"* a rule. **A gate on the exact decimal of this figure will fire
@@ -255,10 +282,52 @@ mechanism. The project's own file predicted the failure mode before it was
 observed in the column the project gates on. That is worth more than a clean
 number.
 
-**The tables in §2.1–§2.2 report the modal case (2 missed, 92.03%),** because
-that is what most runs produce, it is what 1A recorded for every other row, and
-`core/`'s 100.00% — the figure §3.3 turns on — is identical in every run and is
-not affected by any of this. Where a figure could be read either way, §2.6 says so.
+**The tables in §2.1–§2.2 report the modal case (2 missed, 93.87%),** because
+that is what most runs produce, it is what both prior recordings recorded for
+every other row, and `core/`'s figure — the one §3.3 turns on — is identical in
+every run and is not affected by any of this. Where a figure could be read either
+way, §2.6 says so. **The 1C-1 range for the workspace TOTAL is 93.81–93.87%**,
+and every floor in §3 passes at the lower end as well.
+
+### 2.7 The 1C-1 delta, including the regression
+
+The one number in this file that moved against 1B, stated first and without
+softening.
+
+| Aggregate | 1B | 1C-1 | Δ |
+|---|---|---|---|
+| `sh_nexus\src\core\markdown.rs` | *did not exist* | **95.74%** regions / 94.98% lines | new |
+| `sh_nexus\src\core\ordering.rs` | 100.00% / 100.00% | 100.00% / 100.00% | **none** |
+| `sh_nexus\src\lib.rs` | 60.81% / 67.68% | 60.81% / 67.68% | **none** |
+| `sh_nexus\src\main.rs` | 0.00% / 0.00% | 0.00% / 0.00% | **none** |
+| `sh_nexus\src\network\mapping.rs` | 99.40% / 100.00% | 99.40% / 100.00% | **none** (modal; see §2.6) |
+| `sh_nexus_wire\src\error.rs` | 100.00% / 100.00% | 100.00% / 100.00% | **none** |
+| `sh_nexus_wire\src\frame.rs` | 98.82% / 100.00% | 98.82% / 100.00% | **none** |
+| `sh_nexus_wire\src\version.rs` | 100.00% / 100.00% | 100.00% / 100.00% | **none** |
+| **`core/` as a layer** | **100.00%** (190/190) | **96.53%** (1000/1036) | **−3.47** |
+| `sh_nexus_wire` as a crate | 98.95% / 100.00% | 98.95% / 100.00% | **none** |
+| `sh_nexus` as a crate | 90.10% / 88.32% | **93.23%** / **93.61%** | **+3.13 / +5.29** |
+| **Workspace total** | **92.03% / 93.88%** | **93.87% / 94.42%** | **+1.84 / +0.54** |
+
+**Seven rows are unchanged to the decimal**, and that is the control that makes
+the `core/` row readable. 1C-1 touched no line of `ordering.rs`, `lib.rs`,
+`main.rs`, `mapping.rs`, or any wire-crate file, and the tool reports exactly
+what 1B reported for all seven.
+
+**Why `core/` fell, in one sentence:** the aggregate is over every executable
+thing in the layer, `ordering.rs` is still 190 of 1036 regions, and
+`markdown.rs` entered at 95.74% rather than at 100%. **No existing region became
+uncovered** — `ordering.rs` is 190/190 in both recordings — so this is a
+denominator effect and not a regression in code that was already measured. It is
+still a fall, it still counts under `AGENTS.md` §6.3's rule, and it is recorded
+as one rather than explained away by the fact that the floor is met.
+
+**What it predicts, and the prediction is falsifiable.** `core/cache.rs` (1C-2)
+and `core/theme.rs` (1D) are the remaining two logic modules. If they land at
+markdown.rs's ~96%, the layer settles near 97%; if they land at ordering.rs's
+100%, it settles above 98%. Either way the floor holds, and §6.3's regression
+gate should be keyed to the **layer** and not to the 1B figure of 100.00%, which
+was a statement about a single file.
 
 
 ---
@@ -267,83 +336,89 @@ not affected by any of this. Where a figure could be read either way, §2.6 says
 
 ### 3.1 `AGENTS.md` §6.1 — workspace total: 75% minimum / 85% target
 
-**92.03% region coverage — PASSES THE TARGET.** 7.03 points above the 85% target and 17.03 points
-above the 75% minimum, and 4.01 points above the 1A baseline. The line column reads 93.88% and points
+**93.87% region coverage — PASSES THE TARGET.** 8.87 points above the 85% target and 18.87 points
+above the 75% minimum, and 1.84 points above the 1B baseline. The line column reads 94.42% and points
 the same way.
 
-**The regional figure is 91.92–92.03%** depending on the run, per §2.6, and **passes the target by
-6.92 points at the lower end as well.** The verdict does not depend on which run produced it; the
+**The regional figure is 93.81–93.87%** depending on the run, per §2.6, and **passes the target by
+8.81 points at the lower end as well.** The verdict does not depend on which run produced it; the
 decimal does, and §2.6 says so.
 
 ### 3.2 ADR-004 — `sh_nexus_wire` ≥80%
 
-**98.95% region coverage — PASSES.** 18.95 points above the floor, and 6.32 points above the 1A
-baseline. See §2.2. This is the floor that matters most (§3.4), because `AGENTS.md` §4.2's serde
-round-trip mandate and §7.4's version rejection both live in this crate.
+**98.95% region coverage — PASSES.** 18.95 points above the floor, unchanged from 1B. See §2.2. This
+is the floor that matters most (§3.4), because `AGENTS.md` §4.2's serde round-trip mandate and
+§7.4's version rejection both live in this crate.
 
 **It is not 100%, and the reason is recorded in §4.4.** 1A predicted that closing the three named
 residuals would take this crate to 100% region coverage. Measurement says otherwise: 188/190. The
 prediction is refuted by 2 regions, and §4.4 says what is and is not known about them.
 
-### 3.3 `AGENTS.md` §4.1 — `core/` ≥90%: **MEASURABLE, AND MET**
+**1C-1 changed nothing in this crate and is recorded as unchanged**, which is the useful outcome: the
+two figures `frame.rs`'s residual produces are the same two regions 1B found, on a tree where the
+dependency graph grew by two crates.
 
-**`core/ordering.rs` measures 100.00% — 190 of 190 regions, 143 of 143 lines, 18 of 18 functions
-executed, 0 missed. The 90% floor passes with nothing missed at all.** The sentence 1A wrote here —
-that this floor could not be evaluated — is no longer true, and this section is its replacement.
+### 3.3 `AGENTS.md` §4.1 — `core/` ≥90%: **MEASURABLE, AND MET — for two files now**
 
-What changed, stated precisely so the number is not read as more than it is:
+**`core/` measures 96.53% — 1000 of 1036 regions, 730 of 761 lines, 97 of 97 functions executed,
+36 regions missed. The 90% floor passes with 6.53 points of margin.** `core/ordering.rs` is still
+190/190 and `core/markdown.rs` is 810/846.
 
-- **1A was right that the floor was unmeasurable, and right about why.** `core/` held type
-  definitions only, which emit zero regions (§2.3), so there was no denominator. That is a fact about
-  measurement, not a pass, and 1A was careful not to let the absence read as green.
-- **1B is the first executable code in `core/`, and it is 100%.** The floor now has a denominator and
-  the denominator clears it. The two are separate statements: the first is about arithmetic, the
-  second is about whether the code was tested. Both are recorded here because only the first is what a
-  coverage tool can tell you.
-- **The floor is met for one module, not for the layer.** `core/`'s remaining three logic modules —
-  `markdown.rs`, `cache.rs`, `theme.rs` — are work unit **1C** and do not exist. When they land they
-  are measured against the same 90%, and a 100% here is a promise about `ordering.rs`, not a headroom
-  budget for them. `PLAN.md` §8, Phase 1: *"Strict TDD applies to `core/` and `sh_nexus_wire` (pure,
-  ≥90% floor, no excuses)."*
-- **This is the strictest floor in the project, and it is now the first one actually enforced against
-  real logic.** 90% minimum (ADR-004 decision 2, which took the stricter of `AGENTS.md`'s two
-  conflicting figures — see Appendix A item 1) against a pure-logic target with no excuse available.
-  `PLAN.md` §10's proptest mandate applies to exactly this module, and the two properties it names
-  are implemented: the permutation invariant and no-loss.
-- **`core/`'s architectural obligations are now enforced rather than stated.** ADR-003 keeps the
-  layer free of `gpui` and `tokio`, and `core/models/mod.rs` adds "no I/O, no clock, no thread".
-  Until 1B those were prose, because a type definition cannot break them. `core/ordering.rs` is the
-  first code that could, and `tests/layer_boundary.rs` grew three tests in 1B to hold the line
-  mechanically: `core_names_no_clock_and_no_thread`, `core_contains_no_panicking_construct`
-  (`AGENTS.md` §7.1's no-panic rule, also unenforceable before), and
-  `the_violation_scanners_see_code_and_not_prose` — which exists so the two new scanners are known
-  to fail **loud**, not open.
+What is new in 1C-1, stated precisely so the number is not read as more than it is:
+
+- **The floor is met for a second module, and the layer aggregate moved the *wrong* way.** 1B
+  recorded `core/` at 100.00% on the strength of one file. Adding a second file at 95.74% took the
+  layer to 96.53%. §2.7 is the arithmetic. It is a denominator effect and not a regression —
+  `ordering.rs` is unchanged to the decimal — but it **is** a fall under §6.3's rule, and it is
+  recorded as one. The lesson for §6.3 is that a per-layer gate must be keyed to the layer, not to
+  whatever figure a single-file layer happened to report.
+- **The strictest floor in the project now has a denominator worth the name.** 90% against pure
+  logic with no excuse available, met with two logic modules in the denominator rather than one.
+- **The security-relevant work is the part coverage cannot see, and this file says so rather than
+  letting 95.74% stand in for it.** `core/markdown.rs` is a parser for attacker-controlled text.
+  Its correctness is pinned by 241 tests, of which the mandatory ones are named in `AGENTS.md` §4.2
+  — bold, italic, code, links, nested formatting, never panics, injection safety — and by six
+  proptest properties over arbitrary input. §4.7 says which claim each one carries. A coverage
+  number would be the wrong instrument for all of it, and 1A §4.6 already made this point about
+  `ordering.rs`.
+- **`core/`'s architectural obligations are enforced, and the allow-list had to be widened.** ADR-003
+  keeps the layer free of `gpui` and `tokio`. `core/markdown.rs` is the first `core/` module to
+  depend on anything outside `std` and the four domain crates, so
+  `crates/sh_nexus/tests/layer_boundary.rs`'s `CORE_ALLOWED_CRATES` allow-list was extended with
+  `pulldown_cmark` **in the same commit that added it to `Cargo.toml`** — which is the property
+  that makes an allow-list worth maintaining: the dependency was rejected until somebody recorded
+  the decision. All 11 boundary tests pass, including the three 1B added to hold the no-panic and
+  no-clock rules mechanically.
+- **`core/`'s remaining two logic modules are `cache.rs` (1C-2) and `theme.rs` (1D).** They do not
+  exist, so this floor is met for half the layer. §2.7 states the falsifiable prediction for when
+  they land.
 
 ### 3.4 Summary
 
 | Floor | Source | Measured | Verdict |
 |---|---|---|---|
-| Workspace total ≥75% min / ≥85% target | `AGENTS.md` §6.1 | **92.03%** regions | **PASSES target** |
+| Workspace total ≥75% min / ≥85% target | `AGENTS.md` §6.1 | **93.87%** regions (93.81–93.87%) | **PASSES target** |
 | `sh_nexus_wire` ≥80% | ADR-004 decision 3 | **98.95%** regions | **PASSES** |
-| `core/` ≥90% | `AGENTS.md` §4.1, ADR-004 decision 2 | **100.00%** regions (190/190) | **PASSES — 0 missed** |
-| New code ≥80% | `AGENTS.md` §5.1, ADR-004 | see §4 | **PASSES on all three files** |
+| `core/` ≥90% | `AGENTS.md` §4.1, ADR-004 decision 2 | **96.53%** regions (1000/1036) | **PASSES — 36 missed, all defensive (§4.7)** |
+| New code ≥80% | `AGENTS.md` §5.1, ADR-004 | `markdown.rs` **95.74%** | **PASSES** |
 | `network/` ≥80% | `AGENTS.md` §4.1 | `mapping.rs` **99.40%** regions (99.09–99.40%, §2.6) | **PASSES** |
-| `state/`, `db/`, utilities ≥80/85% | `AGENTS.md` §4.1 | directories do not exist yet | Not applicable in 1B |
+| `state/`, `db/`, utilities ≥80/85% | `AGENTS.md` §4.1 | directories do not exist yet | Not applicable in 1C-1 |
 
-**Every floor with a denominator passes in 1B**, and none of them passes by a
+**Every floor with a denominator passes in 1C-1**, and none of them passes by a
 margin that depends on a file nobody can test: the two sub-80% files are
 `lib.rs` and `main.rs`, both characterised in §4.1–§4.2 as the window-opening
 path that Phase 2 moves, and neither is in a directory §4.1 names.
+
 
 
 ---
 
 ## 4. The sub-floor files, characterised
 
-**Two files sit below 80% in 1B, down from four in 1A.** Both are structural: the window-opening
+**Two files sit below 80% in 1C-1, down from four in 1A.** Both are structural: the window-opening
 path that Phase 2 restructures into `src/app.rs`, in a file §4.1's directory-keyed floors do not
-name. None of them is a quality problem in the code that was written, and neither is new in 1B — both
-are byte-identical to 1A and measure identically (§2.5).
+name. None of them is a quality problem in the code that was written, and neither is new in 1C-1 —
+both are byte-identical to 1A and measure identically (§2.7).
 
 The three that 1A characterised here and that are now **closed or nearly so** —
 `version.rs` at 76.47%, `frame.rs` at 94.08%, and the nine-line residual of §5 — are §4.3, §4.4 and
@@ -352,8 +427,8 @@ The three that 1A characterised here and that are now **closed or nearly so** �
 
 ### 4.1 `sh_nexus\src\lib.rs` — 60.81% regions, 67.68% lines
 
-**Unchanged in 1B**, and unchanged for the reason 1A gave: 1B touched no line of this file and the
-tool reports exactly what 1A reported (§2.5).
+**Unchanged in 1C-1, and unchanged for the reason 1A gave:** no work unit since has touched a line
+of this file, and the tool reports exactly what it reported then (§2.7).
 
 **What it holds:** the Phase 0 spike's GPUI root view (`RootView`) and the window-startup path.
 
@@ -462,15 +537,15 @@ names as the thing that must not rot — and it is where `AGENTS.md` §2.1's "va
 payload before it touches state" is enforced. Recorded here because a baseline that only lists
 failures hides the result that matters most.
 
-**Unchanged in 1B, to the modal figure** (§2.5): 1B touched no line of it, and the two missed regions
+**Unchanged in 1C-1, to the modal figure** (§2.7): 1C-1 touched no line of it, and the two missed regions
 remain the two 1A recorded. **The one file whose figure is not reproducible to the decimal — see
 §2.6**, which is why this sentence says "modal" and not "exactly".
 
 ### 4.6 `sh_nexus\src\core\ordering.rs` — 100.00% regions, 100.00% lines
 
-**The new file, and the one §3.3 turns on.** 190 regions, 0 missed, 143 lines, 0 missed, 18 functions
-executed. It is in this section only because §4 is where the *detail* behind a number lives, not
-because anything about it needs characterising.
+**190 regions, 0 missed, 143 lines, 0 missed, 18 functions executed. Unchanged to the decimal in
+1C-1**, which is the control §2.7 relies on. It is in this section because §4 is where the *detail*
+behind a number lives.
 
 **What 100% means here, stated so it is not over-read.** It means every region the instrumenter
 emitted was executed, which for this module includes the private comparators `precedence` and
@@ -494,9 +569,102 @@ permutations, and a property test samples it while an enumeration over 5! = 120 
 for that batch. Both are here because they answer different questions, and 100% region coverage
 answers neither.
 
+### 4.7 `sh_nexus\src\core\markdown.rs` — 95.74% regions, 94.98% lines
+
+**The new file, and the one §3.3 turns on.** 846 regions, 36 missed, 618 lines, 31 missed, and
+**79 of 79 functions executed**. It is in this section because 36 missed regions is a number a
+reader should be able to interrogate rather than accept.
+
+**All 31 missed lines are defensive arms, and the enumeration is the claim.** They fall into exactly
+four groups, and in every case the guard is kept because the *cost of being wrong* is losing an
+author's text — so the list is here for a reader to disagree with, not to be impressed by.
+
+| # | Lines | The arm | Why it cannot be reached |
+|---|---|---|---|
+| 1 | 1020 | strip the `\r` of a closing `\r\n` in a code block | **Verified**: pulldown normalises CRLF to LF before this module sees it. `parse("```rust\r\nx\r\n```")` yields `"x"`, confirmed by test and by probe. The arm is correct and currently unreachable. |
+| 2 | 1292, 1301, 1679, 1700, 1738–1740, 1801, 1868–1869, 1881, 1897–1901 | ten guards on states pulldown excludes | listed individually below |
+| 3 | 1443 | `Event::InlineMath \| DisplayMath \| FootnoteReference` | the `Options` in `parse` do not enable math or footnotes, so these events cannot be emitted. Documented in the module as a deliberate narrowing. |
+| 4 | 1539–1543, 1671–1673, 1704–1708 | three "this cannot happen, but do not lose the content" paths | listed individually below |
+
+Group 2, spelled out:
+
+| Line | The arm | Why it cannot be reached |
+|---|---|---|
+| 1292 | a `Frame::Literal` receiving a bare block | an HTML block holds runs, not blocks |
+| 1301 | `as_list_host` returning `None` | an `Item` is only ever emitted with a `List` directly beneath it |
+| 1679 | a `List` frame closing with no items | a list always has at least one item |
+| 1700 | the brace of `if let Some(items) = host` | **a region-attribution artefact**: `items.push(item)` and the `return` beside it are both covered. This is the same class as `frame.rs`'s two unattributable regions (§4.4) — the instrumenter counts a region the lcov export cannot itemise |
+| 1738–1740 | joining buffered runs into a code block's text | a code block's body arrives as `Text` events and goes straight into its `text`; `loose` is always empty |
+| 1801 | `push_text_with` with empty text | no parser event in this configuration carries an empty `Text` |
+| 1868–1869 | a link inside a link | **CommonMark forbids it**, which is why `MAX_INLINE_DEPTH` is 2 and is documented as structural rather than enforced |
+| 1881 | `Frame::Literal` in `push_inline`'s sink check | no link is emitted inside an HTML block |
+| 1897–1901 | `finish`'s two drain loops | **pulldown's event stream is balanced by guarantee**, so no frame or inline frame is ever still open at the end. This is the single most consequential line in the table: it means the "malformed input" defence lives *inside pulldown*, and this module's own teardown is a belt-and-braces path that no input reaches. |
+
+**Two of the 36 regions were closed during 1C-1 rather than explained away**, and that is the part
+of this entry worth copying. The first measurement was 93.31% with 59 missed and **one missed
+function**; investigation found three things that were *reachable and untested*:
+
+1. `Style`'s `Binary` impl — public API no test called;
+2. the `\r` branch of the code-block trim — reachable only via a CRLF message;
+3. the empty-heading guard — reachable via a bare `#`.
+
+Those are now tested, which is also how the CRLF normalisation above was *verified* rather than
+assumed. Two pieces of genuinely dead code were **deleted** rather than left as unreachable defence:
+`Builder::close_leaf` and the "fill the open leaf" branch of `flush_pending` (whose two states are
+exclusive, so it could never be taken). Deleting them moved 846 regions' worth of code from
+93.31% to 95.74% without adding a single test, which is the honest measure of how much of the
+original 59 was untested *decisions* rather than unreachable branches.
+
+**What coverage cannot see here, and is not asked to.** This is a parser for
+attacker-controlled text, and its security properties are not line coverage. `AGENTS.md` §4.2's
+markdown row is the specification, and each clause has a test named after it:
+
+| `AGENTS.md` §4.2 clause | Test | `#[case]`s |
+|---|---|---|
+| bold, italic, code, links | `a_markup_construct_renders_as_its_style` | 10 |
+| nested formatting | `a_triple_asterisk_run_carries_both_bold_and_italic`, `nested_formatting_produces_one_span_carrying_the_union_of_its_ancestors`, `three_spellings_of_bold_italic_produce_the_same_tree` (4) | 5 |
+| code — block | `a_code_blocks_content_is_never_parsed` (4), `a_code_block_keeps_the_authors_blank_lines` (5), `a_code_block_reports_its_declared_language` (7) | 16 |
+| code — inline vs block | `inline_code_and_a_code_block_are_structurally_different` | 1 |
+| never panics | `arbitrary_markdown_never_panics_the_parser` | **proptest** |
+| malformed input | `unclosed_markup_still_yields_the_authors_text`, `a_hostile_single_token_is_bounded_and_does_not_panic` (8), `an_empty_message_produces_no_blocks` (4) | 30 |
+| injection safety — raw HTML | `raw_html_is_preserved_as_literal_text` | 8 |
+| injection safety — dangerous schemes | `a_dangerous_link_scheme_never_reaches_a_link_target` — **one per scheme** | 4 |
+| injection safety — unlisted schemes | `an_unlisted_scheme_is_refused` (`tel:`, `ftp:`, `ms-msdt:`, `search-ms:`, `customapp:`, `about:`, `jar:`) | 7 |
+| injection safety — obfuscation | `a_scheme_obfuscated_with_a_control_character_is_refused` (10), `a_target_with_no_scheme_is_refused` (6) | 16 |
+| injection safety — the **converse** | `a_legitimate_link_survives` — a filter that refuses everything passes every test above | 5 |
+| injection safety — images | `an_image_contributes_its_alt_text_and_never_a_target` | 4 |
+| injection safety — Unicode | `a_bidi_control_is_replaced_and_a_bidi_mark_is_kept` (12), `a_bidi_mark_and_a_zero_width_joiner_survive` (6), `ordinary_text_neutralizes_nothing` (7) | 25 |
+| the text a reader sees | `a_markup_spelling_renders_to_exactly_the_text_the_reader_sees` | 11 |
+| the declared limits | `a_message_over_the_size_limit_is_truncated_on_a_character_boundary` (5), `deeply_nested_quotes_are_flattened_without_losing_text` (4), `truncation_never_splits_a_multi_byte_character` | 10 |
+
+**The "converse" row is the one to insist on.** Every test above it asserts that something is
+*refused*; a filter that refused all links would pass every one of them. `a_legitimate_link_survives`
+is the only thing standing between this module and a link renderer that breaks every message, and it
+is why the allowlist's three entries are tested positively rather than inferred from the denials.
+
+And the six proptest properties, which are the ones coverage cannot substitute for:
+
+| Property | The claim it pins |
+|---|---|
+| `arbitrary_markdown_never_panics_the_parser` | `AGENTS.md` §4.4's mandate, verbatim |
+| `parsing_is_deterministic` | same input, same tree — what makes 1C-2's segment cache worth having |
+| `the_tree_never_exceeds_its_declared_depth` | both limits, from the outside, over arbitrary input |
+| `every_source_range_lies_inside_the_source` | §3's ranges are real, not fabricated |
+| `no_link_target_escapes_the_allowlist` | the allowlist as a **universal** claim, not a table of bad URLs |
+| `every_run_is_plain_text_with_no_bidi_control` | no run carries a character that changes how its surroundings read |
+
+**The one that found a bug is the one worth noting.** `a_link_is_the_deepest_inline_nesting_there_is`
+is a two-assertion test and it caught `[**a**](x)` producing a link with **no content** and its text
+as a sibling run — a `Strong` frame sits above the link on the inline stack, and the builder was
+looking only at the top of it. That is the same class of defect as the tight-list bug the first
+draft had, found by a different route, and it is the argument for asserting on the tree rather than
+on the text: `plain_text` was **correct** in that case, and only the structure was wrong.
+
 ---
 
-## 5. Carried-forward action — **CLOSED in 1B, with one refuted prediction**
+## 5. Carried-forward actions
+
+### 5.1 1A's nine-line residual — **CLOSED in 1B, with one refuted prediction**
 
 1A left a nine-line residual here, by line range, and named the action. Both are now done.
 
@@ -521,6 +689,10 @@ at would be a task nobody could close — which is worse than recording it as a 
 6.82 points above ADR-004's floor and `sh_nexus_wire` is 18.95 points above it (§3.2). If a future
 tool version makes those regions attributable, §4.4 will say so when it happens.
 
+**1C-1 re-measured both files and both are unchanged**, on a tree where the dependency graph grew by
+two crates. That is the third consecutive recording in which this residual is stable, and it is
+recorded as a settled finding rather than an open action.
+
 **The lesson is recorded because it is the second time in this project.** §6.2 below is the first:
 1A's own §5 action predicted an outcome that measurement did not deliver. Both are the same shape — a
 specific, confident, checkable prediction written before measuring, and a measurement after — and the
@@ -528,14 +700,33 @@ project's rule is that the prediction is not quietly edited once the measurement
 alternative is a documentation file that always reads as though it were right, which is worth nothing
 as a baseline.
 
-### 5.1 Not carried forward
+### 5.2 `core/markdown.rs` — **NOT carried forward, and the reasoning is recorded**
 
-`lib.rs` and `main.rs` are **not** on this list, in 1B exactly as in 1A. Their gaps are the
+1C-1's file has **36 uncovered regions**, and §4.7 enumerates every one of them. None is carried
+forward as an action, for two reasons that are different from each other and both worth stating:
+
+1. **Most are unreachable, and writing a task for an unreachable region is a task nobody can close.**
+   `Builder::finish`'s drain loops cannot run because pulldown's event stream is balanced by
+   guarantee; the link-inside-a-link arm cannot run because CommonMark forbids it. An action item
+   against either would be theatre.
+2. **Three were reachable and are now closed**, and that is what the investigation was *for*. The
+   first measurement was 93.31% with a missed function; the reachable gaps turned out to be
+   `Style`'s `Binary` impl, the `\r` branch of the code-block trim, and the empty-heading guard. All
+   three are tested. Two further pieces of dead code were deleted rather than defended, which is
+   where most of the 93.31% → 95.74% movement came from.
+
+**The prediction §4.7 makes is falsifiable and is left standing**: `core/cache.rs` (1C-2) and
+`core/theme.rs` (1D) will move the `core/` aggregate, and the direction of that move is stated
+rather than left to be discovered.
+
+### 5.3 Not carried forward
+
+`lib.rs` and `main.rs` are **not** on this list, in 1C-1 exactly as in 1B and 1A. Their gaps are the
 window-opening path (§4.1, §4.2), which Phase 2 restructures into `src/app.rs` and which no test can
 reach in its current shape. Adding a test for `spike_window_options` would require a live `App`, and
 adding one for `main()` is not possible. These are **resolves-it-by-moving cases, not
 closes-it-with-a-test cases**, and they are tracked against Phase 2's app shell instead. Neither file
-moved in 1B and both measure identically (§2.5).
+moved in 1C-1 and both measure identically (§2.7).
 
 
 ---
@@ -638,4 +829,41 @@ delegating.
 table is, and nothing in `#[case]` syntax makes it complete — so each list here is paired with a test
 that fails when the registry grows past it. **The mandated style is not self-verifying, and treating it
 as though it were would be the next version of the mistake ADR-008 corrects.**
+
+**1C-1 wrote 241 tests — 215 of them `#[case]`s across 36 `#[rstest]` functions, 20
+hand-written `#[test]`s and 6 proptest properties — in the mandated form from the first line.** No
+grandfathering, no `for` table, and the file was written after ADR-008 was accepted. That is the
+point worth recording: the constitutional reading was settled *before* the work unit that would have
+to follow it, so 1C-1 had no decision to make and no deviation to explain.
+
+| Test file | `#[case]`s | What they cover |
+|---|---|---|
+| `sh_nexus\tests\markdown.rs` | **215** in 36 functions | inline constructs, run merging, soft breaks, code blocks, links and every rejected scheme, raw HTML, bidi controls and marks, size and depth limits, malformed input, plain text, the `Style` algebra, headings, task lists, list numbering, container nesting |
+
+**The 215-case list is a stronger argument for the dependency than 1B's 35 were**, for a specific
+reason: `a_dangerous_link_scheme_never_reaches_a_link_target` has **one `#[case]` per named
+scheme**. Under `#[rstest]` those are four distinct tests, so a failure says *`javascript` stopped
+being refused* — a security regression with a name. Under 1A's `for (name, case, expected)` table
+they would have been one test that failed at some index, and the index would have to be counted back
+to the scheme by hand. `AGENTS.md` §4.2 lists injection safety as a mandatory test target, and this
+is the case where the difference in signal is worth a proc-macro rather than merely convenient.
+
+**1C-1 added two more coverage guards**, following the pattern above rather than inventing one:
+`the_style_bits_are_exactly_the_four_declared_flags` (fails if a fifth style bit is added without the
+list knowing, and fails in *both* directions — a bit in `Style::ALL` that no test names, and a named
+style whose bit `ALL` does not carry) and `the_heading_cases_cover_every_level` (fails if a
+`From<HeadingLevel>` arm and a `Heading::level` arm drift apart). **`AGENTS.md` §4.2's markdown row has
+no registry to guard** — the format is not an enum the project controls — so the guards there are of a
+different kind, and §4.7 lists what stands in their place: the `Style::ALL` and `Heading` guards, the
+`#![case]`-paired structural assertions, and the universal proptest claims that a hand-written case
+list structurally cannot make.
+
+**One compiler fact 1C-1 learned the hard way, recorded because it will cost the next author an hour
+otherwise:** **rstest 0.27 requires `#[case]` on each parameter**, not merely a `#[case(…)]`
+attribute on the test. A signature written as `fn f(source: &str, expected: &str)` under
+`#[case("a", "b")]` produces **one error per `#[case]`, all reading "Wrong case signature: should
+match the given parameters list"** — eighty of them for 1C-1's first draft, with no indication that
+the fix is on the *parameter*. `crates/sh_nexus/tests/ordering.rs:960` shows the blessed form:
+`#[case] offset: i64`.
+
 
