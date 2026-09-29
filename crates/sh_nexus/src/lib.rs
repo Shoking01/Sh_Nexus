@@ -13,9 +13,10 @@
 //!
 //! `app.rs`, `ui/`, `db/` and `platform/` are not declared yet. They are later
 //! work units, and they are absent rather than declared empty: a module that
-//! exists and does nothing reads as finished work. `state/bridge.rs` is likewise
-//! absent -- it is work unit 1E-2, and `PLAN.md` section 4 makes it the single
-//! module permitted to call `cx.update_global`.
+//! exists and does nothing reads as finished work. `state/bridge.rs` arrived in
+//! work unit 1E-2 and is the single module permitted to call
+//! `cx.update_global`; [`run`] installs the global it owns, before any window
+//! exists.
 //!
 //! [`core`] is pure domain logic with no side effects -- no `gpui`, no `tokio`,
 //! no I/O (`AGENTS.md` section 3.2). [`network`] is protocol handling only: it
@@ -167,6 +168,21 @@ impl Render for RootView {
     }
 }
 
+/// The `self_user_id` this client runs with before authentication exists.
+///
+/// **A named placeholder rather than a plausible-looking id, and that is the
+/// whole point of the name.** `AppState`'s unread rule excludes messages whose
+/// author is `self_user_id` (`state/app_state.rs` module docs §5, condition 3),
+/// so a real-looking value would make the client quietly treat *somebody's*
+/// messages as its own. This string is greppable, appears in no fixture, and is
+/// replaced by the signed-in user when `network/auth.rs` arrives in Phase 4.
+///
+/// **The cost of the placeholder, stated rather than hidden:** until then
+/// nothing this client shows can be recognised as its own, so the unread rule
+/// over-counts. That is the safe direction -- a badge that over-reports is a
+/// badge the user dismisses, and an under-report is a message nobody reads.
+pub const UNSIGNED_IN_USER: &str = "u_unsigned_in";
+
 /// The window options the spike opens with: a centred, windowed 480x320.
 fn spike_window_options(cx: &App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
@@ -177,6 +193,18 @@ fn spike_window_options(cx: &App) -> WindowOptions {
 }
 
 /// Starts the GPUI application and opens the single root window.
+///
+/// **The application state is installed here, and this is the one place in the
+/// binary that calls [`state::bridge::install`].** `PLAN.md` §4 makes
+/// `state/bridge.rs` the single owner of `cx.update_global`; registering the
+/// global it owns is the first half of that, and doing it inside the launch
+/// callback means the state exists before any window — and therefore before any
+/// view — can be built. The `EventSender` it returns is dropped here on purpose:
+/// `network/`'s WebSocket client is Phase 4, and the sender's only producer is
+/// a socket task that does not exist yet. **When that task lands, it is handed
+/// this sender, and the handle has to be *kept* rather than dropped** — a
+/// dropped sender closes the inbox and every later delivery is reported as
+/// [`state::bridge::DeliveryRefusal::BridgeDropped`].
 ///
 /// # Errors
 ///
@@ -194,6 +222,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let failure_in_callback = Rc::clone(&failure);
 
     gpui_platform::application().run(move |cx: &mut App| {
+        // A second install is impossible here -- the launch callback runs once
+        // per process -- but the refusal is surfaced rather than unwrapped, per
+        // AGENTS.md 2.1, and a client with no application state has nothing worth
+        // showing, so the window is not opened at all.
+        if let Err(error) = state::bridge::install(cx, UNSIGNED_IN_USER) {
+            *failure_in_callback.borrow_mut() = Some(Box::new(error));
+            return;
+        }
+
         let options = spike_window_options(cx);
         let opened = cx.open_window(options, |window, cx| {
             let view = cx.new(RootView::new);
