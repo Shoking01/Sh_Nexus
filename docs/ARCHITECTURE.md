@@ -809,3 +809,132 @@ example of the mandated form until they reach 1B.
 - **Rewrite 1A's suite to match** - rejected as churn with no behavioural gain.
   Grandfathered and recorded instead.
 
+### ADR-009 - One main thread, by construction rather than by lock
+
+**Status:** Accepted.
+
+#### Context
+
+`AGENTS.md` 7.3 requires `cx.set_global()` / `cx.global::<T>()` for app-wide
+state, and 3.2 puts the mutations in `state/`. Work unit 1C-2b then decided that
+`core/cache.rs` needs **no `Mutex`**, and rested that on two pillars. Only one of
+them survives contact with the pinned revision.
+
+`core/cache.rs` 3 rejected `Rc<K>` because "a cache behind an `Rc` could not be
+held by `gpui::Global`". **That is false.** At rev `e683fd7`,
+`crates/gpui/src/global.rs:22` is
+
+```rust
+pub trait Global: 'static {
+    // This trait is intentionally left empty, by virtue of being a marker trait.
+```
+
+with upstream's own comment saying so. There is no `Send` bound and no `Sync`
+bound, and the storage is `TypeIdHashMap<Box<dyn Any>>` (`app.rs:796`). An `Rc`
+**can** be held as a global. `Send + Sync` was this crate's choice, not a platform
+requirement.
+
+**The second pillar is true, and stronger than 1C-2b wrote it.** `Context<'a, T>`
+holds `&'a mut App` (`gpui/src/app/context.rs:22`), and `App` holds
+`Weak<AppCell>` (`app.rs:748`), `Rc<dyn Platform>` (`app.rs:749`) and
+`Rc<ActionRegistry>` (`app.rs:752`). `Rc` is not `Send`, so `App` is not `Send`,
+so `Context` is not `Send`. **A worker thread cannot call `cx.update_global`; the
+program does not compile.** `AGENTS.md` 7.3 is enforced by the compiler here, not
+by a code review.
+
+**What that does not give, stated exactly.** The compiler prevents crossing the
+*context*, not the *value*. `AppState` remains `Send + Sync` as a matter of fact,
+and a module that built its own state and applied events to it on a worker thread
+would still compile. Work unit 1E-1 already recorded this and guarded it with
+three tests; 1E-2 is where the question becomes answerable, because until
+`state/bridge.rs` existed every caller of `actions.rs` had to be trusted with the
+invariant and there were going to be a dozen of them.
+
+#### Decision
+
+`state/bridge.rs` becomes the only owner of `cx.update_global` and `cx.update`,
+and it reaches the state through exactly one door. Three mechanisms, each doing a
+different job:
+
+**1. `AppStateGlobal` holds a `Receiver`, so the global is `!Sync`.** The state is
+reachable only through a `gpui::Global`; a global is reachable only through
+`&App`; and `&App` is only obtainable from a main-thread context. With the
+`Receiver` inside, no other thread can hold a reference to the state even if one
+wanted to. This is the piece 1C-2b was reaching for and did not have.
+
+**2. A bounded channel carries events, and values cross while state stays.**
+`EventSender` is `Send + Sync + Clone` and holds nothing but the sender half. It
+has no method returning a reference to anything this crate owns, so a worker
+thread can put a finished description into a slot and can do nothing else.
+
+The reason the *event* may travel and the *state* may not is not tidiness.
+Whether a message increments its channel's unread count depends on **which
+channel was selected at the moment it was applied** (`state/app_state.rs` 5,
+condition 2). That is a fact about the main thread at one instant, and it is
+inside no event. An implementation that applied events to a *copy* of the state on
+a worker thread would have to decide each unread count against a `selected` that
+may already be stale and then merge the copy back - a lost-update race with no
+compiler protection and no reproducible failure. The same argument covers the
+rendered-segment cache, whose recency order is a statement about what the user is
+looking at *right now*.
+
+**3. No `Mutex`, and the distinction is the point.** A `Mutex<T>` is a *shared
+handle to mutable state*: two threads hold one object and may both enter. A
+bounded channel is a *queue of owned values*. The `AppState` in this module is
+never behind anything a worker thread owns.
+
+#### Consequences
+
+**A lock would have been three separate mistakes at once.** It would make a
+second thread *possible*, and the invariant is "one owner, one thread" - a
+`Mutex<AppState>` is not a cheaper way to hold that invariant, it is standing
+permission to stop holding it. It would sit in front of every state mutation, on
+the path `AGENTS.md` 6.2's 8ms scroll-frame budget measures. And it would need a
+poisoning policy, which 2.1 forbids a module like this from having.
+
+**The residual gap is named, not rounded off.** What the type system still does
+not catch is a module that is *handed* an `AppState` by value. A scanner cannot
+see that either. Closing it would mean making `AppState::new` crate-private,
+which is a change to a file this work unit does not own, so it stays open and
+recorded. 1E-2's contribution is that the gap is now **one crossing rather than
+many**.
+
+**The queue is bounded, and its cost is declared.** `AGENTS.md` 7.1 forbids
+unbounded in-memory state, and an unbounded `mpsc::channel` would break it in the
+one place a remote peer can outrun this client, so the bridge uses `sync_channel`
+and `try_send`. A legitimate burst larger than `MAX_PENDING_EVENTS` loses the
+events past the bound, each reported to its producer as `DeliveryRefusal::InboxFull`
+**with the event handed back**. A client that hits that has a rendering problem,
+and the refusals are how it becomes visible instead of becoming a quietly stale
+sidebar.
+
+**The absence of a general mutator is the feature.** There is no
+`with_state_mut`. 3.2 asks for every mutation to be auditable, and 1E-1 achieved
+that with `pub(crate)` mutators; one public `&mut AppState` would have undone it
+behind a single door.
+
+**The one guarantee that is a compile error rather than a rule is asserted in both
+directions** and cannot be lost silently when GPUI is re-pinned:
+`a_main_thread_context_cannot_be_sent_to_another_thread` checks `App`,
+`Context` and `AsyncApp` are `!Send` and that a `u32` is `Send` (so the probe
+itself is not vacuous), and a `compile_fail` doctest on `install` demonstrates the
+failure. That doctest carries a **control block**: a `compile_fail` doctest passes
+for *any* compile error, so a typo in the failing block would make it pass for the
+wrong reason, and the `no_run` twin proves the only difference is the thread.
+
+#### Alternatives considered
+
+- **Rely on `AppState: Send + Sync` as the safety property** - rejected. It was
+  never a property; it is a fact about a type whose confinement is a rule, and
+  `the_state_is_send_and_sync_and_that_is_a_hazard_rather_than_a_guarantee` says
+  so in the test name.
+- **`Mutex<AppState>`** - rejected on the three counts above.
+- **Applying events to a copy on a worker thread and merging back** - rejected as
+  the lost-update race it is, in the unread counter specifically.
+- **An unbounded channel** - rejected by 7.1; it converts a slow render into
+  unbounded growth instead of a visible refusal.
+- **Promoting the confinement to the type system** - the correct long-term move
+  and **not attempted here**, because it means making `AppState::new`
+  crate-private and reworking a file 1E-1 owns. Named as the next step rather
+  than half-done.
+
