@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 20d93d86a98c663dce7a478739d79c98f9aeb2d13d13cc43d57af1694abfc445 # shrinks to steps = [Send { channel: 0, client: 4, second: 0 }, Receive { channel: 0, author: 0, client: 4, second: 0 }]
+cc b446156468a88b65132eaaafebbed72f80af791b2ef4a5c52395297e8089f3a7 # shrinks to steps = [Receive { channel: 1, author: 0, client: 3, second: 0 }, Send { channel: 0, client: 3, second: 0 }]
+cc 62125568d728d80349b3a80f9640077f7bc5458aa7a1187f8fd64a964adfcff4 # shrinks to steps = [Edit { channel: 2, client: 5, second: 0 }, Ack { channel: 0, client: 5, author: 0, second: 0 }, Send { channel: 3, client: 5, second: 0 }, Edit { channel: 3, client: 5, second: 0 }]

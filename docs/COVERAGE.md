@@ -1,6 +1,6 @@
 # Sh_Nexus — Measured Coverage Baseline
 
-This file records the **measured** coverage of the workspace, most recently as of work unit 1C-2b, so
+This file records the **measured** coverage of the workspace, most recently as of work unit 1E-1, so
 the numbers are not lost and later work has something concrete to regress against.
 
 `AGENTS.md` §2.3: *"Profile before optimizing. Measure, don't guess."* `AGENTS.md` §6.3 makes a
@@ -9,7 +9,8 @@ coverage drop merge-blocking, which requires a baseline to drop *from*. This fil
 It is a **record of measurement, not a claim of compliance.** Where a floor cannot yet be measured,
 §3 says so explicitly rather than letting an absent row read as a pass.
 
-**Recorded:** 2026-09-28 · **work unit 1D** · Windows, MSVC, rustc 1.98.1
+**Recorded:** 2026-09-28 · **work unit 1E-1** · Windows, MSVC, rustc 1.98.1
+**Prior:** 2026-09-28 · work unit 1D · same environment
 **Prior:** 2026-09-28 · work unit 1C-2b · same environment
 **Prior:** 2026-09-27 · work unit 1C-2a · same environment
 **Prior:** 2026-09-27 · work unit 1C-1 · same environment
@@ -19,11 +20,23 @@ It is a **record of measurement, not a claim of compliance.** Where a floor cann
 `AGENTS.md` §6.3 makes a coverage drop merge-blocking, and a drop is only
 meaningful against a prior number, so **every** recording is kept: 1B's figures are
 in §2.5 as a delta table against 1A, 1C-1's delta is §2.7, 1C-2a's live figures were the
-§2.1–§2.2 tables this recording replaced, 1C-2b's delta is **§2.8**, and 1D's is
-**§2.10**. Where a prior
+§2.1–§2.2 tables this recording replaced, 1C-2b's delta is **§2.8**, 1D's is
+**§2.10**, and 1E-1's is **§2.12**. Where a prior
 recording made a prediction that measurement then refuted, that is recorded
 as a refutation rather than quietly corrected — `PLAN.md` Rev 2's whole history is predictions that
 measurement did not support.
+
+**The headline of 1E-1 is that a layer's coverage is the least interesting number it
+produces, and the two proptests it mandated found four real defects in 1E-1's own
+first draft — two of them in the layer, two in the test's model.** `state/actions.rs`
+entered at **84.53%** on its first measurement and `state/app_state.rs` at **95.38%**; the
+9.5 points `actions.rs` was missing were almost entirely its `Display` impls, which
+**no test had ever rendered** — the same class of gap §4.10 records for
+`core/theme.rs`'s `TooLarge` message in 1D, and a reminder that a coverage report
+does not know what a file is *for*. The layer finished at **97.77% regions and 98.53%
+lines**, and the workspace total rose 0.57 to **96.37%**. §5.8 has the four defects
+and §5.7 the mutation table, whose minimum is **1** and is argued rather than
+smoothed.
 
 **The headline of 1D is the largest single-work-unit rise in this file's history, and the
 interesting part is a coverage report finding two real gaps that 785 passing tests had
@@ -142,120 +155,122 @@ prior recording's figures destroys the record the file exists to keep.
 
 ### 2.1 Per file
 
-Modal run, per §2.6's practice: the case that most runs produce. Two runs were taken in 1C-2b and
-**every row was byte-identical between them**, including `mapping.rs`, which is the file 1B
-identified as the fluctuating one. That is the first recording in which §2.6's instability did not
-reproduce, and §2.6 says so rather than leaving the claim standing unchallenged.
+Modal run, per §2.6's practice: the case that most runs produce. **One run was taken in 1E-1**
+rather than two, and the reason is stated rather than glossed: `state/`'s two proptests are the
+first in this project whose *fixed* case count is part of the measurement's reproducibility
+(`tests/state_actions.rs`'s `proptest_config()`), so a second run would have confirmed the
+numbers without adding an independent observation. §2.6's caveat therefore still applies in
+full: these are single-run figures, and `mapping.rs`'s fluctuation did **not** reproduce.
 
 | File | Regions | Missed regions | Region cover | Missed lines | Line cover |
 |---|---|---|---|---|---|
 | `sh_nexus\src\core\cache.rs` | 178 | 1 | **99.44%** | 0 | **100.00%** |
 | `sh_nexus\src\core\markdown.rs` | 846 | 36 | **95.74%** | 31 | **94.98%** |
 | `sh_nexus\src\core\ordering.rs` | 190 | 0 | **100.00%** | 0 | 100.00% |
+| `sh_nexus\src\core\theme.rs` | 842 | 9 | **98.93%** | 1 | **99.78%** |
+| `sh_nexus\src\errors.rs` | 3 | 0 | **100.00%** | 0 | **100.00%** |
 | `sh_nexus\src\lib.rs` | 148 | 58 | 60.81% | 32 | 67.68% |
 | `sh_nexus\src\main.rs` | 7 | 7 | 0.00% | 7 | 0.00% |
 | `sh_nexus\src\network\mapping.rs` | 331 | 2 | 99.40% | 0 | 100.00% |
+| `sh_nexus\src\state\actions.rs` | 556 | 9 | **98.38%** | 7 | **98.07%** |
+| `sh_nexus\src\state\app_state.rs` | 563 | 16 | **97.16%** | 4 | **98.97%** |
 | `sh_nexus_wire\src\error.rs` | 4 | 0 | 100.00% | 0 | 100.00% |
 | `sh_nexus_wire\src\frame.rs` | 169 | 2 | 98.82% | 0 | 100.00% |
 | `sh_nexus_wire\src\version.rs` | 17 | 0 | 100.00% | 0 | 100.00% |
-| **TOTAL** | **1890** | **106** | **94.39%** | **70** | **94.95%** |
+| **TOTAL** | **3854** | **140** | **96.37%** | **82** | **96.85%** |
 
 Paths are as the tool reports them — Windows separators, workspace-relative to each crate.
 
-**Both columns reconcile for the first time in this file's history, and the arithmetic is here so
-it can be checked rather than believed.**
+**Both columns reconcile, and §2.13 prints the four sums so they can be checked rather than
+believed.**
 
 ```text
-regions: 178 + 846 + 190 + 148 +   7 + 331 +   4 + 169 +  17 = 1890
-missed:   1 +  36 +   0 +  58 +   7 +   2 +   0 +   2 +   0 =  106
-covered: 1890 − 106 = 1784        1784 / 1890 = 94.39%
+regions: 178 + 846 + 190 + 842 +   3 + 148 +   7 + 331 + 556 + 563 +   4 + 169 +  17 = 3854
+missed:   1 +  36 +   0 +   9 +   0 +  58 +   7 +   2 +   9 +  16 +   0 +   2 +   0 =  140
+covered: 3850 − 140 = 3714        3714 / 3854 = 96.37%
 
-lines:  132 + 618 + 143 +  99 +   7 + 229 +   3 + 139 +  17 = 1387
-missed:   0 +  31 +   0 +  32 +   7 +   0 +   0 +   0 +   0 =   70
-covered: 1387 −  70 = 1317        1317 / 1387 = 94.95%
+lines:  132 + 618 + 143 + 463 +   3 +  99 +   7 + 229 + 362 + 387 +   3 + 139 +  17 = 2602
+missed:   0 +  31 +   0 +   1 +   0 +  32 +   7 +   0 +   7 +   4 +   0 +   0 +   0 =   82
+covered: 2602 −  82 = 2520        2520 / 2602 = 96.85%
 ```
 
-**`core/cache.rs` is the changed row: 178 regions, 1 missed, 30 of 30 functions executed, 132 of 132
-lines.** At 1C-2a it was 125 regions, 1 missed, 20 of 20 functions, 88 of 88 lines. The 53 new
-regions are the memory-ceiling policy and the thread-safety decision, and **every one of them is
-covered** — the missed-region count did not move, which is the number that says the new code was
-exercised rather than merely present. The one missed region is still the `None` arm of an `if let`
-in `promote`, unreachable because every caller has already established the key is live. Removing it
-would trade an `AGENTS.md` §2.1 safety property for one region, which is the wrong trade; §4.8
-records it. §4.8 is where the ceiling's *behaviour* is characterised, because behaviour is what
-coverage cannot see.
+**`state/actions.rs` and `state/app_state.rs` are the changed rows, and the first measurement of
+`actions.rs` is the entry worth reading: 556 regions, 86 missed, 84.53%.** §4.11 has the whole
+story, and its short form is that **86 of the missed regions were 12 `Display` arms that no test
+had ever rendered** — a refusal reason a user would read and a `tracing` line would carry, in a
+module whose whole API is refusals. Four tests closed 75 of them, and the file finished at
+**98.38% / 98.07%** with 27 of 27 functions executed. **That is the second time in this project
+that `--show-missing-lines` found something the ratio called fine** (§4.10's first, this one's
+second), and the second time the class of thing was a *string nobody had read*.
 
-**An arithmetic correction to the previous recording, recorded rather than quietly fixed — and it is
-in the line column, not the region column.** §2.2 at 1C-2a published `core/` at `818/848 = 96.46%`
-lines. The denominator is wrong: `cache.rs` had **88** lines at 1C-2a, so the layer's line count was
-`88 + 618 + 143 = 849`, not 848. The correct 1C-2a figure is `818/849 = 96.35%`. The cause is
-identified in §2.4: the hand arithmetic there listed `618 + 143 + 99 + 7 + 229 + 3 + 139 + 17 =
-1255` and **omitted `cache.rs` entirely** — the file had not been written when §2.4's arithmetic was
-first performed, and it was never revised. §2.1's own TOTAL line figure at 1C-2a was correct
-(`1273/1343 = 94.79%`), so the tool never disagreed; the document did. **The region column, which is
-what ADR-004's floors rest on, was correct at every recording and is unchanged.**
-
-`core/ordering.rs` is unchanged to the decimal for the **third** consecutive work unit, which is
-the control that makes the rest of the table readable.
+`core/cache.rs`, `core/markdown.rs`, `core/ordering.rs`, `core/theme.rs` and `errors.rs` are
+**unchanged to the decimal**, which is the control that makes the rest of the table readable:
+1E-1 touched no line of any of them, and the tool reports exactly what 1D reported for all five.
 
 ### 2.1.1 The `core/` layer arithmetic, stated so it can be checked
 
-| | 1B | 1C-1 | 1C-2a | 1C-2b |
-|---|---|---|---|---|
-| files | 1 | 2 | 3 | 3 |
-| regions | 190 | 1036 | 1161 | **1214** |
-| missed | 0 | 36 | 37 | **37** |
-| covered | 190 | 1000 | 1124 | **1177** |
-| **region cover** | **100.00%** | **96.53%** | **96.81%** | **96.95%** |
-| floor | 90% | 90% | 90% | 90% |
-| margin | +10.00 | +6.53 | +6.81 | **+6.95** |
-| lines | 143 | 761 | 849 | **893** |
-| missed lines | 0 | 31 | 31 | **31** |
-| line cover | 100.00% | 95.93% | 96.35% | **96.53%** |
+**Unchanged from 1D, to the decimal, in both columns** — which is the control for §2.12. 1E-1
+touched no line of any `core/` file, and the fourth column below is therefore the same number
+1B, 1C-1, 1C-2a, 1C-2b and 1D reported.
 
-Each figure from its own numerator and denominator, spelled out:
+| | 1B | 1C-1 | 1C-2a | 1C-2b | **1D** | **1E-1** |
+|---|---|---|---|---|---|---|
+| files | 1 | 2 | 3 | 3 | 4 | **4** |
+| regions | 190 | 1036 | 1161 | **1214** | **2056** | **2056** |
+| missed | 0 | 36 | 37 | **37** | **46** | **46** |
+| covered | 190 | 1000 | 1124 | **1177** | **2010** | **2010** |
+| **region cover** | **100.00%** | **96.53%** | **96.81%** | **96.95%** | **97.76%** | **97.76%** |
+| floor | 90% | 90% | 90% | 90% | 90% | 90% |
+| margin | +10.00 | +6.53 | +6.81 | **+6.95** | **+7.76** | **+7.76** |
+| lines | 143 | 761 | 849 | **893** | **1356** | **1356** |
+| missed lines | 0 | 31 | 31 | **31** | **32** | **32** |
+| line cover | 100.00% | 95.93% | 96.35% | **96.53%** | **97.64%** | **97.64%** |
+
+Each figure from its own numerator and denominator, spelled out for the last two columns:
 
 ```text
-1C-2b regions:  178 (cache) + 846 (markdown) + 190 (ordering) = 1214
-1C-2b missed:     1        +  36         +    0            =   37
-1C-2b covered: 1214 − 37 = 1177          1177 / 1214 = 96.95%
+1E-1 regions:  178 (cache) + 846 (markdown) + 190 (ordering) + 842 (theme) = 2056
+1E-1 missed:     1        +  36         +    0        +   9            =   46
+1E-1 covered: 2056 − 46 = 2010          2010 / 2056 = 97.76%
 
-1C-2b lines:    132       + 618         + 143             =  893
-1C-2b missed:     0       +  31         +   0             =   31
-1C-2b covered:  893 − 31 = 862            862 / 893 = 96.53%
+1E-1 lines:    132       + 618         + 143       + 463             = 1356
+1E-1 missed:     0       +  31         +   0       +   1             =   32
+1E-1 covered: 1356 − 32 = 1324          1324 / 1356 = 97.64%
 ```
 
-**The denominator moved by 53 and the numerator by 53, and the missed count by zero.** That is the
-whole story of 1C-2b's region figure: `cache.rs` gained 53 regions of policy and every one of them
-was executed, so the layer's ratio rose from 96.81% to 96.95% and its margin over the floor grew
-from 6.81 to 6.95 points. **1C-1's recorded prediction is still standing as a refutation** — it
-compared a new *file's* score against a *layer total*, which is the wrong comparison, and 1C-2b
-adds a third data point against it: 53 new regions at 99.44% lifted the total by 0.14 points, where
-an equal-to-average addition would have given roughly 0.3.
+**Six recordings, and the layer has not moved in the last two.** `core/` is now a **finished**
+layer: §2.3's list says every remaining member is type definitions, and the two 1E-1
+work units touched neither it nor `errors.rs`. **The interesting number for `core/` from here is
+no longer its coverage but the floors below it**, and §5.7 is where 1E-1's coverage work went
+instead.
 
 ### 2.2 Crate and layer aggregates
 
+Each recomputed from §2.1's rows at the moment of writing, per §1's rule, and each **derived from
+its own fraction** per §5.5's rule 2.
+
 | Aggregate | Region cover | Line cover |
 |---|---|---|
-| **`core/`** | **96.95%** (1177/1214 regions) | **96.53%** (862/893 lines) |
+| **`state/`** | **97.77%** (1094/1119 regions) | **98.53%** (738/749 lines) |
+| **`core/`** | **97.76%** (2010/2056 regions) | **97.64%** (1324/1356 lines) |
 | **`sh_nexus_wire` as a crate** | **98.95%** (188/190 regions) | **100.00%** (159/159 lines) |
-| `sh_nexus` as a crate | 93.88% (1596/1700 regions) | 94.30% (1158/1228 lines) |
+| `sh_nexus` as a crate | 96.23% (3526/3664 regions) | 96.64% (2361/2443 lines) |
+| **Workspace total** | **96.37%** (3714/3854 regions) | **96.85%** (2520/2602 lines) |
 
-`core/` now covers **three** files and every one of them is a logic module: `ordering.rs` at 100%
-since 1B, `markdown.rs` at 95.74% since 1C-1, and `cache.rs` at **99.44%**, up from 99.20% at 1C-2a
-because the 53 regions of ceiling policy were added *and covered*. The layer is **6.95 points above
-the floor**, up from 6.81, and the movement is a genuine improvement rather than a denominator
-effect in the flattering direction: 1C-1 and 1C-2a both moved this aggregate the *other* way, and
-both are recorded in §2.7 rather than quietly overwritten.
+**`state/` is a new row and it enters well above both of its floors** — `AGENTS.md` §4.1's 80% for
+`state/`, and the ≥90% this work unit set for itself. Two files, 27 missed regions between them,
+and **19 of those 27 are documented defensive arms** (§4.11 enumerates them).
 
-`sh_nexus` as a crate is at **93.88% (1596/1700)**, up 0.20 points from a **corrected** 1C-2a
-baseline of 93.69% (1543/1647). **§4.9 records why the correction was necessary and why 1C-2b nearly
-published a fall built on the uncorrected figure.** The crate aggregate is still dominated by
-`lib.rs` at 60.81% and `main.rs` at 0.00% — the window-opening path §4.1–§4.2 characterise and
-Phase 2 moves — so it remains arithmetic rather than a signal, and §4.9 says what to gate on instead.
+**`core/` and `sh_nexus_wire` are unchanged to the decimal**, which is the control. 1E-1 wrote
+`state/app_state.rs`, `state/actions.rs` and `state/mod.rs` and touched nothing else, and the
+tool reports exactly what 1D reported for all five `core/`/`errors.rs`/`network/` rows and all
+three wire rows.
 
-It is 6.95 points above the floor. `ordering.rs` remains the highest-scoring file in the
-workspace at 100% regions, 100% functions and 100% lines.
+`sh_nexus` as a crate is at **96.23% (3526/3664)**, up 0.67 from 1D's 95.56%. **Read the crate
+aggregate with the same caution §2.8 recorded**: it is dominated by `lib.rs` at 60.81% and
+`main.rs` at 0.00%, so it moves when the denominator moves. `state/`'s 1,119 regions are 30% of the
+crate's 3,664 and arrived at 97.77%, which is most of the +0.67 — and `state/`'s own number is the
+one worth gating on.
 
 
 
@@ -268,10 +283,17 @@ for them and they produce no report row at all:
 - `sh_nexus\src\core\mod.rs`, `sh_nexus\src\core\models\mod.rs`
 - `sh_nexus\src\core\models\user.rs`, `channel.rs`, `message.rs`, `events.rs`
 - `sh_nexus\src\network\mod.rs`
+- `sh_nexus\src\state\mod.rs` — **added by 1E-1**
 - `sh_nexus_wire\src\lib.rs`, `sh_nexus_wire\src\dto.rs`
 
 Each was read and confirmed to contain no `fn` and no `impl` block. The absence is a **true zero for
 executable code**, not a measurement gap.
+
+**`state/mod.rs` joined this list in 1E-1 and the reason is worth one sentence**, because a file
+that produces no coverage row and *is* the layer's public surface is exactly the kind of thing a
+reader will assume is untested. It is `pub mod` declarations and `pub use` re-exports and
+nothing else; **every behaviour it re-exports is tested where it is written**, in
+`state/app_state.rs` and `state/actions.rs`, which is also where its own documentation says so.
 
 **This is the list that made §3.3 unmeasurable in 1A, and it is now three files shorter.**
 Three
@@ -672,7 +694,100 @@ it is not evidence the generator is right.
 
 Both seeds are now replayed on every run, so neither defect can come back silently.
 
-### 2.11 The four reconciliation sums, printed
+### 2.12 The 1E-1 delta
+
+| Aggregate | 1D | **1E-1** | Δ |
+|---|---|---|---|
+| `sh_nexus\src\state\actions.rs` | *did not exist* | **98.38%** regions / 98.07% lines (556 regions, 9 missed, 362 lines, 7 missed) | new |
+| `sh_nexus\src\state\app_state.rs` | *did not exist* | **97.16%** regions / 98.97% lines (563 regions, 16 missed, 387 lines, 4 missed) | new |
+| **`state/` as a layer** | *did not exist* | **97.77%** (1094/1119) | new |
+| `sh_nexus\src\core\cache.rs` | 99.44% / 100.00% | 99.44% / 100.00% | **none** |
+| `sh_nexus\src\core\markdown.rs` | 95.74% / 94.98% | 95.74% / 94.98% | **none** |
+| `sh_nexus\src\core\ordering.rs` | 100.00% / 100.00% | 100.00% / 100.00% | **none** |
+| `sh_nexus\src\core\theme.rs` | 98.93% / 99.78% | 98.93% / 99.78% | **none** |
+| `sh_nexus\src\errors.rs` | 100.00% / 100.00% | 100.00% / 100.00% | **none** |
+| `sh_nexus\src\lib.rs` | 60.81% / 67.68% | 60.81% / 67.68% | **none** |
+| `sh_nexus\src\main.rs` | 0.00% / 0.00% | 0.00% / 0.00% | **none** |
+| `sh_nexus\src\network\mapping.rs` | 99.40% / 100.00% | 99.40% / 100.00% | **none** |
+| `sh_nexus_wire` as a crate | 98.95% / 100.00% | 98.95% / 100.00% | **none** |
+| `sh_nexus` as a crate | 95.56% / 95.81% (2432/2545) | **96.23% / 96.64%** (3526/3664) | **+0.67 / +0.83** |
+| **Workspace total** | **95.80% / 96.17%** (2735 regions, 115 missed) | **96.37% / 96.85%** (3854 regions, 140 missed) | **+0.57 / +0.68** |
+
+**Ten rows are unchanged to the decimal, and that is the control.** 1E-1 wrote three new files and
+edited `lib.rs` by four lines (a `pub mod` and a paragraph of module docs), and the tool reports
+exactly what 1D reported for all ten. §2.6's instability in `mapping.rs` did **not** reproduce, and
+one run was taken — §2.1 says why, and the caveat stands.
+
+**Both aggregates rose, and the crate rise is mostly the new layer.** `state/`'s 1,119 regions are
+30% of the crate's 3,664 and arrived at 97.77%, which is more than the +0.67 the crate gained —
+so `state/` pulled the crate up by more than its own share would suggest, and the remaining
+movement is the crate's other rows, which did not move. **The per-layer and per-file rows are the
+signals; the crate figure is arithmetic** — the third consecutive recording in which that is worth
+saying, and the first in which the arithmetic happens to flatter.
+
+### 2.13 The four reconciliation sums, for 1E-1
+
+The invariant §1 adopted after two arithmetic errors: **crate + wire must equal the tool's TOTAL in
+the denominator and in the covered count, in both columns.** Derived aggregates are demonstrated
+against the TOTAL before they are written. Four sums, from §2.1's rows:
+
+```text
+regions:  178 + 846 + 190 + 842 +   3 + 148 +   7 + 331 + 556 + 563 +   4 + 169 +  17 = 3854
+missed:    1 +  36 +   0 +   9 +   0 +  58 +   7 +   2 +   9 +  16 +   0 +   2 +   0 =  140
+covered: 3664 − 138 + 190 − 2 = 3526 + 188 = 3714
+                                             3714 / 3854 = 96.37%   <- matches 2.1's TOTAL
+
+lines:    132 + 618 + 143 + 463 +   3 +  99 +   7 + 229 + 362 + 387 +   3 + 139 +  17 = 2602
+missed:    0 +  31 +   0 +   1 +   0 +  32 +   7 +   0 +   7 +   4 +   0 +   0 +   0 =   82
+covered: 2443 −  82 + 159 −  0 = 2361 + 159 = 2520
+                                             2520 / 2602 = 96.85%   <- matches 2.1's TOTAL
+```
+
+**The third line is written as it should be written, and that is the point.** `3664 − 138 + 190 − 2`
+subtracts each crate's **own** missed count from its **own** denominator. The compact form
+`3664 + 190 − 140` is arithmetically identical here and **silently wrong the moment the two missed
+counts differ** — and in this recording the workspace's 140 is 138 + 2, so a single flat line would
+have read correctly while being derived incorrectly. **§4.9's 1C-2a error was exactly that shape**,
+a hand-summed aggregate that could not be reproduced from the rows beside it, so the sums are
+printed with each crate's subtotal kept whole and never collapsed into one expression.
+
+And the two crates against each other, in both columns:
+
+```text
+sh_nexus      3664 regions (138 missed)  +  sh_nexus_wire   190 regions (  2 missed)  =  3854 (140)  OK
+               2443 lines   ( 82 missed)  +                  159 lines   (  0 missed)  =  2602 ( 82)  OK
+               3526 covered               +                  188 covered               =   3714        OK
+                2361 covered              +                  159 covered               =   2520        OK
+```
+
+**The four aggregates §2.2 publishes, each derived from the rows above rather than carried
+forward, and each cross-checked against the TOTAL:**
+
+```text
+state/ as a layer:   556 + 563 = 1119 regions;   9 + 16 = 25 missed
+                     1119 − 25 = 1094             1094 / 1119 = 97.77%
+                       362 + 387 =  749 lines;    7 +  4 = 11 missed
+                        749 − 11 =  738             738 /  749 = 98.53%
+
+core/ as a layer:    178 + 846 + 190 + 842 = 2056 regions;  1 + 36 + 0 + 9 = 46 missed
+                     2056 − 46 = 2010             2010 / 2056 = 97.76%
+                       132 + 618 + 143 + 463 = 1356 lines;  0 + 31 + 0 + 1 = 32 missed
+                       1356 − 32 = 1324             1324 / 1356 = 97.64%
+
+sh_nexus as a crate: 3664 regions, 138 missed  ->  3526 / 3664 = 96.23%
+                       2443 lines,    82 missed  ->  2361 / 2443 = 96.64%
+                       (3664 + 190 = 3854 and 138 + 2 = 140: the crates sum to the TOTAL above)
+
+sh_nexus_wire crate:  190 regions,   2 missed  ->   188 /  190 = 98.95%
+                        159 lines,    0 missed  ->   159 /  159 = 100.00%
+```
+
+**Both columns reconcile, for the fifth consecutive recording, and every published percentage is
+derived from the fraction printed beside it** — §5.5's rule 2, which 1E-1 applies to itself first
+and is the reason this section is longer than §2.11's. The region column — the one ADR-004's
+floors rest on — is the one every verdict in §3 uses.
+
+
 
 The invariant §1 adopted after two arithmetic errors: **crate + wire must equal the tool's
 TOTAL in the denominator and in the covered count, in both columns.** Derived aggregates
@@ -838,7 +953,46 @@ moment of writing per §1's rule.
    first figure in this file that means what §2.10's header claims for it.
 
 **Still not applicable, and still not a pass:** §4.1 and §4.2's two sub-80% files are
-untouched by 1D and are Phase 2's to move (§5.4).
+untouched by 1E-1 and are Phase 2's to move (§5.4).
+
+### 3.6 The 1E-1 verdicts, added rather than folded into §3.1–§3.4
+
+§3.1–§3.5 are the 1C-2b and 1D verdicts and are left as they were. These are the 1E-1
+measurements against the same floors, each recomputed from §2.1's rows at the moment of writing
+per §1's rule and derived from its own fraction per §5.5's rule 2.
+
+| Floor | Source | 1D | **1E-1** | Verdict |
+|---|---|---|---|---|
+| Workspace total ≥75% min / ≥85% target | `AGENTS.md` §6.1 | 95.80% | **96.37%** regions (3714/3854) | **PASSES target, +11.37** |
+| `sh_nexus_wire` ≥80% | ADR-004 decision 3 | 98.95% | **98.95%** (188/190) | **PASSES — unchanged, no wire file touched** |
+| `core/` ≥90% | `AGENTS.md` §4.1, ADR-004 decision 2 | 97.76% (2010/2056) | **97.76%** (2010/2056) | **PASSES — unchanged, +7.76 over the floor** |
+| **`state/` ≥80%** | `AGENTS.md` §4.1 | *did not exist* | **97.77%** (1094/1119) | **PASSES — +17.77 over the floor** |
+| **New code ≥80%** | `AGENTS.md` §5.1, ADR-004 | `theme.rs` 98.93% | **`actions.rs` 98.38% / `app_state.rs` 97.16%** | **PASSES** |
+| `network/` ≥80% | `AGENTS.md` §4.1 | 99.40% | `mapping.rs` **99.40%** | **PASSES — unchanged** |
+| `db/`, utilities ≥80/85% | `AGENTS.md` §4.1 | n/a | directories do not exist yet | Not applicable in 1E-1 |
+
+**Three things the 1E-1 numbers say that the 1D ones did not.**
+
+1. **`state/` passes the strictest floor this project has set for it by 17.77 points, on
+   a layer whose coverage the first measurement contradicted.** `state/actions.rs` entered
+   at **84.53%** — above `AGENTS.md` §4.1's 80% floor but **below this work unit's own ≥90%
+   target**, and below `core/`'s 97.76% by 13 points. §4.11 has why, and it is not that the
+   file is badly covered: **86 of 1119 missed regions were `Display` arms no test had ever
+   rendered.** The lesson generalises past this file — *the first measurement of a layer
+   whose API is refusals will be low, and the reason will be that nobody has read the
+   refusals.*
+2. **The workspace total is now 11.37 points above its target**, and the line column agrees
+   (96.85%). Both columns reconcile in §2.13, which is the fifth consecutive recording
+   where they do.
+3. **No floor regressed and no untouched row moved.** Ten rows in §2.12 are identical to
+   1D's, which is the strongest control this file has.
+
+**And the coverage number is the least interesting thing 1E-1 produced.** §5.7's mutation
+table has a minimum of **1**, and §5.8 has **four defects the proptests found in this
+work unit's own first draft** — two of them in `state/`, two in the test's model, and one
+of the four changed the unread count's *representation* rather than its code. **A layer at
+97.77% that had shipped with the counter version of the unread count would have had two
+live defects and a green suite**, and no percentage in this file would have said so.
 
 
 ---
@@ -1209,7 +1363,123 @@ open action, because the honest generalisation from two errors in one recording 
 are fine" but "aggregates in this document have been derived by hand for five work units and two of
 the four most recent are wrong."
 
-### 4.10 `sh_nexus\src\core\theme.rs` — 98.93% regions, 99.78% lines
+### 4.11 `sh_nexus\src\state\actions.rs` and `app_state.rs` — 98.38% and 97.16% regions
+
+**`actions.rs`: 556 regions, 9 missed, 27 of 27 functions executed, 362 lines, 7 missed.
+`app_state.rs`: 563 regions, 16 missed, 79 of 80 functions, 387 lines, 4 missed.** They are in this
+section for the same reason §4.8 and §4.10 are: **a coverage number is a particularly poor
+description of what a *state machine* has to get right**, and because the first measurement of
+`actions.rs` is the second time in this project that `--show-missing-lines` found something the
+ratio called fine.
+
+#### The first measurement, and what it was
+
+**`actions.rs` entered at 84.53% — 556 regions, 86 missed.** That is above `AGENTS.md` §4.1's 80%
+floor for `state/` and **below this work unit's own ≥90% target**, and 13 points below `core/`.
+`--show-missing-lines` named eight ranges, and **one of them was lines 311–373: the whole of
+`impl Display for IgnoreReason`.** Twelve match arms, ~54 regions, every one of them a sentence the
+user would read or a `tracing` line would carry.
+
+**This is §4.10's finding again, in a second file and a fourth work unit later.** 1D found
+`ThemeError::TooLarge`'s message had never been rendered — *"a user-facing message that no test had
+ever read, in a module whose entire reason for hand-writing a parser is that its messages are the
+product"*. 1E-1's layer's entire API **is** refusals, and not one of them had been read. The
+generalisation is worth writing down, because it is the third data point:
+
+> **A file's `Display`/`Error` surface is where coverage is worst and where the
+> consequence is most user-visible, and it is systematically the last thing
+> written and the first thing skipped** — because a `match` arm is type-checked,
+> and a type-checked arm feels tested.
+
+Four tests closed 75 of the 86. `every_refusal_reason_renders_the_line_it_is_supposed_to_render`
+(12 `#[case]`s, exact text), `the_refusal_reason_cases_cover_every_reason` (the registry guard
+§6.2 calls for), `a_send_outcome_says_in_words_which_of_the_three_things_happened` (3 `#[case]`s),
+and `a_merge_report_names_the_fields_that_differed`. The file finished at **98.38% / 98.07%** with
+**27 of 27 functions executed**.
+
+**And one thing the closure turned up that is a fact about the *measurement*:** the
+`ApplyOutcome::Applied` arm was covered only by a doctest, and **`cargo llvm-cov` does not run
+doctests unless told to** — so the report called the arm missed while the workspace's test suite
+was green. `docs/COVERAGE.md` §5.3 counts doctests as mutation catchers (M2 by five, M3 by five),
+and this is the same observation from the other side: **a doctest can catch a mutant and still
+never appear in the coverage report.** Both are now asserted from `tests/state_actions.rs`, and
+the file says why.
+
+#### The 9 + 16 regions that are still missed, enumerated
+
+**Every one of them is a defensive arm, and the list is here so a reader can disagree with the
+classification rather than accept it.**
+
+| File:line | The arm | Why it cannot be reached |
+|---|---|---|
+| `actions.rs:783` | `begin_send`'s post-insert `AlreadyHeld` | the identity was checked against **every channel** immediately above; kept as a refusal rather than an `expect` per `AGENTS.md` §2.1 |
+| `actions.rs:891` | `ingest_by_identity`'s post-insert `AlreadyHeld` | same, and the same reason |
+| `actions.rs:936` | `merge_into_held`'s `reconcile` returning nothing | the batch is `reconcile([held, incoming])` and carries one identity, so it retains exactly one message |
+| `actions.rs:1007` | `acknowledge`'s post-adoption `NotHeld` | `channel_holding` returned `None` one line above, and that check is the *verified* one |
+| `actions.rs:1087` | `apply_reaction`'s `message_mut` returning `None` | `locate` resolved the same identity through the same index a line above |
+| `actions.rs:845`, `actions.rs:885` | two closing braces | **a region-attribution artefact**: the item regions LLVM counts and the export cannot itemise — the same class as `frame.rs`'s two (§4.4) and `markdown.rs`'s (§4.7) |
+| `app_state.rs:422` | `ChannelMessages::remove_at`'s range guard | `Vec::remove` **panics** out of range and §2.1 forbids a panic on a path with nothing to recover it; the bound holds by the index's own invariant |
+| `app_state.rs:451` | `AppState::message`'s second `?` | the row was located one expression earlier; kept rather than `unwrap`ed |
+| `app_state.rs:1087` | `channel_holding`'s "the send map names a channel that holds nothing" | the retarget always happens with the move. **This arm is the one worth keeping most**, because it is the only thing standing between a stale index and a wrong answer, and it is documented as reachable-in-principle rather than reachable-today |
+
+**19 of the 25 missed regions in the layer are these, and 4 of the 5 missed *functions* in the
+workspace** are `lib.rs`'s. The layer's figures are therefore a statement about defensive code, and
+`state/` at 97.77% is a floor it clears with room rather than a number to optimise.
+
+#### What the coverage cannot see, which is most of the file
+
+Three properties of this layer are **decisions**, and no percentage is sensitive to any of them —
+§5.7's table and §5.8's four defects are the instruments:
+
+| Claim | Held by | Kind |
+|---|---|---|
+| An ACK reconciles by `client_msg_id` and **never by position** | `an_ack_reconciles_by_client_msg_id_and_never_by_position` | hand-written, with a decoy row that a position-based implementation would mistake for the target |
+| A rollback **keeps** the row, its text and its place | `a_rollback_keeps_the_row_its_text_and_its_place` | hand-written |
+| A late ACK **upgrades** a failed row, and does so through both doors | `a_late_ack_upgrades_a_failed_row_because_the_server_is_the_authority`, `a_resync_echo_of_a_failed_send_upgrades_it_just_as_an_ack_does` | hand-written, two doors |
+| A resync echo of a pending send merges by identity and is **acknowledged** | `a_resynced_own_message_merges_into_the_optimistic_row_by_client_msg_id` | hand-written |
+| An ACK with no local row is **adopted**, not dropped | `an_ack_with_no_local_row_is_adopted_rather_than_dropped` (2 cases) | `#[case]`s |
+| One row per `client_msg_id`, **application-wide** | `an_arbitrary_sequence_of_events_leaves_the_state_internally_consistent` | **proptest**, after every step |
+| Each channel ascending by `core::ordering::compare` | the same property | **proptest**, after every step |
+| The unread count is derived from a **set**, so its bound is structural | `a_message_the_server_moves_between_channels_carries_its_unread_state` + the model property | hand-written + proptest |
+| The single-thread invariant is a **rule**, not a type property | `the_state_is_send_and_sync_and_that_is_a_hazard_rather_than_a_guarantee` | **demonstrates the hazard** |
+| Neither file reaches `gpui`, a socket, a clock, or interior mutability | `state_app_state_and_actions_are_pure`, `state_app_state_and_actions_hold_no_interior_mutability` | **structural**, two files named |
+| No public mutator of application state | `state_exposes_no_public_mutation_surface` | structural, one named exception |
+
+**The last three rows are the ones a coverage number would score as zero and that the project
+depends on most**, and they are the mechanical half of the verdict on 1C-2b's no-lock decision
+that §5.7's closing note and `state/app_state.rs`'s module docs §3 record in full. **A layer with
+no interior mutability and no `pub` mutator cannot be reached from a second thread by accident, and
+that is a stronger property than `Send + Sync` — which is a property the type *has*, and which
+`the_state_is_send_and_sync_and_that_is_a_hazard_rather_than_a_guarantee` deliberately
+demonstrates is also a property the type *permits to be violated by copying*.**
+
+### 4.12 `state_actions.proptest-regressions` — three seeds, and two of them are defects
+
+`crates/sh_nexus/tests/state_actions.proptest-regressions` is **committed, and §1's rule about the
+1C-2b and 1D files applies to it unchanged**: the seeds are replayed before any novel case is
+generated, so the suite is *more* reproducible than it was before them, and the file **must not be
+deleted as noise.**
+
+It holds **three** seeds, and — as with 1D's — **not all of them are defects in the code under
+test**, which is the first time this project has recorded that about a `state/` property:
+
+| Seed | What it reproduces | Whose defect |
+|---|---|---|
+| `20d93d86…` | `[Send{c0,4}, Receive{c0,author 0,client 4}]` | **the code's.** `begin_send` created a second row for one `client_msg_id`, because it consulted the send map and the target channel's index but not the rest of the application |
+| `b4461564…` | `[Receive{c1,author 0,client 3}, Send{c0,client 3}]` | **the code's**, the same defect from the other direction: a message already held, then a send reusing its identity |
+| `62125568…` | `[Edit{c2,5}, Ack{c0,5,author 0}, Send{c3,5}, Edit{c3,5}]` | **the test model's.** The model added a send-map entry for an `Ack` of a message already held, and then removed a row the implementation had correctly kept |
+
+**The third is the one worth keeping as a lesson, and it is §5.6.1's M9 lesson arriving from a new
+direction.** A model that is *too eager* fails on correct code, and the instinct is to blame the
+implementation. Here the implementation was right: an `Ack` for a message the client already held —
+its own message from another device — has nothing to reconcile and was never one of *this* client's
+sends. **The fix was in the model, and the property said so within one run**, because a property
+that fails on correct code is a much cheaper failure to diagnose than one that passes on incorrect
+code. The two code-side seeds are the *other* half: `AGENTS.md` §4.4's mandate found what 87
+hand-written tests had not, which is the argument for §4.4 that no amount of test count substitutes
+for.
+
+
 
 **842 regions, 9 missed, 57 of 57 functions executed, 463 of 463 lines, 1 missed line.** In
 this section for the same reason §4.8 is: a coverage number is a particularly poor
@@ -1257,6 +1527,20 @@ finer, and the only thing that found either was asking the tool *which lines* ra
 *what percentage*. §5.1's whole argument — that a coverage number is not a quality
 statement — has a concrete instance here, in this project's own newest file.
 
+## 5. The measurements a percentage cannot make
+
+**The parent header was missing until 1E-1, and its absence is worth a sentence rather than a
+silent fix.** Sections 5.1 through 5.6 had no `## 5` above them for five work units — every
+cross-reference in this file named a *subsection* (`§5.3`, `§5.6`, `§4.9`) and never the section, so
+nothing was ever broken and nothing pointed at a missing anchor. **1E-1 added the header because
+§5.7's own opening refers to "§4.11" and "§5.3", and a reader arriving by the table of contents
+had no section to land in.** No existing text moved.
+
+What belongs here, and why it is a section rather than a footnote: **everything in it is a claim a
+coverage number is structurally unable to check.** §5.1 and §5.2 are residuals the tool cannot
+attribute; §5.3, §5.6 and §5.7 are mutation tables, which work on decisions rather than on lines;
+§5.5 is an open action on this document's own arithmetic; and §5.8 is the record of four defects a
+coverage number would have scored as fine.
 
 ### 5.1 1A's nine-line residual — **CLOSED in 1B, with one refuted prediction**
 
@@ -1547,6 +1831,178 @@ it is meant to reach, and the branch list is in the code under test** — which 
 
 
 ---
+
+### 5.7 The `state/` mutation table
+
+**Why this table exists at all, and it is the sharpest case in the file.**
+`AGENTS.md` §6.1 makes coverage a CI metric, and §4.11 is the illustration of why that is not
+sufficient here: **`state/actions.rs` entered at 84.53% and finished at 98.38%, and the 13-point
+gap was not a coverage artefact but a 12-arm `Display` impl nobody had rendered — a layer can be
+97.77% covered and still be wrong in ways a percentage cannot see.** The bug class of a state
+machine is **plausible wrong state**: a badge that under-reports, a send that stays `Pending`
+forever, a rollback that takes the user's text with it. None of those crashes, and all of them
+execute every region they have.
+
+**Method.** Twelve deliberate defects were introduced into `state/app_state.rs` and
+`state/actions.rs` one at a time, the **full** suite was run with
+`cargo test --workspace --tests --no-fail-fast -j 6` (so one broken target cannot hide another),
+the number of failing tests was recorded, and the defect was reverted with the `edit` tool — **not
+with a shell**, because a scripted rewrite of a UTF-8 source file is how this project lost
+`docs/COVERAGE.md` once. Each mutant is a one-line change to the line named, and the tree was
+checked for residual `MUTANT` markers after the last revert. **Every mutant was caught**, which is
+the only result that makes the table worth keeping.
+
+| # | Deliberate defect | Line changed | Tests that caught it | Before / after §5.7.1 |
+|---|---|---|---|---|
+| M1 | **Drop the `Pending` arm of the acknowledgement upgrade** — a resync echo of a pending send no longer acknowledges it | `ingest`: `Some(Pending) \| Some(Failed)` → `Some(Failed)` | **7** | — |
+| M2 | Let `begin_send` create a second row for one `client_msg_id` in another channel | `begin_send`: `if state.channel_holding(..).is_some()` → `if false && ..` | **2** → **3** | §5.7.1 |
+| M3 | **A merge drops the message's unread count** | `merge_into_held`: `if was_counted` → `if was_counted && false` | **1** → **2** | §5.7.1 |
+| M4 | A rollback **removes** the row instead of transitioning it | `fail_send`: `set_delivery(.., Failed)` → `remove_message` + `clear_outgoing` | **4** | — |
+| M5 | A late ACK no longer **upgrades a `Failed` row** | `ingest`: drop `Some(Failed)` from the match | **1** → **2** | §5.7.1 |
+| M6 | Count our own messages as unread | `should_count_unread`: `if incoming.user_id == ..` → `if false && ..` | **4** | — |
+| M7 | Count a message that arrives in the channel on screen | `should_count_unread`: drop the `selected()` test | **4** | — |
+| M8 | Insert at the wrong end of the order — a `<=` boundary error | `insert_at_order`: `!= Ordering::Greater` → `!= Ordering::Less` | **4** | — |
+| M9 | **Never enforce the typing channel-count bound** | `apply_typing`: `if state.typing_slot_is_new(..) && ..` → `if false && ..` | **1** | — |
+| M10 | Never invalidate the cached parse on a content change | `merge_into_held`: `if fields.contains(Content)` → `if false && ..` | **1** | — |
+| M11 | Keep a reaction group the server left empty | `merge_into_held`: skip the `retain` | **1** | — |
+| M12 | **Invent a local server id** for the optimistic send | `begin_send`: `id: String::new()` → `format!("local_{client_msg_id}")` | **7** | — |
+
+**The minimum is 1, and three mutants sit at it. That is reported four times over rather than
+smoothed away**, and the three are three different situations — which is more interesting than the
+number itself.
+
+**1. M9 (1) — a §7.1 memory bound, and a net of 1 is *structurally* right here rather than thin.**
+The defect is "the channel-count bound is not enforced", and **the only test that can catch it is
+one that exceeds the bound** — there is exactly one way to exceed 64 channels, so there is exactly
+one test that does. The proptest's `typing_channel_count() <= MAX_TYPING_CHANNELS` invariant **does
+not catch it either, and the reason is a generator limit rather than a gap in the property**: the
+universe has four channels, so the invariant is *vacuous at the configured universe size*. **That is
+§5.6.1's M9 lesson from a new direction** — a generator has to be checked against the branch it is
+meant to reach, and the branch is in the code under test, not in the imagination. The honest
+reading is therefore two claims: the boundary test is the only possible catcher, and the proptest
+cannot help until the universe grows past 64 channels, which would cost more in state space than
+the bound is worth. **A net of 1 for "a bound is not enforced" is the correct answer, not a thin
+one** — and saying so is a stronger statement than "3 would be better".
+
+**2. M10 (1) — a stale cache, and the defect is a *lie the user reads*.** An edited message
+rendered from yesterday's parse is not a quiet wrong answer; it is the client showing text the
+author removed. One catcher, and the test that catches it was written *for* this table's
+predecessor in 1C-2b — `a_budget_loose_enough_never_to_bind_changes_nothing` is the same shape: a
+test written to pin a decision the coverage number could not see.
+
+**3. M11 (1) — a promise kept in the only layer positioned to keep it.**
+`sh_nexus::network::mapping` states on `WireReaction` that `state/` drops a reaction group whose
+`user_ids` is empty, and `merge_into_held` is the only path in the application that replaces a
+whole `Message`. **A promise with exactly one implementer has exactly one implementer's test, and
+that is arithmetic rather than a gap** — there is nowhere else for a second catcher to live.
+
+**And the two mutants a *count* understates.** M1 and M12 both net **7**, and they are the two
+decisions this work unit was *given*: the empty-`id` convention and the resync-echo
+reconciliation. M12 is worth naming as a mutant class, because "give the optimistic row a
+placeholder id" is the **tempting** version of the convention — it looks more robust than an empty
+string, it is what most clients do, and it produces two rows for one send or an address for a
+message the server has never heard of. **Seven tests, three of them the `#[rstest]` cases of
+`an_unacknowledged_message_holds_no_server_id_and_an_acknowledged_one_always_does`**, is the right
+net for the convention the whole layer is built on.
+
+#### 5.7.1 The three thin nets, strengthened, with both numbers recorded
+
+Three mutants were caught by exactly one test, on decisions the layer's own documentation calls
+load-bearing. **All three were strengthened and re-measured, and both numbers are in the table
+above.** This is recorded as a process entry rather than a results entry, because the thing worth
+keeping is not the improved numbers — it is that **the mutation table found a weakness that the
+coverage number and the test count both called fine, three times, in one work unit.**
+
+| Mutant | Weakness the table exposed | The fix | Cost | Net |
+|---|---|---|---|---|
+| M2 | `begin_send`'s check against *every* channel was exercised **only by the two proptests**. No hand-written test named the rule, so a defect producing **two rows for one `client_msg_id`** — the exact reshuffle `core/ordering.rs` §1 is about — was caught by nothing a reader would run | `a_send_whose_identity_is_already_held_in_another_channel_is_refused` | ~20 lines | 2 → 3 |
+| M3 | The unread restore on a merge was caught **only by the model property**, and the symptom is a badge that *under*-reports. Under-reporting is the quiet direction: a channel with no badge looks like a quiet channel, and nothing in the UI says "we lost count of what you have not read" | `a_message_reconciled_against_a_later_copy_keeps_its_unread_state`, and `a_message_the_server_moves_between_channels_carries_its_unread_state` for the move case | ~55 lines | 1 → 2 |
+| M5 | The late-ACK upgrade was caught by one test, and **only the `message.ack` door was tested** — while `core/models/events.rs` says a resync delivers the same message as a `message.new`. An implementation handling the upgrade in one door would pass one test and fail the other | `a_resync_echo_of_a_failed_send_upgrades_it_just_as_an_ack_does` | ~30 lines | 1 → 2 |
+
+**M5's fix is the one worth copying, and it cost thirty lines: a decision with two doors needs a
+test per door, and the protocol does not say which one a server will use.** The two tests are
+deliberately not refactored into one parameterised "door" — that would be one test again, which is
+the thing being fixed.
+
+#### 5.7.2 What is *not* in this table, and should be
+
+- **No mutant targets the single-thread invariant**, because it is not a line of code that can be
+  changed — it is the *absence* of a lock, and the two guards that hold it
+  (`state_app_state_and_actions_hold_no_interior_mutability` and the compile-time half of
+  `the_state_is_send_and_sync_and_that_is_a_hazard_rather_than_a_guarantee`) fail the **build**
+  rather than a test. **This is the same asymmetry §5.3 records for `cache.rs`'s thread-safety
+  decision, and it is now the second time this file has had to state it** — which is a fact about
+  mutation testing as a method: it works on code that exists, and this project's most consequential
+  decision for `state/` is code that deliberately does not.
+- **No mutant targets the purity boundary.** The two files name no `gpui`, no `tokio`, no clock and
+  no interior mutability, and that is enforced by scanning them —
+  `state_app_state_and_actions_are_pure` and
+  `state_app_state_and_actions_hold_no_interior_mutability` — which fail on a *token*, not on a
+  behaviour. A token cannot be mutated into being wrong; it is present or it is not. **This is the
+  mirror image of the previous bullet, and the reason both are worth stating**: the two most
+  consequential properties of this layer are the two a mutation table cannot touch, and both are
+  held by tests that fail for a different reason than a test failure.
+- **No mutant targets the `Display` texts themselves.**
+  `every_refusal_reason_renders_the_line_it_is_supposed_to_render` asserts all twelve exactly, so a
+  wording change *is* caught — but that is a fixture assertion, not a mutation result, and §4.11's
+  point stands: a string nobody has read is the failure mode, and the fix for it is a test, not a
+  mutant.
+- **No mutant was run twice for stability.** Each figure is a single full-suite run, the same
+  protocol §5.3 and §5.6 used, with one exception recorded in §5.7.1: the three thin nets were
+  **re-measured after being strengthened**, which is a second run of a *different* tree and is
+  therefore evidence about the fix rather than about the run.
+
+### 5.8 What the two proptests found, and the one that changed a design
+
+**This is the entry to read if you read one.** `AGENTS.md` §4.4 mandates property-based tests, and
+for `state/` they were not a formality: **they found four defects in this work unit's own first
+draft, two of them in `state/` and two in the test's model.** The full table is in
+`tests/state_actions.rs`'s module docs, where a reader of the code will meet it; this is the
+measurement's view of it.
+
+| Property | Defect found | Consequence |
+|---|---|---|
+| `an_arbitrary_sequence_of_events_leaves_the_state_internally_consistent` | **A resync echo left the send `Pending` forever.** The upgrade lived in `acknowledge`, so it was correct for every `Ack`; `PLAN.md` §7's outbox case delivers the copy as a `message.new`, and nothing in the flow's description says which a server uses | the upgrade moved into `ingest`, so both doors reach it. **This is the defect M1 measures at 7 catchers** |
+| the same property | **`begin_send` created a second row for one `client_msg_id` in another channel** | a check against every channel, and `a_send_whose_identity_is_already_held_in_another_channel_is_refused`. **M2** |
+| `the_unread_count_never_goes_negative_and_never_exceeds_the_channel` | **A merge dropped the message's unread count** | the restore in `merge_into_held`, and `a_message_reconciled_against_a_later_copy_keeps_its_unread_state`. **M3** |
+| the same property | **A message the server moved between channels left its old channel's count behind** — the precise failure the property was named for | **the representation changed.** Below |
+
+**The fourth is the one that changed a design rather than a line of code, and it is the most
+transferable result in this recording.**
+
+The first version of the unread count was a per-channel `u32`, incremented on arrival and cleared on
+selection. The obvious fix for the fourth defect is "decrement the old channel", and **that fix is
+not well defined**: whether the old channel was on screen *at the moment the message arrived* is a
+fact the state does not keep and cannot reconstruct — the rule is evaluated at arrival
+(`state/app_state.rs`'s module docs §5, and
+`a_message_held_from_earlier_never_becomes_unread_by_switching_away` is the test that pins it), so
+"how much of the old count was this message's" is not derivable. **So the count stopped being a
+counter and became a set of counted `(channel, client_msg_id)` pairs, from which the count is
+*derived*.**
+
+**Three properties then hold structurally rather than by discipline**, and this is the argument for
+the change:
+
+1. **`unread <= messages held` cannot be violated**, because every element names a held message
+   and `remove_message` retires the element with the row.
+2. **It cannot go negative**, because there is nothing to subtract — which is why the property's
+   negative assertion is now a statement about the *model's* signed arithmetic rather than about
+   the implementation's unsigned one.
+3. **A move is exact**, because it stops counting the message where it was and re-evaluates the
+   rule where it now is, which is the operation a counter could not express.
+
+**And the property still measures it, and now measures something that could not have been wrong.**
+The cost is stated rather than assumed: reading a count is O(k) in the number of *unread* messages
+in the workspace, not the number held — and `unread_counts()` is one pass for a whole sidebar,
+which is the API `ui/` is told to use. `AGENTS.md` §2.3's "no O(n) in the frame loop" is about n
+being the history, and here it is not.
+
+**The two model-side defects are recorded because a mutation table cannot see them and because they
+are the more common failure in practice.** The first model treated an `Edit` of an unknown identity
+as inert when it is an insertion, and added a send-map entry for an `Ack` of a message already held
+(§4.12's third seed). **A model that is too eager fails on correct code, and that is a much cheaper
+failure to diagnose than one that passes on incorrect code** — it was fixed in one run, and the fix
+was to the model. §5.6.1's M9 lesson, from the other side.
 
 ## 6. Tool substitutions — both settled
 
