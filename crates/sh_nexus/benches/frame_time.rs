@@ -104,6 +104,36 @@
 //! owes the reader is an honest blank, not a second verdict on a number the
 //! threshold does not govern.
 //!
+//! # What this bench does NOT measure, stated next to what it does
+//!
+//! The shell here is `BenchRoot` holding one `MessageList` -- no sidebar, no
+//! input bar, no composer, no SQLite, no network. That limits **both** figures,
+//! and it limits them in the same way:
+//!
+//! - **RAM is a floor.** The list's own cost, with every other consumer absent.
+//!   The app-level row stays owed until `app.rs` opens the real shell.
+//! - **Frame time is a floor too, and is reported against a threshold written for
+//!   the whole window.** Section 6.2's row says "scroll frame time", and in the
+//!   application that frame also lays out and paints the rest of the shell. A
+//!   number measured here is therefore **optimistic**: it is the cheapest
+//!   honest floor, not the shipped figure. It can prove the list is not the
+//!   bottleneck; it cannot prove the app meets 8 ms.
+//!
+//! Saying this for RAM and not for frame time would be the worse error, because
+//! the frame number is the one a reader is tempted to quote as the result.
+//!
+//! Two further limits on what the report can claim:
+//!
+//! - **Dropped samples are invisible.** gpui's `record_draw_duration` discards a
+//!   `hdrhistogram` rejection with `.ok()`, so the bench cannot know whether the
+//!   histogram it reads silently refused a value. At 3 significant figures and
+//!   ~1 000 samples there is no reason to expect any, but the report cannot
+//!   prove there were none.
+//! - **A short `dirty_to_present` is not a percentile.** In the runs recorded
+//!   here it held as few as 11 samples, where "p99" is the maximum and nothing
+//!   more. The `samples=` column is printed next to it for exactly that reason;
+//!   read the two together or do not read it at all.
+//!
 //! # Why `println!` is here
 //!
 //! `AGENTS.md` section 7.1 bans `println!` in `src/`, where output would be
@@ -277,6 +307,15 @@ struct Report {
     draw: Stats,
     /// First-invalidation-to-present durations -- work plus the wait to show it.
     dirty_to_present: Stats,
+    /// Whether the window was visible when this snapshot was read.
+    ///
+    /// Recorded because `draw_duration` has **no** upstream validity filter:
+    /// `record_draw_timing` writes it unconditionally, while
+    /// `dirty_to_present` only survives `journal::frame_sample_is_valid`, which
+    /// drops frames whose window was hidden. So a run whose window lost
+    /// visibility mid-scroll puts its samples in the histogram that *is* judged,
+    /// and nothing else in the report would reveal it.
+    visible: bool,
 }
 
 /// The hand-off between the view (which holds the only `&Window`) and the
@@ -309,6 +348,7 @@ struct FrameProbe {
 fn snapshot_report(
     label: &'static str,
     started: Instant,
+    visible: bool,
     snapshot: &FrameDurationSnapshot,
 ) -> Report {
     let draw_samples = snapshot.draw_duration_histogram.len();
@@ -342,6 +382,7 @@ fn snapshot_report(
         at: started.elapsed(),
         draw,
         dirty_to_present,
+        visible,
     }
 }
 
@@ -380,9 +421,10 @@ impl BenchRoot {
             return;
         };
         let snapshot = window.frame_duration_snapshot();
+        let visible = window.is_visible();
         probe
             .reports
-            .push(snapshot_report(label, self.started, &snapshot));
+            .push(snapshot_report(label, self.started, visible, &snapshot));
     }
 
     /// Marks this view **and the list** dirty, so the next frame rebuilds both.
@@ -629,6 +671,24 @@ fn print_report(probe: &RefCell<FrameProbe>, rendered: usize) -> Result<(), Stri
             "OVER BUDGET"
         }
     );
+    // The verdict is read from `draw_duration`, which gpui records with no
+    // visibility filter at all, so a window that lost focus mid-run would
+    // otherwise publish its frames as if they had been measured in the
+    // foreground. `Window::is_visible` is public precisely so this can be
+    // checked; a run that trips it is reported as compromised rather than
+    // as a passing measurement.
+    if !before.visible || !after.visible {
+        println!(
+            "   WARNING: window visibility was {} at capture time -- the figure above",
+            if before.visible && !after.visible {
+                "lost DURING the run"
+            } else {
+                "not visible"
+            }
+        );
+        println!("   is NOT trustworthy. Leave the window in the foreground for a whole");
+        println!("   run and re-run before quoting it.");
+    }
     println!("   why draw_duration: it is the time GPUI spends building the frame,");
     println!("   which is the half this client controls -- the one that grows if the");
     println!("   list stops being virtualized. dirty_to_present additionally contains");
@@ -744,7 +804,7 @@ async fn seed_messages(
 
     announce(
         started,
-        &format!("phase 2/4 seeded {seeded} messages through bridge::deliver + drain"),
+        &format!("seeding complete: {seeded} messages through bridge::deliver + drain"),
     );
     Ok(())
 }
