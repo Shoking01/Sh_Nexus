@@ -684,6 +684,44 @@ merely slow, and correctness outranks the frame budget. It is to raise the budge
 with evidence, which is what ADR-005 refused to do without one, and to record
 that this project is the second to reach that conclusion about its own
 constitution.
+
+#### Implementation notes — work unit 2A, 2026-09-29
+
+Steps 1 through 5 above landed. Three things the plan did not anticipate were
+**found by building it**, and are recorded here rather than left in a code
+comment, because each one constrains a later work unit that will read this ADR
+instead of the framework's source.
+
+1. **`bounds_for_item` — and therefore this ADR's *"jump to a message"* — answers
+   `None` while the list is anchored to the tail.** A `ListAlignment::Bottom` list
+   in `FollowMode::Tail` keeps `logical_scroll_top` at the end sentinel
+   (`item_ix == item_count`), and `bounds_for_item` returns `None` for every index
+   below it (`elements/list.rs:711-737`). An unread jump or a search jump must
+   therefore `pause_following_tail()` **and move the anchor** before asking where
+   a row is: pausing alone is not enough, because `layout_items` re-engages
+   following whenever the scroll position *is* the bottom
+   (`elements/list.rs:1211-1218`), which it is until something scrolls away. This
+   is asserted, `None` and all, in
+   `crates/sh_nexus/tests/ui_message_list.rs`.
+2. **A remeasure from inside `render_item` is a panic, not a slow frame.**
+   `List::layout_items` is called on a `&mut StateInner`
+   (`elements/list.rs:1027`), so `ListState::remeasure_items` from the render
+   closure would be a second `&mut` borrow of the same `RefCell`. The plan's
+   obligation — *"every height-changing action routes its `remeasure_items` or
+   `splice` from here"* — is met, but the call cannot happen where the change is
+   detected. It is recorded and applied at the top of the view's `render`, before
+   the list lays out for that frame.
+3. **`List` really does render only the visible rows plus overdraw.** 40 messages
+   produced 24 row entities in the headless harness, which is `AGENTS.md` §7.3's
+   requirement measured instead of assumed. The figures and their conditions are
+   in `docs/BASELINES.md`.
+
+**Step 6 is not done, and is now the only part of this ADR that is owed.** The
+<8ms scroll frame time and the idle-RAM figure both need a real window with a
+real frame loop; the headless harness has no renderer on Windows (Phase 0 finding
+3), so neither can be produced from here. `docs/BASELINES.md` states the method
+for both and what is now measurable that was not before.
+
 #### Alternatives considered
 
 | Option | Why not chosen |

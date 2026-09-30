@@ -21,6 +21,8 @@
 //! | `core/` reads no clock and starts no thread | `core/models/mod.rs` | `core_names_no_clock_and_no_thread` |
 //! | `core/` contains no panicking construct | §7.1 | `core_contains_no_panicking_construct` |
 //! | `network/` names no `gpui` | §3.2 | `network_names_no_gpui` |
+//! | `ui/` reaches the layers below it only through the seam | §3.2, `PLAN.md` §4, ADR-006 step 1 | `ui_reaches_gpui_and_the_bridge_and_nothing_below_them` |
+//! | that rule can still catch a violation | — | `the_ui_boundary_rejects_the_layers_below_it` |
 //! | The protocol does not depend on the client | ADR-002 | `the_wire_crate_does_not_depend_on_the_client` |
 //! | The client depends on the protocol | ADR-002 | `the_client_depends_on_the_wire_crate` |
 //!
@@ -504,6 +506,229 @@ fn core_contains_no_panicking_construct() {
             );
         }
     }
+}
+
+/// Paths inside this crate that `ui/` is allowed to name.
+///
+/// `docs/ARCHITECTURE.md` ADR-006's step 1 states the rule as *"`ui/` may import
+/// `gpui` and `state::bridge`, and **may not** import `network/`, `db/` or
+/// `core::cache` directly"*. This is that rule written as an **allow-list**
+/// rather than as a deny-list of those three, and the reason is the same one
+/// `CORE_ALLOWED_CRATES` gives: a deny-list has to be extended in the same
+/// commit as the new import or it silently permits it, while an allow-list
+/// rejects a layer nobody has thought about yet — which is exactly the shape of
+/// the mistake a Phase 3 author makes at 2am with `db::repository` open.
+///
+/// The three entries beyond the ADR's sentence are each a deliberate call:
+///
+/// - **`crate::core::{markdown, models, theme}`.** The ADR's rule names what
+///   `ui/` may not reach; these are the pure `core/` modules it renders. They
+///   hold no I/O and no handle on anything, so admitting them costs the
+///   boundary nothing — while `crate::core::cache` stays out, because the
+///   segment cache is reached through the bridge and going around the seam is
+///   what would make its recency order a statement about a thread nobody
+///   named.
+/// - **`crate::state::DeliveryState`.** `PLAN.md` §5 puts delivery state in
+///   `state/` *and* has the UI display it, so a row that says "sending…" has to
+///   name it. It is client state, not a domain type; the same argument does not
+///   extend to `state::app_state` or `state::actions`, and neither is on the
+///   list. `tests/bridge.rs` independently fails the build on `ui/` naming the
+///   state type itself.
+const UI_ALLOWED_CRATE_PATHS: [&str; 6] = [
+    "crate::core::markdown",
+    "crate::core::models",
+    "crate::core::theme",
+    "crate::state::bridge",
+    "crate::state::DeliveryState",
+    "crate::ui",
+];
+
+/// Paths that must never appear in `ui/`, even fully qualified.
+///
+/// The allow-list above governs `use` statements; this catches a path written
+/// inline, which no import list would show. One entry per layer the ADR names,
+/// plus the two `state/` modules whose mutators `PLAN.md` §4 keeps behind the
+/// named doors in `bridge.rs`.
+const UI_FORBIDDEN_TOKENS: [&str; 5] = [
+    "crate::network",
+    "crate::db",
+    "crate::core::cache",
+    "crate::state::app_state",
+    "crate::state::actions",
+];
+
+/// Whether `ui/` may name an intra-crate path.
+fn ui_may_name(path: &str) -> bool {
+    UI_ALLOWED_CRATE_PATHS
+        .iter()
+        .any(|allowed| path.starts_with(allowed))
+}
+
+/// Every `use` statement that reaches into this crate, as (line, path).
+///
+/// Simpler than [`use_statements`], which keeps only the first path segment: the
+/// question here is which *subtree* a file reaches, so the whole path is what
+/// has to come back.
+fn internal_use_paths(stripped: &str) -> Vec<(usize, String)> {
+    stripped
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            let rest = trimmed
+                .strip_prefix("pub use ")
+                .or_else(|| trimmed.strip_prefix("use "))?;
+            rest.starts_with("crate::").then(|| {
+                (
+                    index + 1,
+                    rest.split(';').next().unwrap_or_default().trim().to_owned(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// `ui/` reaches the layers below the seam only through the seam.
+///
+/// **This lands before there is anything to violate, which is ADR-006's step 1
+/// and the same order work unit 1E-1 used.** A boundary written after the code
+/// is a boundary retrofitted around whatever the code already does, and the
+/// retrofit is where the exception gets made.
+///
+/// Checked three ways, because the three fail differently: an **allow-list** over
+/// intra-crate `use` statements (exact, and rejects a layer nobody thought
+/// about), a **token scan** over comment-stripped source (catches a fully
+/// qualified path a `use` list would not show), and two **positive** assertions
+/// that `ui/` names `gpui` and the bridge at all — without which the rule could
+/// be satisfied by a directory that renders nothing.
+#[test]
+fn ui_reaches_gpui_and_the_bridge_and_nothing_below_them() {
+    let ui_dir = src_dir().join("ui");
+    let files = rust_files_under(&ui_dir);
+    assert!(
+        !files.is_empty(),
+        "{} should hold the presentation layer: PLAN.md section 4 puts ui/ in \
+         AGENTS.md section 3.1's tree",
+        ui_dir.display()
+    );
+
+    let mut names_gpui = false;
+    let mut names_the_bridge = false;
+
+    for file in &files {
+        let source = fs::read_to_string(file)
+            .unwrap_or_else(|error| panic!("{} should be readable: {error}", file.display()));
+        let stripped = without_comments(&source);
+
+        names_gpui |= use_statements(&stripped)
+            .iter()
+            .any(|(_, segment)| segment == "gpui");
+
+        for (line, path) in internal_use_paths(&stripped) {
+            names_the_bridge |= path.starts_with("crate::state::bridge");
+            assert!(
+                ui_may_name(&path),
+                "{}:{line} reaches `{path}`. AGENTS.md 3.2 and PLAN.md section 4 \
+                 give ui/ the seam and the pure core modules and nothing else: \
+                 network/ and db/ are reached through state/bridge.rs or not at \
+                 all, the rendered-segment cache is reached through the bridge \
+                 (which is what keeps its recency order a statement about the \
+                 main thread), and the state's mutators live behind the named \
+                 doors. Allowed: {UI_ALLOWED_CRATE_PATHS:?}",
+                file.display()
+            );
+        }
+
+        for token in UI_FORBIDDEN_TOKENS {
+            assert!(
+                !stripped.contains(token),
+                "{} names `{token}` after comment stripping. ui/ renders what the \
+                 state holds; it does not open a socket, read a database, or \
+                 reach past the seam into the cache or the mutators.",
+                file.display()
+            );
+        }
+    }
+
+    assert!(
+        names_gpui,
+        "no file under {} names gpui. PLAN.md section 4 confines GPUI to ui/ and \
+         app.rs, so a ui/ that does not name it is not the presentation layer.",
+        ui_dir.display()
+    );
+    assert!(
+        names_the_bridge,
+        "no file under {} names crate::state::bridge. PLAN.md section 4 makes \
+         bridge.rs the single seam, and a view that reaches the state some other \
+         way is the second seam that file exists to prevent.",
+        ui_dir.display()
+    );
+}
+
+/// The `ui/` rule is not vacuous: it rejects what it claims to and admits what
+/// it must.
+///
+/// Same reasoning as [`core_admits_serde_json_and_still_rejects_serde`]: a
+/// green tree proves only that nothing *currently* violates the rule, and says
+/// nothing about whether the rule can still catch a violation. The rejected
+/// samples are the imports a Phase 2/3 author would actually write; the admitted
+/// ones are the imports this layer legitimately has, so a tightening that broke
+/// one of them fails here rather than in a build nobody expected.
+#[test]
+fn the_ui_boundary_rejects_the_layers_below_it() {
+    for violation in [
+        "use crate::network::mapping::to_domain;",
+        "use crate::network::websocket::Socket;",
+        "use crate::db::repository::insert_message;",
+        "use crate::core::cache::LruCache;",
+        "use crate::state::app_state::AppState;",
+        "use crate::state::actions::begin_send;",
+        "pub use crate::network::rest::Client;",
+    ] {
+        let paths = internal_use_paths(without_comments(violation).as_str());
+        assert_eq!(
+            paths.len(),
+            1,
+            "`{violation}` should be one intra-crate path"
+        );
+        assert!(
+            !ui_may_name(&paths[0].1),
+            "`{violation}` names a layer ui/ must not reach, but the allow-list \
+             admitted `{}`",
+            paths[0].1
+        );
+    }
+
+    for permitted in [
+        "use crate::state::bridge::{self, Rendered};",
+        "use crate::state::DeliveryState;",
+        "use crate::core::markdown::Document;",
+        "use crate::core::models::message::Message;",
+        "use crate::core::theme::Palette;",
+        "use crate::ui::views::message_list::MessageList;",
+    ] {
+        let paths = internal_use_paths(without_comments(permitted).as_str());
+        assert_eq!(
+            paths.len(),
+            1,
+            "`{permitted}` should be one intra-crate path"
+        );
+        assert!(
+            ui_may_name(&paths[0].1),
+            "`{permitted}` is a legitimate ui/ import and must be admitted, but \
+             `{}` was rejected",
+            paths[0].1
+        );
+    }
+
+    // And a path written inline rather than imported is caught by the token
+    // scan, which is the half an import allow-list cannot reach.
+    assert!(
+        UI_FORBIDDEN_TOKENS
+            .iter()
+            .any(|token| "let c = crate::core::cache::LruCache::new(1);".contains(token)),
+        "a fully qualified path must still trip the token scan"
+    );
 }
 
 /// `core/cache.rs` contains no interior mutability.
