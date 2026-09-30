@@ -106,3 +106,37 @@ pulldown-cmark = { workspace = true }
 # gpui_platform/test-support) are recorded in the root Cargo.toml.
 proptest = { workspace = true }
 rstest = { workspace = true }
+
+[features]
+# profiling: opens `gpui`'s `profiler` feature, which is what makes the frame
+# histograms -- `Window::frame_duration_snapshot`, `WindowProfiler`'s
+# `draw_duration` and `dirty_to_present` -- exist at all. It is a feature and
+# not a plain dependency because `AGENTS.md` 6.1 measures the *release* binary
+# and 6.2's frame-time row is a development measurement: compiling the
+# instrumentation into every build would put measurement code in a product whose
+# first priority is the frame it is measuring. Nothing in `src/` references it,
+# so the cost of leaving it off is zero and the cost of turning it on is a
+# histogram allocation per window.
+#
+# `dep:hdrhistogram` is *not* named here on purpose. `AGENTS.md` 7.2 prices a
+# dependency by its compile time and supply-chain surface, and this crate never
+# names that type: `benches/frame_time.rs` reads the histograms field by field
+# through `FrameDurationSnapshot`, whose fields are public, which needs no
+# import of the type behind them. Enabling `gpui/profiler` pulls `hdrhistogram`
+# in as gpui's own optional dependency -- gpui's business, already audited
+# there -- rather than as ours.
+profiling = ["gpui/profiler"]
+
+[[bench]]
+# The ADR-006 step 6 measurement: scroll frame time at 10k messages against
+# `AGENTS.md` 6.2's `< 8 ms`, plus two fixed idle dwells for an external RAM
+# sample.
+name = "frame_time"
+# The bench opens a real window and drives a real frame loop, which `libtest`'s
+# harness has no opinion about: it would run `main`, get a function that never
+# returns a `Bencher`, and report nothing. The bench prints its own report.
+harness = false
+# Gated so that `cargo build`, `cargo test` and `cargo clippy` -- the commands
+# `AGENTS.md` 5.1 makes mandatory -- never build an instrumented binary they do
+# not run. The measurement is opt-in, exactly like the feature above.
+required-features = ["profiling"]
