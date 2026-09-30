@@ -46,16 +46,34 @@
 //! [`DomainEvent`] and the state never does. The global itself is `!Sync`, so no
 //! second thread can hold a reference to the state even in principle.
 //!
-//! **The residual gap is narrowed, not closed, and the narrowing is a scanner
-//! rather than a type.** `only_the_bridge_constructs_an_application_state` in
+//! **The residual gap is closed, by a scanner rather than a type.**
+//! `only_the_bridge_constructs_an_application_state` in
 //! `crates/sh_nexus/tests/bridge.rs` fails the build when a module outside
 //! `bridge.rs` constructs an [`AppState`] of its own — the cheap mistake, and the
-//! one a Phase 3 or Phase 4 author would actually make. **What stays open is a
-//! module that is *handed* a state by value**, which no guard in this repository
-//! would see; closing that would mean making `AppState::new` crate-private, and
-//! `app_state.rs` is not this work unit's file to change. `bridge.rs`'s module
-//! docs, §1, says the same thing in the same words rather than claiming a
-//! guarantee that does not exist.
+//! one a Phase 3 or Phase 4 author would actually make.
+//!
+//! **A module that is *handed* a state by value was the other half, and
+//! `no_module_outside_state_names_the_state_type` closes it:** no file under
+//! `src/` outside `state/` may name the type at all. One condition rather than
+//! three, and it forecloses constructing one, holding one as a field, and taking
+//! `&mut` to one, which is exactly the trio a `ui/` view would reach for.
+//!
+//! **The obvious alternative was wrong, and the reason is worth keeping.**
+//! `docs/ARCHITECTURE.md` ADR-009 proposed closing this by making
+//! `AppState::new` crate-private. The integration tests in `tests/` are a
+//! *separate crate*, so that would have broken the six call sites in
+//! `tests/state_actions.rs` that legitimately build a state to drive
+//! `actions::apply_event` with — it would have moved the gap rather than closed
+//! it. A scanner over `src/` leaves the external test API untouched.
+//!
+//! **What still stands open, and it is narrower than "nothing".** The
+//! confinement is now a build failure for every shape that *owns* the state off
+//! the main thread. It is not a type-level guarantee: [`AppState`] is `Send +
+//! Sync` as a matter of fact, and `bridge::try_read` hands an `&AppState` to a
+//! closure. That borrow is main-thread by construction, so outliving the call is
+//! the next shape to rule out, and it is not what these guards rule out.
+//! `bridge.rs`'s module docs, §1, states the same distinction in the same words
+//! rather than claiming a guarantee that does not exist.
 //!
 //! # What the layer may not reach
 //!
