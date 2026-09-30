@@ -541,16 +541,32 @@ measured-height estimator for lists whose content is variable-height.**
    mandatory for every list that is uniform** — Zed's own pickers, tables, git
    graph and LSP store are all uniform and all use `UniformList`, and this ADR
    does not touch them.
-3. **Recycling is unaffected.** §7.3's recycle requirement stands as written and
-   is not in question. Only the height source changes.
-4. **Height changes must be reported.** `List` is explicit that *"clients… need
-   to ensure that elements outside of the scrolled area do not change their
-   height… If your elements do change height, notify the list element via
-   `ListState::splice` or `ListState::reset`."* Editing a message, a reaction
-   changing a chip row, or a markdown segment re-parsing all change a row's
-   height, and each is a `splice`. **This is a real obligation the previous
-   proposal did not have**, because the previous proposal did not know `List`
-   existed.
+3. **Recycling is this project's job, not the component's, and §7.3's wording
+   needs a second amendment.** The word *recycle* appears in **neither**
+   `elements/list.rs` nor `elements/uniform_list.rs` — verified by search, not
+   assumed. Both elements **virtualize** (render only the visible subset); neither
+   recycles. What `List` offers in that direction is *"this element's state is
+   stored intrusively on your own views, so that your code can coordinate
+   directly with the list element's cached state"* — **state** reuse, not element
+   reuse. So §7.3's three requirements resolve as: **render only visible** is met
+   natively; **uniform estimator** is what decision 2 amends; **recycle** is a
+   caller-side discipline that this project must implement, by holding one
+   `Entity`/`Rc` per row so a row's state survives scrolling out and back.
+4. **Height changes are reported with `remeasure_items`, not `splice`.** `List`
+   is explicit that *"clients… need to ensure that elements outside of the scrolled
+   area do not change their height… notify the list element via `ListState::splice`
+   or `ListState::reset`."* `splice` is one of the two ways to satisfy that, and
+   it is the **wrong** one here: its own doc says *"Unlike `Self::splice`, this
+   does not change the number of items **or blow away `logical_scroll_top`**"* —
+   so a message edited while the user is reading history would reset their scroll
+   position. `remeasure_items` is documented for exactly this case: *"Use this
+   when an item's content has changed and its rendered height may be different,
+   but the item itself still exists at the same index."*
+   - **Content changed, same row** — an edit, a reaction chip appearing, a
+     markdown re-parse: `remeasure_items(ix..ix+1)`.
+   - **Rows inserted or removed** — a new message, optimistic send reconciled,
+     history paged in from Phase 3: `splice(range, count)`.
+   - **The count is wrong wholesale** — a channel switch: `reset(count)`.
 
 **Why the amendment is the honest framing rather than a convenience:** §7.3's
 substantive requirement is *"render only visible items"*, and `List` satisfies it.
@@ -581,14 +597,93 @@ proposes amending the rule it mis-specifies is proposing the actual fix.
   directly with the list element's cached state"*. §7.1's prohibition on
   unbounded growth is the component's problem now, not a design decision this
   project has to get right.
-- **Responsibility shifts to the caller.** `List` is not a pure virtualizer: it
-  requires the caller to keep a row's height stable or report the change. Every
-  height-mutating action in `state/actions.rs` and `core/markdown.rs` now has a
-  corresponding `splice`, and forgetting one produces a list that slowly drifts
-  out of alignment — a new failure mode that did not exist under
-  `uniform_list`, which is worth naming as the cost.
+- **Responsibility shifts to the caller, in two places rather than one.**
+  `List` is not a pure virtualizer: it requires the caller to keep a row's height
+  stable or report the change, using the right one of three calls (§Decision 4).
+  **And recycling is now entirely ours** (decision 3) — one `Entity` per row,
+  kept alive across scroll-out. Both are obligations the previous proposal did
+  not have, because the previous proposal did not know `List` existed.
+- **The caller can pick which items get measured.** `ListMeasuringBehavior`
+  defaults to `Visible` (*"Only measure visible items"*) and has a `Measure(bool)`
+  variant documented as *"This can be expensive for the first frame in a large
+  list."* §6.2's channel-switch budget and its scroll-frame budget pull in
+  opposite directions here, and the default is the safe one for both; the
+  `Measure` variant is a tuning knob, not a starting point.
 - **§6.2's <8ms scroll frame time becomes measurable for the first time.**
 
+#### Implementation plan
+
+Everything below is grounded in the API at the pinned `rev e683fd7`, read from
+`crates/gpui/src/elements/list.rs` rather than recalled. **Three things this
+project would otherwise have built by hand already exist**, and the plan is
+mostly *wiring* rather than *construction*.
+
+**What `List` gives us, verified:**
+
+| Need | Provided by | Note |
+|---|---|---|
+| render only visible rows | `list(state, render_item)` | `render_item: impl FnMut(usize, &mut Window, &mut App) -> AnyElement` |
+| chat-log direction | `ListAlignment::Bottom` | *"The list is scrolling from bottom to top, **like a chat log**"* |
+| stick to the newest message | `set_follow_mode(FollowMode::Tail)`, `pause_following_tail()`, `is_scrolled_to_end()` | first-class, not hand-rolled |
+| jump to a message | `scroll_to_reveal_item(ix)`, `bounds_for_item(ix)` | needed for unread jumps and search results |
+| correct heights | `ListMeasuringBehavior::Visible` (default) | `Measure(bool)` is the expensive opt-in |
+| height changed, row is the same | `remeasure_items(range)` | *"does not… blow away `logical_scroll_top`"* |
+| rows inserted/removed | `splice(range, count)` | also the expensive one — resets scroll position |
+| recount | `reset(count)` | channel switch |
+| infinite scroll | `set_scroll_handler(..)` | the hook Phase 3's paged history needs |
+
+**And the thing that cost the previous proposal its premise: there is no
+delegate trait.** The entire rendering contract is one closure. This project does
+not build a `MessageListDelegate` abstraction, and that is a deliberate
+non-decision — a trait over a single call site is indirection with no second
+implementation to justify it.
+
+**Work order.** Each step is a commit with its own tests; none depends on a
+measurement from a later step.
+
+1. **`ui/` skeleton and the layer rule.** Create `src/ui/mod.rs` plus
+   `src/ui/views/`. Extend `tests/layer_boundary.rs`: `ui/` may import `gpui`
+   and `state::bridge`, and **may not** import `network/`, `db/` or `core::cache`
+   directly. This guard lands *first*, before there is anything to violate —
+   the same order 1E-1 used, and it is the reason a later mistake is a build
+   failure rather than a review comment.
+2. **A `ListState` and a first row, headless.** `ListState::new(count,
+   ListAlignment::Bottom, overdraw)`, a `list()` with a stub row, and
+   `#[gpui::test]` asserting the row renders and `bounds_for_item(0)` is
+   non-empty. **No messages yet.** This unit exists to prove the harness renders
+   a `List` headlessly before any content logic is layered on it — the Phase 0
+   spike proved the harness for a plain view, not for a virtualized one.
+3. **Row recycling.** One `Entity<MessageRow>` per `client_msg_id`, held in a
+   map bounded per §7.1, so a row's state survives scroll-out. This is §7.3's
+   recycle requirement and it is the only part of the list that is *built* rather
+   than *wired* — which is why it is its own step.
+4. **`core/markdown.rs` → GPUI elements.** The segment tree becomes a row's
+   content, with an explicit `.text_color()` on every text element (GPUI does
+   not inherit color; §7.3). This is the first consumer of a 1,956-line module
+   that nothing calls today.
+5. **The state seam.** `bridge::try_read` to obtain rows, `try_select_channel`
+   and `try_begin_send` for the gestures, and `FollowMode::Tail` +
+   `pause_following_tail()` for stick-to-bottom. **Every height-changing action
+   routes its `remeasure_items` or `splice` from here**, so the obligation lives
+   in one place rather than at each call site.
+6. **Measure, and record it.** §6.2's **<8ms** scroll frame time at 10k
+   messages, and the **idle RAM** figure `docs/BASELINES.md` has been carrying as
+   deliberately-unmeasured. Both are owed and both need a real window, which
+   only now exists.
+
+**What the plan deliberately does not include.** No `UniformList` anywhere in
+the message list. No measured-height overlay or height cache — `List` holds the
+layout state. No delegate trait. No `ListMeasuringBehavior::Measure` until a
+measurement says the default is insufficient. No search, no thread panel, no
+editing UI: those are Phase 2 items this ADR does not govern.
+
+**The risk, named.** Step 6 is the one that can invalidate the decision. If
+`List` cannot hold <8ms at 10k messages, the response is **not** to return to a
+uniform estimator — a uniform estimator on chat content is *incorrect*, not
+merely slow, and correctness outranks the frame budget. It is to raise the budget
+with evidence, which is what ADR-005 refused to do without one, and to record
+that this project is the second to reach that conclusion about its own
+constitution.
 #### Alternatives considered
 
 | Option | Why not chosen |
