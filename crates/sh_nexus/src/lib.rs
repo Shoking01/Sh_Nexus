@@ -11,12 +11,15 @@
 //!
 //! # The module tree (AGENTS.md section 3.1)
 //!
-//! `app.rs`, `ui/`, `db/` and `platform/` are not declared yet. They are later
-//! work units, and they are absent rather than declared empty: a module that
-//! exists and does nothing reads as finished work. `state/bridge.rs` arrived in
-//! work unit 1E-2 and is the single module permitted to call
-//! `cx.update_global`; [`run`] installs the global it owns, before any window
-//! exists.
+//! `app.rs`, `db/` and `platform/` are not declared yet. They are later work
+//! units, and they are absent rather than declared empty: a module that exists
+//! and does nothing reads as finished work. `state/bridge.rs` arrived in work
+//! unit 1E-2 and is the single module permitted to call `cx.update_global`;
+//! [`run`] installs the global it owns, before any window exists. [`ui`]
+//! arrived in work unit 2A with the message list, and it is the layer GPUI is
+//! confined to (`PLAN.md` section 4) — the reason this file's spike view is
+//! still here rather than in `app.rs` is that the spike's footprint is what
+//! Phase 0 had to prove.
 //!
 //! [`core`] is pure domain logic with no side effects -- no `gpui`, no `tokio`,
 //! no I/O (`AGENTS.md` section 3.2). [`network`] is protocol handling only: it
@@ -36,6 +39,7 @@ pub mod core;
 pub mod errors;
 pub mod network;
 pub mod state;
+pub mod ui;
 
 use std::cell::RefCell;
 use std::rc::Rc;

@@ -2140,3 +2140,126 @@ the fix is on the *parameter*. `crates/sh_nexus/tests/ordering.rs:960` shows the
 `#[case] offset: i64`.
 
 
+
+---
+
+## 5.9 The `ui/` layer, and the debt that was closed before it landed
+
+Phase 2 work unit 1 brought `ui/` into existence: `ui/markdown.rs`,
+`ui/views/message_list.rs`, `ui/views/message_row.rs`, and `ui/mod.rs`, with
+`tests/ui_message_list.rs` (27 tests) and `tests/ui_markdown_blocks.rs` (28).
+
+### The measurement that decided the work order
+
+`ui/markdown.rs` arrived at **57.26% regions and 64.24% lines**, with **100
+unexecuted regions** and 9 of 12 functions partly uncovered. `AGENTS.md` 4.1 sets
+no numeric floor for `ui/` (*"UI components: Integration tests for critical
+flows"*), so this did not violate the constitution - and it still had to be
+closed, because the uncovered part was not arbitrary.
+
+**The uncovered code was the block dispatcher, and the block dispatcher is what
+produces the variable row heights ADR-006's whole decision rests on.** Runs,
+colours and the palette were covered; heading, quote, list, rule and code block
+were not. A code block rendering with the wrong padding would have been invisible
+to every test in the suite, and that is exactly the case that makes a uniform
+estimator misplace every row after it.
+
+The decision recorded before the work: **`main` was not to carry the 57%.** The
+unit was completed and the gap closed *before* the first commit, so the number
+was never published in either direction.
+
+### The structural gap, and the production change that closed it
+
+`block_element` returns `AnyElement`, which is **opaque**: a caller can hold it
+and learn nothing about it. The module's own convention was already the right one
+- `runs()` returns `(String, Vec<TextRun>)` and `blocks()` is `pub` *"because a
+test can assert on a block tree without building a whole document"* - but the
+inline path had been made testable and the block path had not.
+
+So the block path needed a seam, and it is the same seam `src/ui/views/
+message_row.rs` had already found: **a `debug_selector` per block, which
+`cx.debug_bounds(..)` can find in a real window.** Two details are load-bearing:
+
+- **`.id()` is the wrong tool**, and `message_row.rs:264` already records why:
+  *".id() alone records nothing."* An `ElementId` is state identity, and one per
+  block across N rows of a virtualized list is N copies of one identity.
+- **A `Bounds` is the only place a height is observable**, which is what makes
+  the ADR-006 claim testable at all: *a code block is taller than a one-word
+  paragraph*.
+
+Also made `pub`, for the same reason `blocks` and `runs` are: **`list_marker`**,
+whose entire behaviour is a four-way decision and which could not be reached from
+an external test.
+
+### After: 99.49% lines, 13 of 13 functions
+
+| File | Lines | Functions |
+|---|---|---|
+| `sh_nexus\src\ui\markdown.rs` | **196/197 = 99.49%** | **13/13 = 100%** |
+| `sh_nexus\src\ui\mod.rs` | 40/41 = 97.56% | 5/5 = 100% |
+| `sh_nexus\src\ui\views\message_list.rs` | 181/195 = 92.82% | 26/28 = 92.86% |
+| `sh_nexus\src\ui\views\message_row.rs` | 140/150 = 93.33% | 18/20 = 90% |
+| **`ui/` as a layer** | **557/583 = 95.54%** | 62/66 = 93.94% |
+
+**The one uncovered line is the empty-span guard in `push_run`, and it is left
+uncovered on purpose.** `no_input_produces_an_empty_text_span` parses eight
+inputs chosen to produce empty spans (`""`, `"**"`, `` "` `" ``, `"****"`,
+`"> "`, `"- \n- "`, `"[a](b)"`, `` "```\n```" ``) and asserts the parser emits
+none - which makes the guard **unreachable by construction rather than untested
+by accident**. If that test ever fails the guard becomes reachable and must be
+covered rather than removed: an empty run reaching `TextRun` would shift every
+subsequent run's byte offset, because `StyledText::with_runs` slices the
+accumulated string by each run's length.
+
+### Reconciliation - read from `cargo llvm-cov --json`, not transcribed
+
+```text
+client 3072/3184 lines    wire 159/159
+  covered: 3072 + 159 = 3231  == the tool's TOTAL 3231   CUADRA
+  missed:   112 +   0 =  112  == the tool's TOTAL  112   CUADRA
+  workspace 3231/3343 = 96.65%
+
+core/   1324/1356 = 97.64%   (control: identical to Phase 1, byte for byte)
+state/   892/903  = 98.78%
+ui/      557/583  = 95.54%
+```
+
+Every percentage above is derived from its own fraction at the moment it was
+written, per 5.5's second rule. The first attempt at this section transcribed
+the rows by hand and **did not reconcile** - off by one region - which is the
+failure 5.5 documents, committed a second time by the same hand. The numbers
+above come from `cargo llvm-cov report --summary-only --json` instead.
+
+### Two mutants survived the first pass, and both were mine
+
+| # | Defect | Caught |
+|---|---|---|
+| M1 | a task item's marker loses its `checked` | 2 |
+| M2 | an ordered list ignores its declared `start` | 6 |
+| M3 | the code block loses its padding | 1 |
+| M4 | the heading loses its `text_lg()` | **0, then 1** |
+| M5 | a block's debug selector disappears | 2 |
+| M6 | the rule stops being a hairline | **0, then 1** |
+
+**M4 and M6 survived because the tests asserted something weaker than their
+doc comments claimed**, and both weaknesses were mine:
+
+- The heading test compared with `>=`. Both wrappers carry the same padding, so
+  **nothing could ever make it fail** - and removing `text_lg()` did not. A `>=`
+  on a relation that only one thing can produce is a test that asserts nothing.
+- The rule test asserted only `rule < paragraph`. Mutation M6 replaced 1px with
+  24px and stayed green, because a 24px line is still shorter than a paragraph of
+  body text. The assertion that catches it is a **ratio** - a rule is a
+  separator, so it must be a small fraction of a line of text - and that is a
+  claim about what a rule *is*, not a constant.
+
+Both are now strict and both are mutation-checked. The general form is the one
+5.7.1 and 5.7.2 have been converging on: **a bound that cannot fail is
+indistinguishable from no bound, and the mutation table is the only thing that
+tells the two apart.** A green suite cannot.
+
+The remaining minimum is **1**, on three mutants - the same floor `cache.rs`
+(5), `theme.rs` (1) and `state/` (1) reported before. None of the three is a
+branch with a *choice* in it; each is a single styling or padding value whose
+only failure mode is a specific wrong number, and a test that pins the number
+pins the constant.

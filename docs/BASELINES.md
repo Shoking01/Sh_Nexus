@@ -116,3 +116,72 @@ The coverage and test figures are re-derived from `cargo llvm-cov
 rules in `docs/COVERAGE.md` §5.5 — a percentage that disagrees with its own
 fraction survived four correct reconciliations in work unit 1D, so every number
 above is either measured here or points at the file where it is measured.
+
+## Message list: what is measured, and the two figures still owed
+
+`docs/ARCHITECTURE.md` ADR-006's step 6 makes two `AGENTS.md` §6.2 figures owed
+by the message list: the **<8 ms scroll frame time at 10 000 messages**, and the
+**idle RAM** this file has been carrying as deliberately unmeasured. Work unit 2A
+landed steps 1–5 (the `ui/` layer, `gpui::List`, row recycling, Markdown to GPUI
+elements, the state seam), so the list now exists and the two figures are
+**measurable for the first time**. Neither is recorded here yet, and the reason
+is narrow rather than the old one.
+
+### Owed: scroll frame time at 10 000 messages — §6.2, `< 8 ms`
+
+**Not measured.** A frame-time histogram is a property of a real window with a
+real frame loop, and the headless harness has no renderer at all on Windows:
+`current_headless_renderer()` returns `Ok(None)` there, because `TestAppContext`
+uses GPUI's pure-Rust `TestPlatform` and never touches a GPU (Phase 0 finding 3).
+So neither `TestAppContext` nor CI on this platform can produce this number, and
+a figure produced some other way would not be the figure §6.2 bounds.
+
+**Method, when it is taken:** `cargo build --release` (which needs `fxc.exe` on
+`PATH` — Phase 0 finding 1, and the build fails with an error that reads like a
+code defect), run the release binary, open a channel with 10 000 messages, and
+record the frame time histogram while scrolling continuously. The number to
+compare against §6.2 is the **99th percentile**, not the mean: §1's priority is
+*zero jank while receiving messages*, and a mean hides exactly the frames that
+are the complaint.
+
+### Owed: idle RAM — §6.2, `< 80 MB`, and it is no longer impossible
+
+**Still not measured, and the old reason is now spent.** The Phase 1 section
+above says the figure was not measurable because *"there is no window, no
+sidebar, no message list, no input bar"* and measuring a stub would put a
+green-looking number against a threshold it has no standing to test. There is
+now a message list, so what is missing is not the UI but a **release binary that
+opens it**: `src/main.rs` still opens the Phase 0 spike's `RootView`, which is
+the same stub in a different file. Measuring that process would be the failure
+mode this file already names, so the figure stays owed until `app.rs` (which
+`PLAN.md` §4 places next) opens the real shell.
+
+**Method, unchanged from §5.2:** release build, attach the OS process monitor,
+let it settle, sample the working set at rest, then exercise it for 30 minutes of
+active chatting and record **both** the idle figure and the growth. §6.2's
+companion line — *"RAM with 10k cached messages < 200 MB"* — has the same
+dependency and is measured in the same session.
+
+### Measured headlessly, and what it does and does not prove
+
+Recorded because it is the denominator the frame budget needs, and because it is
+the first measurement of §7.3's virtualization claim rather than a restatement of
+it. Conditions: `cargo test -p sh_nexus --test ui_message_list`, the harness
+window at 1920×1080 (maximized), 40 messages in one channel, the built-in dark
+theme, debug profile.
+
+| Metric | Measured | Threshold | Verdict |
+|---|---|---|---|
+| Row entities built for 40 messages | **24** | — | **virtualization works: 24 rows, not 40** |
+| Row height (one line, `text_sm`) | **68.5 px** | — | — |
+| List viewport in the harness | 1920×1080 px | — | — |
+| Rows built for 10 000 messages | not measured | — | the figure above is 40 messages, not 10 000 |
+
+**What this proves:** `gpui::List` renders the visible range plus the 512 px
+overdraw and nothing else, so §7.3's *"render only visible messages"* is a
+measured property of this list rather than an assumption about the framework.
+**What it does not prove:** anything about frame time. 24 rows at 68.5 px puts
+roughly 685 000 px of content in the list, and that is the input a frame-time
+measurement needs — not the measurement itself. The distinction is the same one
+the Phase 1 section draws about the stub: a number that looks like a budget
+figure and cannot test the budget is worse than no number.
