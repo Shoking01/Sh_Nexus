@@ -331,7 +331,8 @@ Sh_Nexus/
   Every text element in `ui/` sets it explicitly.
 - **Use `cx.spawn()` for async operations.** Never block the UI thread.
 - **Use `cx.set_global()` / `cx.global::<T>()`** for app-wide state.
-- **Virtualized message lists** — see §8 Phase 2 for the estimator question.
+- **Virtualized message lists** — the estimator question is **settled**: ADR-006 is
+  Accepted, and the message list is built on `gpui::List`. See §8 Phase 2.
 - **No DOM APIs.** No `document`, no `window`, no `fetch`.
 - **No blocking `cx.update_global` from non-UI threads** — see `state/bridge.rs` above.
 
@@ -613,13 +614,19 @@ Strict TDD applies to `core/` and `sh_nexus_wire` (pure, =90% floor, no excuses)
 ### Phase 2 — Core UI
 
 - App shell: sidebar + chat area + input bar
-- **Virtualized message list** — render only visible items (§7.3). **The row estimator:** §7.3
-  mandates "a uniform row estimator and recycle". Markdown and code blocks make true row
-  heights genuinely variable, and a uniform estimator in a chat list produces scroll jank
-  against §1's zero-jank priority. **Plan: implement the §7.3 uniform estimator as the
-  specified default and first-pass fallback, and layer measured per-row heights on top as a
-  superset once a row has been rendered.** This complies rather than overrides, and an ADR
-  request to amend §7.3 for measured-height chat lists is filed alongside it.
+- **Virtualized message list** — render only visible items (§7.3). **The row estimator is
+  settled: build it on `gpui::List`, not `gpui::UniformList`.** ADR-006 is **Accepted** and
+  amends §7.3 to permit a measured-height estimator for lists whose content is genuinely
+  variable-height. The original premise of that ADR — that `UniformList` was the only
+  virtualized list available — was false at the pinned `rev e683fd7`: GPUI also ships
+  `elements/list.rs` for *"a large number of differently sized elements"*, `uniform_list.rs`
+  points readers to it, and **Zed's own chat panel (`agent.rs`) uses it**. §7.3's substantive
+  requirement (render only visible items) is met; the word *uniform* was the part written for
+  another data shape. **Every other list in this project — sidebar, channel list, Ctrl+K
+  switcher — has genuinely uniform rows and keeps the strict uniform estimator.** Two
+  consequences Phase 2 must honour: `List` is the slower component, so §6.2's <8ms scroll
+  frame time is the first thing to measure; and `List` requires the caller to report height
+  changes via `ListState::splice`, so every action that changes a row's height owes a splice.
 - Channel list (from cached `AppState`)
 - Message bubbles: sender, timestamp, text — each with explicit `.text_color()`
 - Input bar with send on Enter
@@ -917,7 +924,7 @@ window-opening path, which Phase 2 restructures into `src/app.rs` and which no t
 - **`docs/ARCHITECTURE.md`** holds ADRs in Context / Decision / Consequences / Alternatives
   format (§9.2). ADR-001 (GPUI distribution), ADR-002 (backend in Rust), ADR-003 (workspace
   layout) and ADR-004 (this reconciliation) are the first four; ADR-005 (perf re-baseline) and
-  ADR-006 (row estimator) are pending Phase 0/1.
+  ADR-006 (row estimator, now Accepted) are pending Phase 0/1.
 - **`docs/API.md`** documents the protocol and version negotiation, updated on any WebSocket
   change (§5.3), and records the theme schema when it changes (§11).
 - **`docs/DEPENDENCIES.md`** holds the §7.2 audit.
@@ -981,7 +988,7 @@ features.
 2. ~~Document the `fxc.exe` release-build prerequisite~~ - **DONE.** `README.md` Prerequisites
    and Platform gotchas (a). CI wiring outstanding, see item 4.
 3. ~~Write ADR-001 through ADR-004 into `docs/ARCHITECTURE.md`~~ - **DONE**, along with ADR-005
-   (Withdrawn, retained as a record) and ADR-006 (Proposed). ADR-005 is withdrawn: the
+   (Withdrawn, retained as a record) and ADR-006 (Accepted 2026-09-29, superseding its own Proposed text). ADR-005 is withdrawn: the
    measured 9.92MB binary refuted the hypothesis (section 11).
 4. **CI.** `.github/workflows/ci.yml` running the section 5.1 checklist is the one section 12
    commitment with nothing behind it. Every push so far has been self-verified by hand, and
@@ -1023,8 +1030,12 @@ amendment queue:
 4. **§4.1's coverage floors are keyed to client directory names** (`core/`, `network/`,
    `state/`, `db/`) and so do not obviously cover `sh_nexus_wire` or `sh_nexus_server`. This plan
    extends them (§10); the constitution should say so.
-5. **§7.3's "uniform row estimator"** is likely wrong for chat lists with variable-height
-   content. ADR-006 proposes the amendment; §8 Phase 2 complies in the meantime.
+5. **CLOSED — §7.3's "uniform row estimator" was wrong for chat lists with variable-height
+   content, and ADR-006 amends it.** The defect was open through all of Phase 1 and is now
+   settled on verified evidence rather than judgement: at the pinned `rev e683fd7` GPUI
+   ships `elements/list.rs` for *"a large number of differently sized elements"*,
+   `uniform_list.rs` points readers to it, and Zed's own chat panel (`agent.rs`) uses it.
+   §8 Phase 2 builds on that, and every other list keeps the strict uniform estimator.
 6. **§6.1's note "GPUI statically links the renderer" is factually false on Windows.** Phase 0
    measured a 9.92 MB release binary — 3× under §6.1's own 30 MB maximum — and confirmed
    `gpui_windows` is pure Rust over the `windows` crate with a hand-written D3D11 renderer, with

@@ -16,7 +16,7 @@
 //! | | Holds because | Fails as |
 //! |---|---|---|
 //! | A worker thread cannot call `cx.update_global` | `Context<'a, T>` holds `&'a mut App` (`gpui/src/app/context.rs:22`), and `App` holds `Weak<AppCell>` (`gpui/src/app.rs:748`), `Rc<dyn Platform>` (`gpui/src/app.rs:749`) and `Rc<ActionRegistry>` (`gpui/src/app.rs:752`), so `App` and therefore `Context` are `!Send` | a compile error — asserted in `tests/bridge.rs` both ways, and demonstrated as a `compile_fail` doctest on [`install`] |
-//! | `AppState` is only ever read and written on the main thread | **nothing in the type system.** See `state/app_state.rs` module docs §3 | no *type* detects it. A scanner catches a second **constructor**; a module **handed** a state by value does not |
+//! | `AppState` is only ever read and written on the main thread | **nothing in the type system.** See `state/app_state.rs` module docs §3 | no *type* detects it. Two scanners make every shape that *owns* the state a build failure, and the remaining shape is a closure outliving `try_read` |
 //!
 //! **So the second row is still a rule, and this file cannot promote it to a
 //! type.** What this file does is remove every *other* way to reach the state:
@@ -31,14 +31,22 @@
 //! **The residual gap, stated exactly rather than rounded off.** `AppState` is
 //! `Send + Sync` and its constructor is `pub`, so a `db/`, `network/` or
 //! `platform/` module that built its *own* state and applied events to it off the
-//! main thread would still compile — nothing in the type system objects, and
-//! nothing here prevents it. What 1E-2 does about that is not a type but a
-//! scanner: `only_the_bridge_constructs_an_application_state` in
-//! `crates/sh_nexus/tests/bridge.rs` fails the build when a second module
-//! constructs one. **The honest residue is a module that is *handed* a state by
-//! value**, which no scanner here would see; that is 1E-1's gap, still open, and
-//! narrowing it further would mean making `AppState::new` crate-private, which
-//! is a change to a file this work unit does not own.
+//! main thread would still compile — nothing in the type system objects.
+//!
+//! **Both halves of that are now build failures, and neither is a type.** Two
+//! scanners in `crates/sh_nexus/tests/bridge.rs` close it:
+//! `only_the_bridge_constructs_an_application_state` fails on a second
+//! *constructor*, and `no_module_outside_state_names_the_state_type` fails on
+//! *any* mention of the type outside `src/state/` — which forecloses holding one
+//! as a field or borrowing it mutably in the same rule. The second scanner's doc
+//! records why the obvious alternative, a crate-private constructor, would have
+//! been wrong.
+//!
+//! **What that still does not make true is that the confinement is a type
+//! property.** It is not, and the remaining shape is narrow: `try_read` lends an
+//! `&AppState` to a closure, and that borrow is main-thread only because
+//! `&App` is. A closure that outlived the call is the next thing to rule out, and
+//! it is not what these guards rule out.
 //!
 //! # 2. Why the event travels as `Send` and the state does not
 //!

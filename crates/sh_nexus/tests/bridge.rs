@@ -1275,6 +1275,112 @@ fn only_the_bridge_constructs_an_application_state() {
     );
 }
 
+/// The state cannot be *handed* to a module outside `state/`, and this is the
+/// half of the guarantee the scanner above says it does not close.
+///
+/// `only_the_bridge_constructs_an_application_state` is explicit about its own
+/// limit: *"a module that received one by value would still compile, and nothing
+/// here would see it."* That is the residual gap `docs/ARCHITECTURE.md` ADR-009
+/// names as the correct next step, and **this is that step.** ADR-009 proposed
+/// closing it by making `AppState::new` crate-private. That answer turns out to
+/// be the wrong shape, for a reason the proposal could not have known: the
+/// integration tests in `tests/` are a *separate crate*, so a crate-private
+/// constructor would break the six call sites in `tests/state_actions.rs` that
+/// legitimately build a state to drive `actions::apply_event` with. Making the
+/// constructor private would have moved the gap, not closed it.
+///
+/// **The rule is therefore "no file under `src/` outside `state/` may name the
+/// type",** which is one condition rather than three, and it closes all three
+/// doors at once: constructing one, holding one as a field, and taking `&mut`
+/// to one. It needs no visibility change, so the external test API is untouched.
+///
+/// **What it still does not claim.** `AppState` is `Send + Sync` as a matter of
+/// fact, and `bridge::try_read` hands out an `&AppState` to a closure. That
+/// borrow is main-thread by construction — `try_read` takes `&App`, and `&App`
+/// is only obtainable from a main-thread context — so a closure that outlived
+/// the call is the next thing to rule out, and it is not what this test rules
+/// out. What this test rules out is **owning** the state off the main thread,
+/// which is the shape a `ui/` view struct would take if someone wired one by
+/// hand.
+#[test]
+fn no_module_outside_state_names_the_state_type() {
+    let state_dir = src_dir().join("state");
+    let mut offenders: Vec<(PathBuf, usize)> = Vec::new();
+
+    for file in rust_files_under(&src_dir()) {
+        if file.starts_with(&state_dir) {
+            continue;
+        }
+        let stripped = without_comments(
+            &fs::read_to_string(&file)
+                .unwrap_or_else(|error| panic!("{} should be readable: {error}", file.display())),
+        );
+        for (index, line) in stripped.lines().enumerate() {
+            if line.contains("AppState") {
+                offenders.push((file.clone(), index + 1));
+            }
+        }
+    }
+
+    assert_eq!(
+        offenders,
+        Vec::<(PathBuf, usize)>::new(),
+        "only files under src/state/ may name `AppState`. Anywhere else, the type is \
+         reachable off the main thread: a `ui/` view that holds one as a field owns a \
+         copy of the application state, and `AppState`'s mutators are `pub(crate)`, so \
+         that copy can be mutated from any thread while the bridge believes the \
+         single-thread invariant in state/app_state.rs module docs section 3 still \
+         holds. Read the state through `bridge::try_read` and mutate it through the \
+         named doors; those are the only ways to touch it."
+    );
+}
+
+/// The rule above is not vacuous: it rejects the three doors it claims to.
+///
+/// A scanner that passes because its token never appears in the tree is a
+/// scanner that has not been tested, and the three shapes below are exactly what
+/// `ui/` would be tempted to write. This is the control
+/// `core_admits_serde_json_and_still_rejects_serde` established for the
+/// boundary scan, applied here.
+#[test]
+fn the_state_naming_rule_rejects_a_holder_a_mutator_and_a_constructor() {
+    // Each sample is the code a view module would contain, not prose about it.
+    let samples = [
+        ("a struct field", "struct MessageList { state: AppState }"),
+        ("a by-value parameter", "fn render(state: AppState) {}"),
+        ("a mutable borrow", "fn bump(state: &mut AppState) {}"),
+        ("a construction", "let s = AppState::new(\"u_me\");"),
+        (
+            "a heap box",
+            "let s: Box<AppState> = Box::new(AppState::new(\"u\"));",
+        ),
+    ];
+
+    for (what, code) in samples {
+        assert!(
+            without_comments(code).contains("AppState"),
+            "the control sample for {what} no longer contains the token, so the rule \
+             has stopped being tested by it: {code}"
+        );
+    }
+
+    // And the legitimate cases must NOT trip it, or the rule is too broad to be
+    // worth having: prose about the state, and a file inside `state/`.
+    for (what, code) in [
+        (
+            "a doc comment",
+            "/// `AppState`'s unread rule excludes our own messages.",
+        ),
+        ("a normal comment", "// AppState is main-thread-owned."),
+    ] {
+        assert!(
+            !without_comments(code).contains("AppState"),
+            "{what} mentioning AppState must not trip the rule, or every file that \
+             talks about the state in prose fails: {code}"
+        );
+    }
+}
+
 /// `network/` cannot reach the main-thread context, by name.
 ///
 /// **A second, narrower guard than the one above, and it is not redundant.** The

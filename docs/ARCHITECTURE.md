@@ -460,102 +460,154 @@ tested before it gets obeyed.
 
 ### ADR-006 — Row estimator for the virtualized message list
 
-**Status:** **Proposed — NOT ACCEPTED. Not in force. Do not implement as settled.**
+**Status:** **Accepted.** Supersedes the Proposed text of 2026-09-27; the
+decision below is a different one, and the reason it is different is recorded in
+`#### Context` because the original premise turned out to be false.
 
-> Phase 2 has not started. This ADR is open for review. `PLAN.md` §8, Phase 2 states the
-> **compliance** plan below, which is what will be built in the meantime; that plan is not this ADR's
-> decision, and Phase 2 does not depend on this ADR resolving first.
+> **What changed, in one line:** this ADR was written assuming `UniformList` was
+> the only virtualized list available. At the pinned `rev e683fd7` it is not, and
+> the framework's own chat panel does not use it.
 
 #### Context
 
+**The premise this ADR originally rested on was wrong, and the correction is
+verifiable in the pinned revision.** GPUI ships **two** list elements, and they
+are not variants of one idea — they are answers to two different questions:
+
+| Component | What its own docs say | What Zed uses it for |
+|---|---|---|
+| `elements/uniform_list.rs` | *"A scrollable list of elements with **uniform height**… measures the first element and then lays out all remaining elements in a line based on that measurement… **only works for elements with uniform height**"* | `picker.rs` (18), `data_table.rs` (12), `git_graph.rs` (9), `lsp_store.rs` (9) |
+| `elements/list.rs` | *"A list element that can be used to render a large number of **differently sized** elements efficiently… If all of your elements are the same height, see `crate::UniformList` for a simpler API"* | **`agent.rs` (37) — Zed's chat panel**, `sidebar_tests.rs` (88), `persistence.rs` (58), `acp_thread.rs` (57) |
+
+`uniform_list.rs` points the reader at `List` for the other case, in its own
+documentation. **So the variable-height virtualized list is not something this
+project has to build; it is a component it already depends on, and the reference
+implementation of a chat list in the framework this project pins uses it.**
+
+**What that does to the original proposal.** The previous text offered a table of
+six alternatives, every one of which assumed the choice was between *strict
+uniform* and *build a measured-height overlay on top of it*. On that assumption
+the overlay was the honest answer and its cost had to be argued. **On the
+verified premise there is no overlay to build**, and proposing one would have
+been months of work re-deriving a component that already exists.
+
+**The conflict inside the constitution is real, and it is unchanged.** What
+changes is that it is now a conflict with a known resolution rather than an open
+design question.
+
 `AGENTS.md` §7.3 is explicit and mandatory:
 
-> "Virtualized lists: Message lists must render only visible items. **Use a uniform row estimator and
-> recycle.**"
+> "Virtualized lists: Message lists must render only visible items. **Use a uniform
+> row estimator and recycle.**"
 
-A **uniform** row estimator assumes every row is the same height. That assumption holds for a list of
-fixed-height items and is the standard, correct approach for one. It does not hold for a chat
-message list.
+A **uniform** row estimator assumes every row is the same height. That is correct
+for a list of fixed-height items. It does not hold for a chat message list.
 
-Markdown and code blocks make true message row heights **genuinely variable** within a single
-channel: a one-word message, a five-line paragraph, a fenced code block, a message with reaction chips
-underneath — all in the same viewport, all different heights, and none of them predictable from the
-message's metadata without laying the text out. Wrapping width alone makes height a function of
-viewport width, so heights are not even stable across window resizes.
+Markdown and code blocks make true message row heights **genuinely variable**
+within a single channel: a one-word message, a five-line paragraph, a fenced code
+block, a message with reaction chips underneath — all in the same viewport, all
+different heights, and none of them predictable from the message's metadata
+without laying the text out. **Wrapping width alone makes height a function of
+viewport width**, so heights are not even stable across window resizes.
 
-`AGENTS.md` §1 lists the project's core priorities in order, and the first is **Responsiveness**:
-"120fps UI, <16ms message render, **zero jank while receiving messages**." §6.2 sets scroll frame
-time at **<8ms** for 10k virtualized messages. A uniform estimator against variable-height content
-forces the scroll position to be computed from an assumption the data contradicts: the scrollbar
-thumb is wrong, `scroll_to` overshoots or undershoots, and a newly-arrived message lands at the wrong
-offset. That is visible jank, against the project's highest priority, caused by a rule written for a
-different data shape.
+`AGENTS.md` §1 lists the project's core priorities in order, and the first is
+**Responsiveness**: "120fps UI, <16ms message render, **zero jank while receiving
+messages**." §6.2 sets scroll frame time at **<8ms** for 10k virtualized messages.
+A uniform estimator against variable-height content forces the scroll position to
+be computed from an assumption the data contradicts: the scrollbar thumb is
+wrong, `scroll_to` overshoots or undershoots, and a newly-arrived message lands at
+the wrong offset. **One tall first row makes every subsequent row's position
+wrong** — that is not approximate, it is structurally incorrect rendering.
+That is visible jank, against the project's highest priority, caused by a rule
+written for a different data shape.
 
-This is a genuine conflict inside the constitution, not a preference: §7.3's uniform estimator
-directly threatens §1's zero-jank priority and §6.2's <8ms frame-time target. `AGENTS.md` §3.2
-already anticipates layer rules adapting to context; the same latitude is warranted here.
+This is a genuine conflict inside the constitution, not a preference: §7.3's
+uniform estimator directly threatens §1's zero-jank priority and §6.2's <8ms
+frame-time target. `AGENTS.md` §3.2 already anticipates layer rules adapting to
+context; the same latitude is warranted here.
 
 #### Decision
 
-**Pending. This ADR proposes, and does not decide.**
+**Build the message list on `gpui::List`, and amend `AGENTS.md` §7.3 to permit a
+measured-height estimator for lists whose content is variable-height.**
 
-The proposed decision, for review:
+1. **`List` for the message list.** It virtualizes — it renders only the visible
+   subset, which is §7.3's substantive requirement and the one that protects
+   memory against §2.3's "render 10,000 DOM-equivalent elements". It measures
+   real heights, so scroll position is correct rather than estimated.
+2. **`AGENTS.md` §7.3 is amended**, not overridden, to read: *"Use a uniform row
+   estimator and recycle; for lists whose content is genuinely variable-height,
+   a measured-height estimator is permitted."* The uniform estimator **stays
+   mandatory for every list that is uniform** — Zed's own pickers, tables, git
+   graph and LSP store are all uniform and all use `UniformList`, and this ADR
+   does not touch them.
+3. **Recycling is unaffected.** §7.3's recycle requirement stands as written and
+   is not in question. Only the height source changes.
+4. **Height changes must be reported.** `List` is explicit that *"clients… need
+   to ensure that elements outside of the scrolled area do not change their
+   height… If your elements do change height, notify the list element via
+   `ListState::splice` or `ListState::reset`."* Editing a message, a reaction
+   changing a chip row, or a markdown segment re-parsing all change a row's
+   height, and each is a `splice`. **This is a real obligation the previous
+   proposal did not have**, because the previous proposal did not know `List`
+   existed.
 
-1. **Implement the `AGENTS.md` §7.3 uniform estimator as the specified default and first-pass
-   fallback.** For every row that has not yet been rendered, the estimator's value is used. §7.3 is
-   complied with literally on first paint.
-2. **Layer measured per-row heights on top as a superset, once a row has actually been rendered.** A
-   row's measured height replaces the estimate in the height cache; the estimate remains the answer
-   for unmeasured rows. This is the standard measured/virtualized-list pattern — estimate, then
-   correct — and it is a **superset of §7.3, not an override of it**: §7.3's estimator remains the
-   mechanism, and it remains the fallback.
-3. **Recycling is unaffected.** §7.3's recycle requirement stands as written and is not in question.
-   Only the height source changes.
-4. **This ADR proposes amending `AGENTS.md` §7.3** to say "a uniform row estimator, refined by
-   measured heights where available" for lists whose content is variable-height, and to keep the
-   strict uniform estimator for genuinely uniform lists.
+**Why the amendment is the honest framing rather than a convenience:** §7.3's
+substantive requirement is *"render only visible items"*, and `List` satisfies it.
+The word *"uniform"* is the part that is wrong, and it is wrong for a reason the
+framework's own authors documented and then routed their chat panel around. An
+ADR that proposes building a better version of a component the project already
+depends on is proposing avoidable work; an ADR that points at the component and
+proposes amending the rule it mis-specifies is proposing the actual fix.
 
-**Rationale for framing it as compliance rather than override:** point 1 satisfies §7.3 exactly as
-written. Point 2 adds a refinement that §7.3 does not prohibit — §7.3 mandates an estimator, not a
-prohibition on knowing better numbers. Whether that reading is acceptable is precisely what the
-review of this ADR is for, which is why it is Proposed and not Accepted.
+#### Consequences
 
-#### Consequences (of the proposed decision, if accepted)
-
-- **Scroll position becomes correct rather than approximate**, for the common case where a channel's
-  visible rows have been rendered at least once.
-- **First paint of a scrolled-to-middle channel remains estimate-based** — the accuracy of the
-  scrollbar before those rows have been seen is bounded by the estimator, exactly as §7.3 intends.
-  This is the residual cost of compliance, and it is the honest limit of the proposal.
-- **Window resizes invalidate measured heights**, since wrapping width changed. They must be
-  recomputed or discarded on resize; the estimate is the correct answer in the gap.
-- **The height cache must be bounded**, per `AGENTS.md` §7.1's prohibition on unbounded in-memory
-  growth. A 10,000-message channel must not retain 10,000 measured heights indefinitely.
-- **§6.2's <8ms scroll frame time becomes measurable for the first time**, since correct scroll
-  position is a precondition for the measurement to mean anything.
-- **If this ADR is rejected**, the uniform estimator stands as written and §1's zero-jank priority is
-  at risk for variable-height content. That is a legitimate outcome and would be an explicit decision
-  to accept a known trade-off — but it should be a decision, not a default.
-
-**Open questions for review:**
-
-- Does the "superset, not override" reading of §7.3 hold, or is any estimator refinement an override?
-- Should measured heights be keyed by viewport width, and discarded on resize?
-- What is the correct bound and eviction policy for the height cache?
-- Does §7.3 need a carve-out for variable-height lists, or is a general rewrite cleaner?
+- **Scroll position becomes correct**, for every row, from first paint, not only
+  after a row has been seen once. The previous proposal's residual cost —
+  *"first paint of a scrolled-to-middle channel remains estimate-based"* — is
+  **eliminated**, not accepted.
+- **`List` is the slower of the two.** `uniform_list.rs` says so directly: it
+  exists to avoid *"the full taffy layout system"* because that *"is much faster
+  but only works for elements with uniform height"*. §6.2's **<8ms** scroll
+  frame time at 10k messages is therefore the thing to measure first, and it is
+  the measurement Phase 2 owes `docs/BASELINES.md`. **If `List` misses the
+  budget, the answer is not to go back to a uniform estimator** — a uniform
+  estimator on chat content is incorrect, not merely slow — but to raise the
+  budget with evidence, as ADR-005 refused to lower it without one.
+- **A height cache is not needed, and that removes a whole class of problem.**
+  The previous proposal had to specify a bound and an eviction policy for
+  measured heights, and had to discard them on resize. `List` keeps its own
+  layout state intrusively on the view, *"so that your code can coordinate
+  directly with the list element's cached state"*. §7.1's prohibition on
+  unbounded growth is the component's problem now, not a design decision this
+  project has to get right.
+- **Responsibility shifts to the caller.** `List` is not a pure virtualizer: it
+  requires the caller to keep a row's height stable or report the change. Every
+  height-mutating action in `state/actions.rs` and `core/markdown.rs` now has a
+  corresponding `splice`, and forgetting one produces a list that slowly drifts
+  out of alignment — a new failure mode that did not exist under
+  `uniform_list`, which is worth naming as the cost.
+- **§6.2's <8ms scroll frame time becomes measurable for the first time.**
 
 #### Alternatives considered
 
-| Option | Why not chosen (yet) |
+| Option | Why not chosen |
 |---|---|
-| **Strict uniform estimator**, as §7.3 says | Correct for fixed-height lists; wrong for chat content. Kept as the specified default and first-pass fallback under the proposal, and it is the fallback if this ADR is rejected. Rejecting it outright now would be a decision taken without Phase 2 evidence. |
-| **Measure everything up front** — lay out and measure all N rows before the first paint | Correct scroll position immediately, and correct for every row. Rejected on performance: it is O(N) layout work on channel switch, against §6.2's <100ms cold channel-switch budget for 500 messages, and it is exactly the "render 10,000 elements" anti-pattern §2.3 forbids. |
-| **No estimator; virtualize on a measured-only basis** | Cannot scroll to an unrendered row at all, because the position is unknown. Rejected: a list you cannot scroll through is not a list. |
-| **A per-content-class estimator** (one estimate for text, one for code blocks, one for reactions) | Genuinely better than a single uniform value, and a plausible refinement. Not proposed here because it is a bigger change to §7.3 than the amendment this ADR requests, and it presumes a content-classification step that `core/markdown.rs` has not yet produced. Revisit after Phase 2 has real measurements. |
-| **Ignore variable heights** and normalize every message bubble to a fixed height | Avoids the problem by removing the feature. Rejected: `AGENTS.md` §10 and §4.2 require Markdown and code-block rendering, so variable height is a requirement, not an accident. |
-| **Defer entirely** until Phase 2 shows measurable jank | Rejected as a default. §1's zero-jank priority is stated as a priority, not a nice-to-have, and "measure first" applies to the *magnitude* of the problem, not to whether a known-correctness gap in scroll positioning is worth writing down while it is still cheap to change. |
+| **`UniformList` + a measured-height overlay** (the previous proposal) | **Rejected on a verified premise, not on judgement.** It was a plan to re-derive a component the project already depends on. Its problem — the estimate is wrong until a row has been seen — is `List`'s absence rather than a gap to fill. |
+| **Strict uniform estimator**, as §7.3 says | Correct for fixed-height lists; wrong for chat content, structurally. A tall first row misplaces every row after it. Kept as mandatory for genuinely uniform lists by decision 2. |
+| **Measure everything up front** — lay out all N rows before first paint | Correct position immediately, and correct for every row. Rejected on performance: O(N) layout work on channel switch, against §6.2's <100ms cold channel-switch budget for 500 messages, and it is exactly the "render 10,000 elements" anti-pattern §2.3 forbids. This is also what `List` avoids by measuring lazily. |
+| **A per-content-class estimator** (one for text, one for code blocks, one for reactions) | Genuinely better than a single uniform value. **Obsolete**: `List` measures the real thing rather than estimating it by class, so there is no class to infer. |
+| **Ignore variable heights**, normalizing every bubble to a fixed height | Avoids the problem by removing the feature. Rejected: §10 and §4.2 require Markdown and code-block rendering, so variable height is a requirement, not an accident. |
+| **Defer until Phase 2 shows measurable jank** | Rejected. §1's zero-jank priority is stated as a priority, not a nice-to-have, and this ADR now has a verified answer rather than a preference to test. |
 
----
+#### Amendment filed
+
+`AGENTS.md` §7.3 is amended as stated in decision 2. The amendment is one clause
+long and changes no other list in the project. **Every list this ADR does not
+name — the sidebar, the channel list, the Ctrl+K switcher — has genuinely
+uniform rows and keeps the strict uniform estimator.** Those are `UniformList`
+rows, which is what the framework's own pickers and tables are.
+
 
 ### ADR-007 — Deferring the `#[from]` error payloads in `ShNexusError`
 
@@ -892,12 +944,31 @@ permission to stop holding it. It would sit in front of every state mutation, on
 the path `AGENTS.md` 6.2's 8ms scroll-frame budget measures. And it would need a
 poisoning policy, which 2.1 forbids a module like this from having.
 
-**The residual gap is named, not rounded off.** What the type system still does
-not catch is a module that is *handed* an `AppState` by value. A scanner cannot
-see that either. Closing it would mean making `AppState::new` crate-private,
-which is a change to a file this work unit does not own, so it stays open and
-recorded. 1E-2's contribution is that the gap is now **one crossing rather than
-many**.
+**The residual gap was named here, and is now closed. Both the closure and the
+reason this ADR's own proposed answer was wrong are worth keeping.**
+
+ADR-009 left open the case of a module that is *handed* an `AppState` by value,
+and proposed closing it by making `AppState::new` crate-private. **That answer
+would have moved the gap rather than closing it:** the integration tests in
+`tests/` are a *separate crate*, so a crate-private constructor breaks the six
+call sites in `tests/state_actions.rs` that legitimately build a state to drive
+`actions::apply_event` with.
+
+**What closed it instead is one condition, not a visibility change:** no file
+under `src/` outside `state/` may name the type `AppState` at all
+(`no_module_outside_state_names_the_state_type` in `tests/bridge.rs`). That
+forecloses all three doors in one rule — constructing one, holding one as a
+field, and taking `&mut` to one — and it leaves the external test API untouched.
+The rule is verified to fire by a mutation, not merely to pass.
+
+**What still stands open is narrower, and it is not "nothing".** The confinement
+is now a build failure for every shape that *owns* the state off the main
+thread. It is still not a type-level guarantee: `AppState` is `Send + Sync` as a
+matter of fact, and `bridge::try_read` hands an `&AppState` to a closure. That
+borrow is main-thread by construction, so a closure outliving the call is the
+next shape to rule out — and it is not what these guards rule out. Closing that
+too would mean changing what `try_read` hands out, which is a different
+decision about a different file.
 
 **The queue is bounded, and its cost is declared.** `AGENTS.md` 7.1 forbids
 unbounded in-memory state, and an unbounded `mpsc::channel` would break it in the
