@@ -1,0 +1,50 @@
+# Dependency updates for a Cargo workspace.
+#
+# The dependency surface is small and audited: the root `Cargo.toml` holds the
+# 11 direct dependencies and documents each one against `AGENTS.md` 7.2's five
+# criteria, with the full table in `docs/DEPENDENCIES.md`. Dependabot does not
+# change that review, it only surfaces candidates -- and with a weekly schedule
+# the pull requests arrive in batches small enough to actually read.
+#
+# Weekly, not daily. This project pins GPUI to an exact upstream `rev` and syncs
+# it deliberately; a daily cadenza on 675 transitive packages would bury the
+# signal, and `AGENTS.md` 7.2's criteria require a human judgement per version,
+# not a merge queue.
+#
+# Direct dependencies are grouped apart from the rest so that an upstream GPUI
+# bump -- the one update that can change behaviour, licence or compile time
+# materially -- is visibly separated from a patch bump in `serde`.
+version: 2
+
+updates:
+  # GPUI and gpui_platform, pinned to a Zed `rev`. An update here is the only one
+  # that can move `AGENTS.md` 6.1's binary size or 6.2's frame figures, so it is
+  # grouped alone rather than buried among the other direct dependencies.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    groups:
+      gpui-pin:
+        patterns:
+          - "gpui"
+          - "gpui_platform"
+
+  # The remaining direct dependencies, whose per-version justification is
+  # recorded in the root `Cargo.toml` comments and `docs/DEPENDENCIES.md`.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      direct-deps:
+        dependency-type: direct
+    ignore:
+      # GPUI is not on crates.io -- it is a git dependency on Zed's monorepo --
+      # so Dependabot will never propose a version for it. Listed here so the
+      # intent is recorded rather than inferred from its absence.
+      - dependency-name: gpui
+      - dependency-name: gpui_platform
+      - dependency-name: sh_nexus_wire
