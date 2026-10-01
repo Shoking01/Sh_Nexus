@@ -98,6 +98,24 @@ pub struct MessageList {
     /// The item count last reconciled with the state, so a change can be routed
     /// as an insertion, a removal, or nothing at all.
     count: usize,
+    /// The `client_msg_id` the shown channel's head row had when this list last
+    /// reconciled, so a **head** eviction can be told from a tail change.
+    ///
+    /// `None` whenever there is no anchor worth protecting: nothing shown, no
+    /// state, or a first frame. See [`MessageList::sync`], which is the method
+    /// that reads this field and the reason it exists — `AGENTS.md` §7.1's
+    /// history bound evicts the oldest row, and a list that ignored where the
+    /// removal happened would move the content under a reader scrolled into
+    /// history.
+    head: Option<Uuid>,
+    /// The `client_msg_id` that was under the scroll position when this list last
+    /// reconciled — **the reader's anchor, remembered rather than re-read.**
+    ///
+    /// See [`MessageList::reanchor`] for why the *previous* frame's identity is
+    /// the one that has to be kept: the state has already been applied by the
+    /// time a frame runs, so the row now at the scroll top is the row that slid
+    /// into it.
+    anchor: Option<Uuid>,
     /// Rows whose content changed while rendering, waiting to be remeasured.
     ///
     /// See the module docs: a `remeasure_items` from inside the render closure
@@ -148,6 +166,8 @@ impl MessageList {
             channel: None,
             colors: Colors::default(),
             count: 0,
+            head: None,
+            anchor: None,
             pending_remeasure: Vec::new(),
         }
     }
@@ -262,6 +282,12 @@ impl MessageList {
         // is keyed by `client_msg_id`, which is global, so a row that comes back
         // is the same row (`docs/ARCHITECTURE.md` ADR-006, step 3).
         self.pending_remeasure.clear();
+        // The head and the anchor are a different channel's now, so a comparison
+        // against either would be evidence of nothing. `reset` puts the list at
+        // the end sentinel and `List` re-anchors there itself; there is no
+        // position to carry over.
+        self.head = None;
+        self.anchor = None;
         self.list.reset(self.count);
         // A gesture that changes what is on screen has to ask for a frame.
         // `reset` changes the list's state, not GPUI's: nothing else in this
@@ -283,6 +309,44 @@ impl MessageList {
     /// scroll position and is what a new message is; `reset` discards the
     /// measurements and is what *different messages* are.
     ///
+    /// # The scroll anchor, which is not the count
+    ///
+    /// [`MAX_MESSAGES_PER_CHANNEL`](crate::state::MAX_MESSAGES_PER_CHANNEL) makes
+    /// a full channel lose its **oldest** row, and every index below the head
+    /// shifts down by one. Reconciling the *count* does nothing about that: at
+    /// the cap, an arrival is one insertion and one eviction, so `count` is
+    /// unchanged, the `Ordering::Equal` arm below runs, and a reader scrolled into
+    /// history would watch the content move up one row for every message that
+    /// arrives. That is the defect this section exists to prevent.
+    ///
+    /// **The anchor is an identity, and it is restored by identity.** Each frame
+    /// the list reads the `client_msg_id` of the row at its own scroll top and
+    /// remembers the head's; when the head's identity has changed — which is the
+    /// eviction signal, and is a property of the *state* rather than of anything
+    /// the reader did — it asks the state where the anchored row now sits and
+    /// moves the scroll position to match. So the row the reader was looking at
+    /// stays under the reader, and by how much it moved is the state's answer
+    /// rather than a number inferred from a count.
+    ///
+    /// **The whole thing is skipped while the reader is following the tail.** The
+    /// list is pinned to the newest message, there is no row to hold still, and
+    /// `List` re-anchors itself at the end sentinel
+    /// (`gpui/src/elements/list.rs:1211-1218`) — `scroll_to` would call
+    /// `stop_following` and fight it. The head is still *recorded* on those
+    /// frames, so a reader who scrolls up and is then evicted is re-anchored on
+    /// the very next arrival rather than the one after.
+    ///
+    /// **The two costs are stated rather than assumed.** Each of the two reads is
+    /// a `try_read` of a `Uuid` and an `Option<usize>`, so both are O(1) hash
+    /// probes and neither is `AGENTS.md` §2.3's O(n) in the frame loop. And the
+    /// *heights* of off-screen rows are not corrected: the rows shifted down by
+    /// one, so a cached measurement now describes the message above it, and the
+    /// scrollbar is fractionally wrong until those rows are scrolled into view
+    /// and remeasured. The visible range is not affected —
+    /// [`MessageList::render_row`] sees a different spec for every shifted index,
+    /// records it, and [`MessageList::flush_remeasures`] remeasures that range in
+    /// the same frame.
+    ///
     /// **This never calls `cx.notify()`.** It runs at the top of every render,
     /// so notifying here would mark the view dirty during its own frame and ask
     /// for another one, forever — a redraw loop that also means
@@ -291,7 +355,8 @@ impl MessageList {
     pub fn sync(&mut self, cx: &mut Context<Self>) -> usize {
         self.flush_remeasures();
 
-        let count = match self.channel.clone() {
+        let channel = self.channel.clone();
+        let count = match channel.clone() {
             Some(channel) => self.messages_in(&channel, cx),
             None => 0,
         };
@@ -302,7 +367,66 @@ impl MessageList {
             Ordering::Less => self.list.splice(count..self.count, 0),
         }
         self.count = count;
+        self.reanchor(&channel, cx);
         count
+    }
+
+    /// Keeps the row the reader is looking at under the reader across a head
+    /// eviction. See [`MessageList::sync`], which is where this is explained.
+    ///
+    /// **The anchor has to be remembered from the *previous* frame, because by
+    /// the time this runs the eviction has already happened.** The state is
+    /// applied on the main thread by `bridge::drain` before any frame is drawn,
+    /// so reading "which row is at the scroll top" now returns the row that
+    /// *slid into* that position — the very shift being corrected. The list
+    /// therefore notes the identity under its scroll top on every frame and, on
+    /// the frame the head changes, asks the state where last frame's identity
+    /// ended up. Both halves are needed: the head identity is the *signal* that
+    /// indices moved, and the remembered anchor is the *thing* to move.
+    ///
+    /// **One `try_read` when there is nothing to do and two when there is.** The
+    /// head and the current anchor are two fields of one answer, so they are one
+    /// lease of the global; the second lease is the position lookup, and it is
+    /// only taken on a frame that actually evicted.
+    fn reanchor(&mut self, channel: &Option<String>, cx: &mut Context<Self>) {
+        let top = self.list.logical_scroll_top();
+
+        // `(None, None)` is the "nothing shown, or no state" case and also what a
+        // `show_channel` on an empty channel leaves behind. Neither is evidence
+        // of an eviction, and both are recorded, so the next frame has something
+        // real to compare against.
+        let (head, at_top) = match channel.as_deref() {
+            Some(channel) => bridge::try_read(cx, |state| {
+                let held = state.messages(channel);
+                (
+                    held.first().map(|message| message.client_msg_id),
+                    held.get(top.item_ix).map(|message| message.client_msg_id),
+                )
+            })
+            .unwrap_or((None, None)),
+            None => (None, None),
+        };
+
+        let evicted_head = head.is_some_and(|head| self.head.is_some_and(|last| last != head));
+        if !self.list.is_following_tail() && evicted_head {
+            // The remembered anchor, not `at_top`: if the row the reader was on is
+            // itself the row that was evicted there is nothing to preserve, and
+            // `position_of` answering `None` is the honest "leave them where they
+            // are" — they are at the head of what is left.
+            if let (Some(channel), Some(anchored)) = (channel.as_deref(), self.anchor) {
+                let moved =
+                    bridge::try_read(cx, |state| state.position_of(channel, &anchored)).flatten();
+                if let Some(at) = moved.filter(|at| *at != top.item_ix) {
+                    self.list.scroll_to(gpui::ListOffset {
+                        item_ix: at,
+                        offset_in_item: top.offset_in_item,
+                    });
+                }
+            }
+        }
+
+        self.head = head;
+        self.anchor = at_top;
     }
 
     /// Stops the list snapping to the newest message.

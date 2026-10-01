@@ -98,5 +98,6 @@ pub mod bridge;
 pub use crate::state::actions::{ApplyOutcome, IgnoreReason, SendOutcome};
 pub use crate::state::app_state::{
     AppState, DeliveryState, DifferingFields, SendFailure, DEFAULT_SEGMENT_CACHE_BUDGET,
-    DEFAULT_SEGMENT_CACHE_CAPACITY, MAX_TYPING_CHANNELS, MAX_TYPING_USERS_PER_CHANNEL,
+    DEFAULT_SEGMENT_CACHE_CAPACITY, MAX_MESSAGES_PER_CHANNEL, MAX_TYPING_CHANNELS,
+    MAX_TYPING_USERS_PER_CHANNEL,
 };

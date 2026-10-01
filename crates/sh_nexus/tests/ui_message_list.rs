@@ -47,7 +47,7 @@ use sh_nexus::core::models::events::{ConnectionState, DomainEvent};
 use sh_nexus::core::models::message::{Message, Reaction};
 use sh_nexus::core::theme::BuiltIn;
 use sh_nexus::state::bridge::{self, Delivery, EventSender};
-use sh_nexus::state::DeliveryState;
+use sh_nexus::state::{DeliveryState, MAX_MESSAGES_PER_CHANNEL};
 use sh_nexus::ui::markdown as ui_markdown;
 use sh_nexus::ui::views::message_list::MessageList;
 use sh_nexus::ui::views::message_row::{RowCache, RowSpec, MAX_RETAINED_ROWS};
@@ -336,6 +336,159 @@ fn only_visible_rows_are_built_and_a_row_can_be_located_off_the_tail(cx: &mut Te
     assert!(
         first.is_some_and(|bounds| bounds.size.height > px(0.)),
         "a row must have real bounds once the anchor is not the tail, got {first:?}"
+    );
+}
+
+/// A reader scrolled into history keeps the row they are looking at when the
+/// channel evicts its head.
+///
+/// **This is the UI consequence of `MAX_MESSAGES_PER_CHANNEL`, and the count is
+/// not what it is about.** At the cap an arrival is one insertion and one
+/// eviction, so the item count is *unchanged* — a test that asserted the count
+/// would pass on a list that moved the reader's content up one row for every
+/// message that arrived. So the assertion is on **which row is under the reader**:
+///
+/// 1. fill past the cap, so the head really is being evicted;
+/// 2. scroll into history, off the tail, and record the `client_msg_id` the
+///    reader is on by reading it back out of the list's own scroll offset;
+/// 3. deliver one more message, which evicts the head;
+/// 4. assert the anchored row is *still* the row at the list's scroll position —
+///    by identity, and by asking the state where that identity now sits.
+///
+/// **Step 2's read-back is what makes step 4 mean anything.** Asserting that
+/// `logical_scroll_top.item_ix` still equals some number would pass for a list
+/// that held the *index* still while the content under it changed — which is the
+/// exact defect. The identity is the thing that must not move.
+///
+/// **The evicted row is asserted to be gone too**, because a list that "kept the
+/// reader steady" by refusing to reconcile would also pass the identity check.
+#[gpui::test]
+fn a_reader_scrolled_into_history_keeps_their_row_when_the_head_is_evicted(
+    cx: &mut TestAppContext,
+) {
+    let sender = installed(cx);
+    let (view, cx) = cx.add_window_view(|_, cx| MessageList::new(cx));
+    connected(cx, &sender);
+
+    // One past the cap, so the last arrival evicts.
+    let total = MAX_MESSAGES_PER_CHANNEL + 1;
+    for n in 0..total as u128 {
+        delivered(
+            cx,
+            &sender,
+            DomainEvent::MessageReceived(stored(n, "a body long enough to be a row", n as i64)),
+        );
+    }
+    view.update_in(cx, |list, _window, cx| {
+        list.show_channel(CHANNEL, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |list, _| list.item_count()),
+        MAX_MESSAGES_PER_CHANNEL,
+        "the cap must have evicted on the way up, so the count is the cap and \
+         not the number delivered"
+    );
+
+    // Into history: pause following, and move the anchor well away from both
+    // ends so a one-row shift in either direction is unambiguous.
+    let anchor_ix = 5_000;
+    view.update_in(cx, |list, _window, cx| {
+        list.pause_following_tail(cx);
+        list.list_state().scroll_to(gpui::ListOffset {
+            item_ix: anchor_ix,
+            offset_in_item: px(0.),
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        !view.read_with(cx, |list, _| list.is_following_tail()),
+        "the reader must be off the tail for this to be a scroll-anchor question"
+    );
+
+    // Read the anchored identity back out of the list's own offset, and
+    // confirm the state agrees about where it is. One `read_with`, so the list
+    // and the state are read at the same instant and the pair cannot disagree
+    // because the world moved between them.
+    let (top_before, anchored_id) = view.read_with(cx, |list, app| {
+        let top = list.list_state().logical_scroll_top();
+        let held = bridge::try_read(app, |state| {
+            state
+                .messages(CHANNEL)
+                .get(top.item_ix)
+                .map(|message| message.client_msg_id)
+        })
+        .flatten();
+        (top, held)
+    });
+    let anchored_id = anchored_id.expect("the anchored row must be a held message");
+    assert_eq!(
+        cx.read(
+            |app| bridge::try_read(app, |state| { state.position_of(CHANNEL, &anchored_id) })
+                .flatten()
+        ),
+        Some(top_before.item_ix),
+        "the fixture must be coherent before the assertion means anything: the \
+         identity at the list's scroll offset is the one the state places there"
+    );
+
+    // One more arrival: over the cap again, so the head is evicted.
+    delivered(
+        cx,
+        &sender,
+        DomainEvent::MessageReceived(stored(total as u128, "one more than the cap", total as i64)),
+    );
+    view.update_in(cx, |_list, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    let (top_after, at_top_after) = view.read_with(cx, |list, app| {
+        let top = list.list_state().logical_scroll_top();
+        let held = bridge::try_read(app, |state| {
+            state
+                .messages(CHANNEL)
+                .get(top.item_ix)
+                .map(|message| message.client_msg_id)
+        })
+        .flatten();
+        (top, held)
+    });
+
+    assert_eq!(
+        at_top_after,
+        Some(anchored_id),
+        "the row under the reader must be the row they were reading. Evicting \
+         the head shifts every index below it by one, so holding the *index* \
+         would leave the reader looking at the next message down"
+    );
+    assert_eq!(
+        top_after.item_ix,
+        top_before.item_ix - 1,
+        "and the offset itself moved by exactly the one row the eviction took"
+    );
+    assert_eq!(
+        top_after.offset_in_item, top_before.offset_in_item,
+        "with the pixel offset inside the row untouched, so the reader's place \
+         in the message they were reading is the same place"
+    );
+    assert_eq!(
+        view.read_with(cx, |list, _| list.item_count()),
+        MAX_MESSAGES_PER_CHANNEL,
+        "and the count is reconciled, or the identity check would pass for a \
+         list that simply stopped counting"
+    );
+    // An identity rather than a `&Message`: `bridge::try_read` hands out a borrow
+    // of the state, and a borrow cannot outlive the `read` that produced it.
+    assert_eq!(
+        cx.read(|app| {
+            bridge::try_read(app, |state| {
+                state
+                    .message(CHANNEL, &cid(0))
+                    .map(|message| message.client_msg_id)
+            })
+            .flatten()
+        }),
+        None,
+        "while the row that was actually evicted is gone"
     );
 }
 

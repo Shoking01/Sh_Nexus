@@ -107,15 +107,15 @@ work units.
 
 | Metric | Value | Where |
 |---|---|---|
-| Tests | **890** unit/integration + **49** doctests = **939**, 0 failures | — |
+| Tests | **973** unit/integration + **49** doctests = **1 022**, 0 failures | — |
 | `core/` coverage | **97.76%** regions (floor: 90%) | `docs/COVERAGE.md` |
 | `state/` coverage | **98.16%** regions | `docs/COVERAGE.md` |
 | `state/bridge.rs` | **100%** (185/185 regions, 29/29 functions) | `docs/COVERAGE.md` |
 | Workspace coverage | **96.42%** regions | `docs/COVERAGE.md` |
-| Release binary | **10.85 MB** (was 10.80 MB before work unit 3B) | this file |
+| Release binary | **10.87 MB** (was 10.85 MB before work unit 3C) | this file |
 | Release build | **288 s** at `-j 6` | this file |
 | Dev build (warm) | 14 s | this file |
-| Source | 43 `.rs` files, +666 lines (`ui/views/input_bar.rs`, plus `app.rs` and the tests) | — |
+| Source | 53 `.rs` files, 37 403 lines (+941 this unit, work unit 3C) | — |
 | Direct dependencies | 12 rows | `docs/DEPENDENCIES.md` |
 | Idle RAM | **51.6 MB** empty / **64.4 MB** with 10k, bench shell only (floor) | this file, §"Measured: idle RAM" — added by work unit 2B |
 | Idle RAM, app level | **51.7 MB** empty / **64.5 MB** with 10k, real `app::Shell` | this file, §"Measured: idle RAM" — added with `--mode app` |
@@ -127,6 +127,29 @@ The coverage and test figures are re-derived from `cargo llvm-cov
 rules in `docs/COVERAGE.md` §5.5 — a percentage that disagrees with its own
 fraction survived four correct reconciliations in work unit 1D, so every number
 above is either measured here or points at the file where it is measured.
+
+**Work unit 3C — the history bound — grew the binary by 19,968 B, which is 0.02 MB
+and 0.18%, against §6.3's 5 MB threshold.** Measured: 11,373,568 B before,
+**11,393,536 B** after, same command and same machine. A `pub` constant, an
+eviction pass, two index-maintaining helpers, and eight tests cost about a
+fiftieth of the margin. **The figure that matters for this unit is not the size
+but the shape: nothing was added to a dependency graph and no crate was linked
+that was not already there**, so the cost is code rather than supply chain.
+
+**And the frame-time figure did not move, which is the number this unit could
+have broken.** `benches/frame_time.rs` seeds `MAX_MESSAGES_PER_CHANNEL` — it
+names the constant rather than restating 10 000, so the fixture is *exactly* the
+cap and the first insert past it is the first eviction. Run after the change,
+list mode: `draw_duration` p99 = **1.204 ms** over 1 030 scroll frames of 1 042
+(98.8%), against §6.2's `< 8 ms` and against the 1.087–1.740 ms range this file
+already records for list mode. The published measurement is therefore the point
+just before the first eviction, and the p99 is inside the same bracket as before.
+**Why it could not have moved is the point worth recording:** at the cap, an
+arrival is one insertion and one eviction, the item count is unchanged, and
+`MessageList::sync`'s extra work is two O(1) `try_read`s of a `Uuid` and an
+`Option<usize>` — a scroll frame is 1 042 of those before the reader scrolls a
+pixel. The eviction itself is on the *arrival* path, not the frame path, and the
+bench's scroll phase produces no arrivals at all.
 
 **The binary grew 0.86 MB in work unit 3A, and §6.3's justification threshold is
 5 MB.** Measured: 9,946,368 B before, 11,325,440 B after — **+899,072 B,
