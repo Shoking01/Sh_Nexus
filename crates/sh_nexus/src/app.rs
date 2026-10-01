@@ -137,10 +137,12 @@ use crate::UNSIGNED_IN_USER;
 /// **The same viewport ADR-006 step 6 measured, deliberately.**
 /// `benches/frame_time.rs` sizes its own window to this and says why: rows per
 /// frame — and therefore any frame-time figure — scale with viewport height, so a
-/// differently-sized window would make the pending re-measurement of
-/// `docs/BASELINES.md`'s app-level row incomparable with the floor already
-/// recorded. The spike's 480x320 is the number `frame_time.rs:255` rejected in
-/// writing, and repeating it here would repeat that mistake.
+/// differently-sized window would make a re-measurement of `docs/BASELINES.md`'s
+/// app-level row incomparable with the floor already recorded. The spike's
+/// 480x320 is the number that bench's `WINDOW_HEIGHT` rejected in writing, and
+/// repeating it here would repeat that mistake. **The equality is now checked by
+/// the compiler** — a `const` assertion in the bench fails the build if these two
+/// ever diverge — because a doc sentence is not a guarantee.
 pub const WINDOW_WIDTH: f32 = 1024.0;
 
 /// Height of the shell's window, in logical pixels. See [`WINDOW_WIDTH`].

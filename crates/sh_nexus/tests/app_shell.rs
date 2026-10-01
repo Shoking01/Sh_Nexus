@@ -605,9 +605,10 @@ fn escape_returns_the_list_to_the_newest_message(cx: &mut TestAppContext) {
 /// **Two claims that would otherwise be prose, and both have a failure mode that
 /// is silent.** A window at the spike's 480x320 would render four rows, so every
 /// frame-time figure taken against it would be about a different program — the
-/// mistake `benches/frame_time.rs:255` records in writing. And a startup channel id
-/// that looked like a real id would let a fixture quietly address the channel the
-/// application opens, at which point the placeholder stops being findable.
+/// mistake `benches/frame_time.rs`'s `WINDOW_HEIGHT` documentation records in
+/// writing. And a startup channel id that looked like a real id would let a
+/// fixture quietly address the channel the application opens, at which point the
+/// placeholder stops being findable.
 ///
 /// **The size check is a compile-time assertion, and that is clippy being right
 /// rather than clippy being in the way.** Both operands are `const`, so a runtime
