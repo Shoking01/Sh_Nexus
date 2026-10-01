@@ -139,6 +139,7 @@
 //! | [`drain`] | the caller that owns the schedule |
 //! | [`try_apply_event`] | one event, applied through [`actions::apply_event`] |
 //! | [`try_select_channel`], [`try_begin_send`] | the two user gestures `AGENTS.md` §8.1's flows need |
+//! | [`try_retry_send`] | the third user gesture: a failed send's badge. **It does not transmit** |
 //! | [`try_render_and_cache`], [`try_rendered`] | the parse on render, and the read that promotes it |
 //! | [`try_read`] | any read of the state |
 //!
@@ -153,6 +154,15 @@
 //! door, because no `DomainEvent` carries a channel list and `network/`'s REST
 //! client is Phase 4. Adding a door nothing calls is dead code with a doc
 //! comment, which is the shape of work that reads as finished and is not.
+//!
+//! **`actions::discard_failed_send` has no door either, and that one is a
+//! decision rather than a queue.** Its sibling above got a door because a badge
+//! wants a retry; this one removes a row the user wrote, and a destructive action
+//! reached by a stray click is worse than no affordance at all. A door here would
+//! also be a door with no caller, which is what the paragraph above rejects — so
+//! the absence is doubly deliberate, and `tests/layer_boundary.rs`
+//! (`the_destructive_discard_has_no_ui_caller`) is what keeps it honest instead
+//! of leaving it to the next reader's judgement.
 //!
 //! # 6. What this file does not decide
 //!
@@ -628,6 +638,44 @@ pub fn try_begin_send(
     }
     Some(cx.update_global::<AppStateGlobal, _>(|global, _| {
         actions::begin_send(&mut global.state, channel_id, content, client_msg_id, at)
+    }))
+}
+
+/// Puts a failed send back in flight, on the main thread.
+///
+/// A named door rather than a general one, for the reason in the module docs, §5:
+/// **the surface of ways to change this state is the audit trail.** This one is
+/// the gesture behind the failed-send badge, so its only caller is
+/// `MessageList::retry_failed_send`, and a second caller would have to justify
+/// itself here.
+///
+/// # This door does not transmit anything
+///
+/// [`actions::retry_send`] moves a send from
+/// [`DeliveryState::Failed`](crate::state::DeliveryState::Failed) to `Pending`
+/// and stops. There is no socket on this side of the seam — `network/` is not
+/// wired — and the outbox that would put a `Pending` send on a wire is `PLAN.md`
+/// §7's Phase 3 work. So a user who clicks retry watches the badge read
+/// `sending…`, and it stays there until an outbox exists to move it.
+/// **A caller that reported this door's success as "sent" would be reporting a
+/// transport that does not exist**, which is the failure this paragraph exists to
+/// prevent.
+///
+/// # Errors
+///
+/// `None` when the state is not installed. A send this client does not hold is an
+/// [`ApplyOutcome`] refusal per `actions.rs` module docs §1. So is a send that is
+/// no longer
+/// [`Failed`](crate::state::DeliveryState::Failed) — the server's ACK may land
+/// between the frame that painted the badge and the click that hits it — and that
+/// refusal is the correct answer rather than an error: there is nothing left to
+/// retry, and the row is already right.
+pub fn try_retry_send(cx: &mut App, client_msg_id: Uuid) -> Option<ApplyOutcome> {
+    if !is_installed(cx) {
+        return None;
+    }
+    Some(cx.update_global::<AppStateGlobal, _>(|global, _| {
+        actions::retry_send(&mut global.state, client_msg_id)
     }))
 }
 

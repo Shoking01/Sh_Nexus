@@ -32,17 +32,52 @@
 //! and `tests/bridge.rs` fails the build on a view that names the state's type.
 //! A by-value spec is also what makes a row testable without a bridge at all:
 //! `RowSpec` is constructible from nothing but plain data.
+//!
+//! **A second field arrived in work unit 3D, and it is a handle to the *view*,
+//! not to the state.** [`MessageRow::owner`] is a
+//! `WeakEntity<MessageList>`: the list that owns this row, so a control the row
+//! draws has somewhere to dispatch to. It holds no application state, names no
+//! state type, and would survive every check above unchanged. The invariant it
+//! does not break is the one that was actually about safety.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use gpui::{div, prelude::*, AnyElement, App, Context, Entity, Render, Window};
+use gpui::{div, prelude::*, AnyElement, App, Context, Entity, Render, WeakEntity, Window};
 use uuid::Uuid;
 
 use crate::core::markdown::Document;
 use crate::state::DeliveryState;
+use crate::ui::views::message_list::MessageList;
 use crate::ui::{markdown, Colors};
+
+/// The debug selector the retryable badge records its bounds under.
+///
+/// A *static* selector, for the reason the row's own is static: `debug_bounds`
+/// takes `&'static str`, so a per-message key could never be queried. The headless
+/// test drives a single failed send, and one failed send is one badge.
+pub const RETRY_BADGE_SELECTOR: &str = "retry-badge";
+
+/// The element id the retryable badge carries.
+///
+/// **Load-bearing rather than decorative.** `.on_click` lives on
+/// `StatefulInteractiveElement`, so an element only reaches it through `.id(..)`
+/// — a plain `div()` cannot be clickable at all. And the id is unique per row
+/// without saying so: GPUI builds a global element id from the whole ancestor id
+/// stack, and every entity-rooted element pushes `ElementId::View(entity_id)`
+/// first (`gpui/src/element.rs::prepare_element_id`), so this constant in row A
+/// and this constant in row B are different elements.
+pub const RETRY_BADGE_ID: &str = "delivery-retry";
+
+/// The word the retryable badge carries.
+///
+/// **`retry`, and not "resend" or "send again", because it is the only word the
+/// client can keep.** [`crate::state::bridge::try_retry_send`] moves the send
+/// from `Failed` to `Pending` and stops — there is no socket on this side of the
+/// seam, and the outbox that would transmit it is Phase 3. "resend" would name a
+/// transport that does not exist.
+const RETRY_LABEL: &str = "retry";
 
 /// How many rows the cache keeps before evicting the oldest.
 ///
@@ -116,6 +151,26 @@ impl RowSpec {
             || self.reactions != other.reactions
             || !Arc::ptr_eq(&self.document, &other.document)
     }
+
+    /// Whether this row's delivery badge offers a retry.
+    ///
+    /// **On the spec rather than inside the render, and that placement is what
+    /// makes the rule checkable.** Whether a badge is a control is a fact about
+    /// the data the frame draws, and `RowSpec` is the complete statement of that
+    /// data — so a predicate living here can be asserted without a window. The
+    /// failure this guards against is a badge that *looks* clickable on a send
+    /// with nothing to retry (`Pending` has already asked, `Acked` is done), and
+    /// a rule that could only be reached by painting is a rule a test asserts
+    /// indirectly at best.
+    ///
+    /// [`DeliveryState::Failed`] and nothing else, which is also the only state
+    /// the seam's retry door accepts — see
+    /// [`try_retry_send`](crate::state::bridge::try_retry_send). So the set of rows
+    /// that *look* retryable and the set that are retryable are the same set, by
+    /// construction rather than by two literals happening to agree.
+    pub fn offers_retry(&self) -> bool {
+        matches!(self.delivery, Some(DeliveryState::Failed))
+    }
 }
 
 /// One row of the message list.
@@ -128,15 +183,56 @@ pub struct MessageRow {
     /// The palette the row draws with. Copied in, because `Colors` is `Copy` and
     /// a row outlives any borrow of the view that built it.
     colors: Colors,
+    /// The list this row belongs to, weakly.
+    ///
+    /// # Why this exists, when the row's invariant says it holds no state
+    ///
+    /// The design this implements said the badge's click listener could be built
+    /// in `MessageList::render_row` and handed down, on the grounds that
+    /// `render_row` already holds a `&mut MessageList`. **That is not where the
+    /// badge is built.** `render_row` returns `row.into_any_element()`, and the
+    /// badge is built inside [`MessageRow::render`], whose context is a
+    /// `Context<MessageRow>` — a listener written there reaches the row and
+    /// nothing above it. The alternative routes were a GPUI `Action` (dispatched
+    /// on the *focused* node's dispatch path, and the focused node here is the
+    /// composer, a sibling of this list) and a callback closure per row (an
+    /// allocation per cached row, 512 of them). A weak handle to the owner is the
+    /// third option, and it is the cheapest of the three.
+    ///
+    /// **What it is not.** It is a handle to the view that owns this row, not
+    /// state about the message: two rows of the same message would hold the same
+    /// value, and replacing the row's content cannot change it. So the invariant
+    /// above — *no reference into the application state, and no state type named*
+    /// — still reads exactly as it did before this field, and would still hold
+    /// with this field deleted.
+    ///
+    /// **Weak, so ownership is not a cycle.** The list holds
+    /// `Entity<MessageRow>` through [`RowCache`], so a strong handle back would
+    /// be a cycle. `WeakEntity::update` answers `Err` once the list is released,
+    /// which is the natural no-op for a click that arrives afterwards: a list that
+    /// is gone cannot have a live row inside it. `app.rs`'s drain pump reads the
+    /// same answer as the signal that the shell is gone.
+    owner: WeakEntity<MessageList>,
 }
 
 impl MessageRow {
-    /// Builds a row for `spec`.
+    /// Builds a row for `spec`, owned by `owner`.
     ///
-    /// No `Context` is taken: a row has no state of its own beyond its spec, so
-    /// there is nothing to register and nothing to focus.
-    pub fn new(spec: RowSpec, colors: Colors) -> Self {
-        Self { spec, colors }
+    /// **No `Context` is taken, and that is still true:** a row has no state of
+    /// its own beyond its spec and the handle back to its owner, so there is
+    /// nothing to register and nothing to focus. See [`MessageRow::owner`] for why
+    /// the handle exists, and for why it is not the state the sentence above rules
+    /// out.
+    ///
+    /// `owner` is fixed here and never updated, which is a consequence rather than
+    /// an oversight: a row belongs to exactly one list — the cache that holds it
+    /// — so there is no second owner to move it to.
+    pub fn new(spec: RowSpec, colors: Colors, owner: WeakEntity<MessageList>) -> Self {
+        Self {
+            spec,
+            colors,
+            owner,
+        }
     }
 
     /// What this row is currently showing.
@@ -237,6 +333,71 @@ impl MessageRow {
     /// the server has seen the message. Both are here, and `Acked` is the one
     /// state that draws nothing: a delivered message is the normal case, and a
     /// badge for it would be noise on every row.
+    ///
+    /// # A failed badge is a control, and the label is the honest one
+    ///
+    /// `PLAN.md` §7 says a terminally-failed send *"stays visible for retry"*.
+    /// Staying visible was already true; this is the half that was missing, and it
+    /// is the whole of work unit 3D. So the failed badge carries an `on_click` that
+    /// dispatches to the list, and the badge reads `failed: <the server's words>`
+    /// followed by **`retry`** in [`Colors::accent`] — the interactive colour, which
+    /// is what tells the reader which word is the affordance.
+    ///
+    /// **What the word does not promise.** The click moves the send to
+    /// [`DeliveryState::Pending`] and stops; there is no socket on this side of the
+    /// seam, so the badge immediately afterwards reads `sending…` and stays there
+    /// until the outbox exists to move it. `retry` is the only label the client can
+    /// keep — `resend` names a transport that does not exist — and the gap between
+    /// the label and the delivery is stated here and on
+    /// [`crate::state::bridge::try_retry_send`] rather than left for a user to
+    /// discover.
+    ///
+    /// **Cursor and hover are not decoration on a control drawn in `danger`.**
+    /// Without them the badge reads as static text that happens to be clickable,
+    /// which is a worse failure than no affordance: the user tries it, gets
+    /// nothing, and concludes the feature is broken. `bg` is the only property
+    /// that changes on hover, so pointing at the badge cannot re-measure the row
+    /// under the pointer — and [`MAX_RETAINED_ROWS`] rows are measured precisely
+    /// once each.
+    ///
+    /// # What this control deliberately does *not* advertise
+    ///
+    /// **There is no `Role::Button` here, and the omission is the point.** A role
+    /// is a claim about how assistive technology may operate the element, and this
+    /// element has exactly one activation route: a pointer click. Giving it
+    /// `Role::Button` without a focus handle (nothing to `track_focus`) and
+    /// without an `on_a11y_action` handler (the route an AT uses to synthesise a
+    /// click) would announce a button that does nothing for precisely the users the
+    /// role exists for. `accesskit`'s `Action::Click` handler cannot be exercised by
+    /// this crate's headless harness either — `Window::a11y.is_active()` is false
+    /// there — so shipping it would be shipping an untested activation path.
+    ///
+    /// **Which leaves the keyboard omission, and it is a real one.** `AGENTS.md`
+    /// §5.2 requires keyboard-only operation and this control does not meet it.
+    /// Delivering it is not a matter of adding a key handler here:
+    ///
+    /// - A keyboard-operable element needs a [`gpui::FocusHandle`] plus
+    ///   `track_focus` and `tab_stop`, and a `FocusHandle` is *state on the row* —
+    ///   the exact thing this file's constructor exists to avoid.
+    /// - A focus handle would have to survive `RowCache::evict`, and eviction
+    ///   happens at [`MAX_RETAINED_ROWS`]; a window left focused on a released
+    ///   row's handle is a dangling focus, not a lost keystroke.
+    /// - GPUI rebuilds the tab-stop map every painted frame from the handles that
+    ///   were actually painted (`window.rs` clears `tab_stops` before each frame
+    ///   and `div.rs` inserts into it during paint), so a row scrolled out of the
+    ///   overdraw loses its tab stop and takes the focus with it. A virtualized
+    ///   list needs a focus *model* — a selected row, or a retained handle — and
+    ///   this crate has none for rows anywhere.
+    /// - `on_key_down` on a row would in any case fire only for the focused
+    ///   node's dispatch path, so it needs the focus model before it needs the
+    ///   handler.
+    ///
+    /// So the two real options are a per-row focus handle with eviction-aware
+    /// focus management, or a list-level selection model that gives "the failed
+    /// send" an identity a key can name. **Both are designs this unit does not
+    /// have, and choosing between them is a decision with a real trade-off, so
+    /// this is recorded rather than picked.** `odd/tasks/3d-retry-failed-send.md`
+    /// and the work unit's report carry the same record.
     fn delivery_badge(&self) -> Option<AnyElement> {
         let colors = self.colors;
         let (label, color) = match self.spec.delivery? {
@@ -248,12 +409,59 @@ impl MessageRow {
             },
         };
 
+        // Only a failed send offers anything, and the decision is the spec's so a
+        // test can assert it without painting a row.
+        if !self.spec.offers_retry() {
+            return Some(
+                div()
+                    .text_sm()
+                    // Explicit, per AGENTS.md 7.3.
+                    .text_color(color)
+                    .child(label)
+                    .into_any_element(),
+            );
+        }
+
+        let owner = self.owner.clone();
+        let client_msg_id = self.spec.client_msg_id;
+
         Some(
             div()
-                .text_sm()
-                // Explicit, per AGENTS.md 7.3.
+                .id(RETRY_BADGE_ID)
+                // Records this element's bounds for the headless test, for the
+                // same reason the row records its own: `.id()` alone records
+                // nothing.
+                .debug_selector(|| RETRY_BADGE_SELECTOR.to_owned())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .rounded_sm()
+                // Explicit, per AGENTS.md 7.3. GPUI inherits nothing, so this
+                // sets the badge's own default and both children below set theirs
+                // again rather than relying on it.
                 .text_color(color)
-                .child(label)
+                .cursor_pointer()
+                // `bg` only, so hovering cannot change the badge's size — see the
+                // note above on remeasurement.
+                .hover(|style| style.bg(colors.surface))
+                .on_click(move |_event, _window, cx| {
+                    // `Err` is a released list, and there is nothing to retry
+                    // against: it cannot be holding the row that painted this
+                    // badge. Discarding the answer is the whole of the correct
+                    // behaviour — see `MessageRow::owner`.
+                    //
+                    // `retry_failed_send` reports whether the row now reads
+                    // `sending…`, and the list asks for its own frame from there.
+                    // This listener adds nothing, because a frame requested by the
+                    // list is the same frame the row's next render belongs to.
+                    let _ = owner.update(cx, |list, cx| {
+                        list.retry_failed_send(client_msg_id, cx);
+                    });
+                })
+                .child(div().text_color(color).child(label))
+                .child(div().text_color(colors.accent).child(RETRY_LABEL))
                 .into_any_element(),
         )
     }
@@ -326,14 +534,32 @@ pub struct RowCache {
     /// Insertion order, which is also the eviction order. A `VecDeque` because
     /// eviction is `pop_front` and insertion is `push_back`, both O(1).
     order: VecDeque<Uuid>,
+    /// The list these rows belong to, handed to every row the cache builds.
+    ///
+    /// **The cache is what builds rows, so the cache is what tells them who their
+    /// owner is.** Keeping it here rather than threading it through
+    /// [`RowCache::row`] as a parameter means the recycling rules stay testable
+    /// with a cache and nothing else, and it is the reason a caller has to *name*
+    /// an owner at construction instead of getting an inert cache by default —
+    /// see the removed `Default` impl below.
+    owner: WeakEntity<MessageList>,
 }
 
 impl RowCache {
-    /// An empty cache.
-    pub fn new() -> Self {
+    /// An empty cache whose rows belong to `owner`.
+    ///
+    /// **There is no `Default` impl, and work unit 3D removed one.** `Default`
+    /// would have to invent an owner, and the only handle it can invent is
+    /// `WeakEntity::new_invalid()` — a cache whose rows draw working controls that
+    /// dispatch nowhere. That is the worst of both worlds: it passes every
+    /// structural check and behaves like a bug. Naming the owner here makes the
+    /// dependency explicit, and a test that only wants to exercise eviction can
+    /// say so with `WeakEntity::new_invalid()` in full view of what it is doing.
+    pub fn new(owner: WeakEntity<MessageList>) -> Self {
         Self {
             rows: HashMap::new(),
             order: VecDeque::new(),
+            owner,
         }
     }
 
@@ -389,7 +615,7 @@ impl RowCache {
             return (existing.clone(), changed);
         }
 
-        let row = cx.new(|_| MessageRow::new(spec, colors));
+        let row = cx.new(|_| MessageRow::new(spec, colors, self.owner.clone()));
         self.order.push_back(key);
         self.rows.insert(key, row.clone());
         self.evict();
@@ -414,12 +640,5 @@ impl RowCache {
                 None => break,
             }
         }
-    }
-}
-
-impl Default for RowCache {
-    /// An empty cache, so a caller that needs no configuration can take it.
-    fn default() -> Self {
-        Self::new()
     }
 }

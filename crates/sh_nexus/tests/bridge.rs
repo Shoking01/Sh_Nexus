@@ -199,6 +199,7 @@ fn every_door_reports_a_missing_install_instead_of_panicking(cx: &mut TestAppCon
             bridge::try_begin_send(cx, CHANNEL, "hello", cid(1), at(0)),
             None
         );
+        assert_eq!(bridge::try_retry_send(cx, cid(1)), None);
         assert_eq!(bridge::try_render_and_cache(cx, cid(1), "body", 8), None);
         assert_eq!(bridge::try_rendered(cx, &cid(1)), Rendered::NotInstalled);
         assert_eq!(

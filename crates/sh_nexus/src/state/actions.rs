@@ -624,6 +624,35 @@ pub fn retry_send(state: &mut AppState, client_msg_id: Uuid) -> ApplyOutcome {
 /// removes are its own. The cached segments go with the row, because `AGENTS.md`
 /// §7.1 is a bound on memory and a dead parse is memory.
 ///
+/// # There is no UI for this, and that is a decision rather than an omission
+///
+/// **`retry_send` has a door in `state/bridge.rs` and a badge that reaches it;
+/// this has neither.** Work unit 3D settled that, and the reasoning is worth
+/// keeping next to the function rather than in a task file that nothing reads:
+///
+/// - **It is destructive and unrecoverable.** `retry_send` moves a row between
+///   two states that hold the same text; this deletes the text, and `PLAN.md`
+///   §7's "failures are never silently dropped" is precisely the rule a one-click
+///   delete would strain. The sibling affordance sits on a badge that says
+///   `failed: <the server's words>`, so a click there is a considered act; a
+///   second button beside it is not, and a mis-click there is a lost message the
+///   user wrote.
+/// - **It needs a gesture of its own, and there is no design for one.** A
+///   destructive action wants confirmation, or an undo, or a deliberate
+///   long-press — and this crate has no menu, no modal, no toast and no undo
+///   stack yet (`ui/` is a message list, a rail and an input bar). Choosing among
+///   those is a design decision with a real trade-off, and taking it as a side
+///   effect of "make the failed badge clickable" is how the wrong one gets taken.
+/// - **A door with no caller is dead code with a doc comment.** `bridge.rs` §5
+///   rejects that on principle, so adding a door here would be a way to publish
+///   the affordance without the design.
+///
+/// What *is* asserted, so this stays a decision rather than drifting into an
+/// oversight: `tests/layer_boundary.rs`
+/// (`the_destructive_discard_has_no_ui_caller`) fails the build if any file
+/// under `src/ui/` names this function, or names a `bridge` door for it. Wiring
+/// it is a work unit of its own, and it starts by removing that test.
+///
 /// # Errors
 ///
 /// None as such; a send that is not held, or is not [`DeliveryState::Failed`], is

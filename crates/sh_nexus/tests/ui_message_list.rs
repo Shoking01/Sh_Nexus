@@ -37,8 +37,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::{
-    div, list, prelude::*, px, Context, FontStyle, FontWeight, IntoElement, ListAlignment,
-    ListState, Render, TestAppContext, TextStyle, VisualTestContext, Window,
+    div, list, prelude::*, px, Context, Entity, FontStyle, FontWeight, IntoElement, ListAlignment,
+    ListState, Render, TestAppContext, TextStyle, VisualTestContext, WeakEntity, Window,
 };
 use rstest::rstest;
 use sh_nexus::core::markdown as core_markdown;
@@ -50,7 +50,9 @@ use sh_nexus::state::bridge::{self, Delivery, EventSender};
 use sh_nexus::state::{DeliveryState, MAX_MESSAGES_PER_CHANNEL};
 use sh_nexus::ui::markdown as ui_markdown;
 use sh_nexus::ui::views::message_list::MessageList;
-use sh_nexus::ui::views::message_row::{RowCache, RowSpec, MAX_RETAINED_ROWS};
+use sh_nexus::ui::views::message_row::{
+    RowCache, RowSpec, MAX_RETAINED_ROWS, RETRY_BADGE_SELECTOR,
+};
 use sh_nexus::ui::Colors;
 use smallvec::SmallVec;
 use uuid::Uuid;
@@ -99,6 +101,16 @@ fn stored_in(channel: &str, client_msg_id: u128, content: &str, second: i64) -> 
 /// A stored message in [`CHANNEL`].
 fn stored(client_msg_id: u128, content: &str, second: i64) -> Message {
     stored_in(CHANNEL, client_msg_id, content, second)
+}
+
+/// A stored message this client authored, which is what an ACK reconciles onto an
+/// optimistic row. [`stored`] is somebody else's, so a self-send's ACK needs its
+/// own fixture or the reconciled row would change author as well as delivery.
+fn stored_by_me(client_msg_id: u128, content: &str, second: i64) -> Message {
+    Message {
+        user_id: ME.to_owned(),
+        ..stored(client_msg_id, content, second)
+    }
 }
 
 /// A row spec with nothing but a body, for the cache tests.
@@ -151,6 +163,116 @@ fn connected(cx: &mut VisualTestContext, sender: &EventSender) {
         sender,
         DomainEvent::ConnectionStateChanged(ConnectionState::Connected),
     );
+}
+
+/// Applies a terminal send failure for `client_msg_id`.
+fn send_failed(cx: &mut VisualTestContext, sender: &EventSender, client_msg_id: Uuid) {
+    delivered(
+        cx,
+        sender,
+        DomainEvent::MessageSendFailed {
+            client_msg_id,
+            code: "forbidden".to_owned(),
+            detail: "you may not post here".to_owned(),
+        },
+    );
+}
+
+/// The server's answer to a send this client made.
+fn acked(
+    cx: &mut VisualTestContext,
+    sender: &EventSender,
+    client_msg_id: u128,
+    content: &str,
+    second: i64,
+) {
+    let client_msg_id = cid(client_msg_id);
+    delivered(
+        cx,
+        sender,
+        DomainEvent::MessageAcked {
+            client_msg_id,
+            message: stored_by_me(client_msg_id.as_u128(), content, second),
+        },
+    );
+}
+
+/// What the state holds for a send, read through the seam.
+fn delivery_in_state(cx: &VisualTestContext, client_msg_id: Uuid) -> Option<DeliveryState> {
+    cx.read(|app| bridge::try_read(app, |state| state.delivery(&client_msg_id)))
+        .flatten()
+}
+
+/// What a row is drawing, read through the list's own cache.
+///
+/// One `read_with`, so the row and the app are read at the same instant and the
+/// pair cannot disagree because the world moved between them.
+fn delivery_in_row(
+    cx: &VisualTestContext,
+    view: &Entity<MessageList>,
+    client_msg_id: Uuid,
+) -> Option<Option<DeliveryState>> {
+    view.read_with(cx, |list, app| {
+        list.retained_row(&client_msg_id)
+            .map(|row| row.read_with(app, |row, _| row.spec().delivery))
+    })
+}
+
+/// A connected list showing [`CHANNEL`], ready for a send.
+///
+/// Returns the borrowed `VisualTestContext` rather than an owned one, so the
+/// shadowing chain in each test reads like every other test in this file: `cx` is
+/// still the thing that paints and hit-tests, and it is still borrowed rather than
+/// cloned — which matters because `debug_bounds` and `simulate_click` answer for
+/// the window that context belongs to.
+fn showing_channel(
+    cx: &mut TestAppContext,
+) -> (EventSender, Entity<MessageList>, &mut VisualTestContext) {
+    let sender = installed(cx);
+    let (view, cx) = cx.add_window_view(|_, cx| MessageList::new(cx));
+    connected(cx, &sender);
+    view.update_in(cx, |list, _window, cx| {
+        list.show_channel(CHANNEL, cx);
+    });
+    cx.run_until_parked();
+    (sender, view, cx)
+}
+
+/// Sends optimistically and then fails terminally, leaving the list in the state
+/// a user is looking at when they decide to retry.
+///
+/// **The two halves have to happen together or the row is not a failed send**, and
+/// a fixture that is only half of what it claims would make every test below pass
+/// for the wrong reason: a `Pending` send has nothing to retry, so there is no
+/// badge on it to click.
+fn failed_send(
+    cx: &mut VisualTestContext,
+    view: &Entity<MessageList>,
+    sender: &EventSender,
+    n: u128,
+) -> Uuid {
+    let send_id = cid(n);
+    let sent = view.update_in(cx, |list, _window, cx| {
+        list.begin_send("hello team", send_id, at(1), cx)
+    });
+    assert!(
+        sent,
+        "the optimistic row must reach the list before it can fail"
+    );
+    cx.run_until_parked();
+
+    send_failed(cx, sender, send_id);
+    // One frame for the failure, exactly as the event loop does after a drain:
+    // `sync` reconciles and neither it nor the drain schedules a redraw.
+    view.update_in(cx, |_list, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    assert_eq!(
+        delivery_in_state(cx, send_id),
+        Some(DeliveryState::Failed),
+        "the fixture must be a failed send before any retry test means anything"
+    );
+    send_id
 }
 
 // ---------------------------------------------------------------------------
@@ -661,7 +783,9 @@ fn a_row_is_the_same_row_after_switching_away_and_back(cx: &mut TestAppContext) 
 /// guesses.
 #[gpui::test]
 fn the_row_cache_evicts_the_oldest_row_once_the_bound_is_reached(cx: &mut TestAppContext) {
-    let mut cache = RowCache::new();
+    // No owner, and said so: this test is about eviction, and an invalid handle
+    // makes the rows' controls inert rather than fake. See `RowCache::new`.
+    let mut cache = RowCache::new(WeakEntity::new_invalid());
     let colors = Colors::default();
     let total = MAX_RETAINED_ROWS + 8;
     let ids: Vec<Uuid> = (0..total).map(|n| cid(n as u128 + 1)).collect();
@@ -1002,7 +1126,7 @@ fn a_channel_with_no_messages_shows_nothing(cx: &mut TestAppContext) {
 /// holding a different parse.
 #[gpui::test]
 fn a_row_is_redrawn_only_when_its_spec_changed(cx: &mut TestAppContext) {
-    let mut cache = RowCache::new();
+    let mut cache = RowCache::new(WeakEntity::new_invalid());
     let colors = Colors::default();
 
     // The *same* spec, not a second one built from the same text: a spec is
@@ -1090,5 +1214,309 @@ fn a_list_without_an_installed_bridge_renders_empty(cx: &mut TestAppContext) {
         view.read_with(cx, |list, _| list.retained_rows()),
         0,
         "nothing to draw means nothing cached"
+    );
+
+    // And the retry gesture is a no-op rather than a panic on the same condition:
+    // `bridge::try_retry_send` answers `None` with no global, the list's
+    // read-back cannot see a `Pending` send, and `AGENTS.md` 2.1 forbids the
+    // `unwrap` that would distinguish "no state" from "no such send" by
+    // crashing.
+    let applied = view.update_in(cx, |list, _window, cx| list.retry_failed_send(cid(1), cx));
+    assert!(
+        !applied,
+        "with no state installed there is nothing to put back in flight, and the \
+         gesture must say so instead of inventing an outcome"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Work unit 3D — the retry gesture on a failed send's badge
+// ---------------------------------------------------------------------------
+
+/// Only a failed send offers the retry control.
+///
+/// **Every state is a case, not just the two that matter.** A badge that offers
+/// a retry on a `Pending` send would let a user ask for a second attempt before
+/// the first has been answered; one that offers it on an `Acked` send offers a
+/// control for something that already happened. `None` is the case that covers
+/// every message this client did not send, which is most rows.
+///
+/// **A `RowSpec` and no window, and that is the point of the predicate being on
+/// the spec.** The alternative — deciding inside `MessageRow::render` — could only
+/// be asserted by painting, and "does this row's badge respond to a click" is
+/// exactly the property that is expensive and ambiguous to check through a frame.
+#[rstest]
+#[case::never_sent(None, false)]
+#[case::pending(Some(DeliveryState::Pending), false)]
+#[case::acked(Some(DeliveryState::Acked), false)]
+#[case::failed(Some(DeliveryState::Failed), true)]
+fn only_a_failed_send_offers_the_retry_control(
+    #[case] delivery: Option<DeliveryState>,
+    #[case] expected: bool,
+) {
+    let mut spec = spec_for(1, "hello");
+    spec.delivery = delivery;
+
+    assert_eq!(
+        spec.offers_retry(),
+        expected,
+        "a send in {delivery:?} must {} offer the retry control",
+        if expected { "" } else { "not" }
+    );
+}
+
+/// Clicking a failed send's badge puts it back in flight, in place.
+///
+/// **`PLAN.md` §7's "stays visible for retry" — the half that was missing.** The
+/// send is the same message: same `client_msg_id`, same channel, same optimistic
+/// timestamp, and the row never leaves the list. That is what
+/// `actions::retry_send`'s documentation is about, and it is asserted here rather
+/// than inferred: an implementation that minted a new identity, or that removed
+/// the row and re-added it, would pass a delivery check and fail this one.
+///
+/// **The click is a real click on a real painted element**, not a call to the
+/// gesture: `debug_bounds` reads the frame the harness drew, and `simulate_click`
+/// hit-tests against that frame's hitboxes. So this fails if the badge stops being
+/// hit-testable, which is the failure a "we wired the listener" review would miss.
+///
+/// **It does not, and cannot, prove that the gesture asked for a frame** — a
+/// mousedown on a stateful element dirties the window by itself, so the badge would
+/// repaint either way and this test would pass with the `notify` deleted. That half
+/// is pinned separately, by [`the_retry_gesture_schedules_its_own_frame`], which
+/// drives `retry_failed_send` the way a non-pointer activation would have to.
+#[gpui::test]
+fn clicking_a_failed_sends_badge_puts_it_back_in_flight_in_place(cx: &mut TestAppContext) {
+    let (sender, view, cx) = showing_channel(cx);
+    let send_id = failed_send(cx, &view, &sender, 7);
+    let row_before = view
+        .read_with(cx, |list, _| list.retained_row(&send_id))
+        .expect("the failed row must be in the cache")
+        .entity_id();
+
+    let badge = cx
+        .debug_bounds(RETRY_BADGE_SELECTOR)
+        .expect("a failed send must paint a retry control");
+    assert!(
+        badge.size.height > px(0.),
+        "the control must be laid out, not merely built, got {:?}",
+        badge.size
+    );
+
+    cx.simulate_click(badge.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        delivery_in_state(cx, send_id),
+        Some(DeliveryState::Pending),
+        "the retry must move the send out of Failed. Nothing above this client \
+         transmits it — `retry_send` does not send, and the outbox is Phase 3 — \
+         so Pending is the honest end state and `sending…` is the honest badge"
+    );
+    assert_eq!(
+        delivery_in_row(cx, &view, send_id),
+        Some(Some(DeliveryState::Pending)),
+        "and the row must be showing it: the gesture schedules its own frame, so a \
+         row that still read Failed here would mean nothing ever repainted"
+    );
+    assert_eq!(
+        view.read_with(cx, |list, _| list.item_count()),
+        1,
+        "the same row, in place. A retry that added or removed a row would be a \
+         different message, not the same one in flight again"
+    );
+    assert_eq!(
+        view.read_with(cx, |list, _| {
+            list.retained_row(&send_id).map(|row| row.entity_id())
+        }),
+        Some(row_before),
+        "and the same entity, which is the part `differs_from` guarantees: the \
+         identity is keyed on `client_msg_id`, and a retry must not mint a new one — \
+         the server deduplicates on it, which is what stops a partial flush from \
+         duplicating a message"
+    );
+    assert!(
+        cx.debug_bounds(RETRY_BADGE_SELECTOR).is_none(),
+        "a pending send has nothing to retry, so the control must be gone — a badge \
+         that still offered one would be offering a second attempt at a send that \
+         has not been refused"
+    );
+}
+
+/// A click that arrives after the ACK does nothing, and does not panic.
+///
+/// **The race this exists for is real and is not hypothetical.** The server's ACK
+/// can land between the frame that painted the badge and the click that hits it: the
+/// badge's hitbox is the one the *last painted frame* recorded, and `bridge::drain`
+/// applies events without scheduling a frame. So the click reaches a listener whose
+/// row is no longer failed.
+///
+/// The fixture builds exactly that state and asserts it before clicking: the ACK is
+/// applied through the seam and **no frame is drawn**, which is what leaves a stale
+/// control with a live hitbox. Without that precondition the test would degenerate
+/// into "clicking nothing does nothing", which passes for the wrong reason.
+///
+/// **`actions::retry_send` refuses this**, with `IgnoreReason::NotFailed`, and the
+/// row is already right — so the correct outcome is silence, and a listener that
+/// forced the send back to `Pending` would resurrect a message the server has
+/// already accepted.
+#[gpui::test]
+fn a_click_that_arrives_after_the_ack_does_nothing(cx: &mut TestAppContext) {
+    let (sender, view, cx) = showing_channel(cx);
+    let send_id = failed_send(cx, &view, &sender, 7);
+
+    let badge = cx
+        .debug_bounds(RETRY_BADGE_SELECTOR)
+        .expect("a failed send must paint a retry control");
+
+    // The ACK arrives and is applied. `delivered` drains and asserts; it does not
+    // notify any view, so no frame is drawn and the painted frame still shows the
+    // failed badge with its hitbox intact.
+    acked(cx, &sender, 7, "hello team", 1);
+    assert_eq!(
+        delivery_in_state(cx, send_id),
+        Some(DeliveryState::Acked),
+        "the ACK must have been applied, or this test proves nothing"
+    );
+
+    cx.simulate_click(badge.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        delivery_in_state(cx, send_id),
+        Some(DeliveryState::Acked),
+        "a refused retry must leave the send alone: the server already accepted this \
+         message, and forcing it back to Pending would put a duplicate in flight"
+    );
+
+    view.update_in(cx, |_list, _window, cx| cx.notify());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds(RETRY_BADGE_SELECTOR).is_none(),
+        "and the next frame must not offer a retry either — the gesture that failed \
+         must not have scheduled work pretending it succeeded"
+    );
+}
+
+/// The gesture schedules its own frame, and a click cannot be mistaken for proof.
+///
+/// **This exists because a mutation check found that the click-driven test above
+/// does not test what it looks like it tests.** Pressing a stateful element updates
+/// that element's hover and pressed state, which dirties the window whether or not
+/// anything asked it to — so deleting the `cx.notify()` from
+/// [`MessageList::retry_failed_send`] left
+/// [`clicking_a_failed_sends_badge_puts_it_back_in_flight_in_place`] green. A test
+/// that passes with the thing it is named after removed is worse than no test,
+/// because it is a green light for the next reader.
+///
+/// So the gesture is called directly here, and **the assertion is read *after* the
+/// update call has returned.** GPUI flushes effects and paints dirty windows at the
+/// end of an `update` (`App::finish_update` -> `flush_effects`), so a repaint
+/// triggered by anything the harness did is already over by the time `update_in`
+/// returns. If the gesture asked for no frame, the row's spec is still `Failed` at
+/// that point and this fails.
+///
+/// # What this test does *not* claim, and why
+///
+/// **It does not assert that a refused retry costs no frame**, even though the code
+/// guards for exactly that with `if retried`. A refusal changes nothing, so a repaint
+/// produces a frame identical to the one already on screen and there is nothing to
+/// observe — and the harness exposes no frame counter to observe with, so the
+/// assertion would pass for the wrong reason rather than fail. **The guard is
+/// therefore a documented property of
+/// [`MessageList::retry_failed_send`] and not a tested one**, and this test says so
+/// rather than implying coverage it does not have.
+///
+/// What *is* asserted about the second call is the half that is observable: the
+/// gesture reports that it did nothing, and the row is exactly as it was.
+#[gpui::test]
+fn the_retry_gesture_schedules_its_own_frame(cx: &mut TestAppContext) {
+    let (sender, view, cx) = showing_channel(cx);
+    let send_id = failed_send(cx, &view, &sender, 7);
+
+    // Nothing between here and the read touches the window: `update_in` is the only
+    // call, and it draws only because the gesture asked it to.
+    let applied = view.update_in(cx, |list, _window, cx| list.retry_failed_send(send_id, cx));
+    assert!(
+        applied,
+        "a failed send must be put back in flight, and the gesture must say so"
+    );
+    assert_eq!(
+        delivery_in_row(cx, &view, send_id),
+        Some(Some(DeliveryState::Pending)),
+        "the row must already be showing the new state when the call returns, which \
+         it can only be if the gesture asked for the frame itself: nothing else in \
+         this test dirties the window"
+    );
+
+    // The same gesture again. The send is `Pending` now, not `Failed`, so the state
+    // refuses it — and this is the case the "did it move" answer exists for: a
+    // gesture that asked "does the badge read sending…" would answer yes here.
+    let second = view.update_in(cx, |list, _window, cx| list.retry_failed_send(send_id, cx));
+    assert!(
+        !second,
+        "retrying a send that is no longer failed changed nothing, so the gesture \
+         must report that — reporting success would mean a second click on a badge \
+         the first click already retired"
+    );
+    assert_eq!(
+        delivery_in_row(cx, &view, send_id),
+        Some(Some(DeliveryState::Pending)),
+        "and the row must be exactly as it was"
+    );
+    assert_eq!(
+        view.read_with(cx, |list, _| list.item_count()),
+        1,
+        "with no row added or removed: a retry is a state change, never a new message"
+    );
+}
+
+/// A send that is not failed offers no control, and clicking where one would be
+/// changes nothing.
+///
+/// Two halves, and both matter. **The absence** is asserted through the painted
+/// frame rather than through `offers_retry`, because the user-visible claim is that
+/// there is nothing to click — and a predicate can be right while the element
+/// still draws a control. **The click** lands on the row's own bounds, where the
+/// badge would be, so the row is *tested* for absorbing a click rather than merely
+/// assumed to.
+///
+/// The state checked afterwards is `Pending` rather than `Acked` because that is the
+/// state where a stray click is most tempting: the user has just pressed Enter and
+/// the row says `sending…`.
+#[gpui::test]
+fn a_send_that_is_not_failed_offers_no_control_and_its_row_absorbs_a_click(
+    cx: &mut TestAppContext,
+) {
+    let (_sender, view, cx) = showing_channel(cx);
+    let send_id = cid(7);
+
+    let sent = view.update_in(cx, |list, _window, cx| {
+        list.begin_send("hello team", send_id, at(1), cx)
+    });
+    assert!(sent, "the optimistic row must be on screen");
+    cx.run_until_parked();
+
+    let row = cx
+        .debug_bounds("message-row")
+        .expect("the row must have painted");
+    assert!(
+        cx.debug_bounds(RETRY_BADGE_SELECTOR).is_none(),
+        "an optimistic send has not been refused, so there is nothing to retry and \
+         no control to offer"
+    );
+
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        delivery_in_state(cx, send_id),
+        Some(DeliveryState::Pending),
+        "a click on a row that offers nothing must not change the send's state"
+    );
+    assert_eq!(
+        view.read_with(cx, |list, _| list.item_count()),
+        1,
+        "nor the number of rows: a stray click is not a discard, and the row is still \
+         the user's message"
     );
 }
