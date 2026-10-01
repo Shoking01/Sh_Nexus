@@ -22,6 +22,9 @@
 //! | The unread rule's conditions | `only_a_foreign_message_for_a_channel_that_is_not_on_screen_is_unread` | `#[rstest]`, four cases |
 //! | No event sequence leaves the state inconsistent | `an_arbitrary_sequence_of_events_leaves_the_state_internally_consistent` | **proptest**, invariants checked after *every* step |
 //! | The unread count never goes negative and never exceeds the channel's messages | `the_unread_count_never_goes_negative_and_never_exceeds_the_channel` | **proptest**, against a model that recomputes |
+//! | A channel never grows past `MAX_MESSAGES_PER_CHANNEL`, and the one exception is stated | `a_channel_at_its_bound_keeps_the_cap_and_loses_the_oldest`, `a_channel_whose_every_row_is_a_send_in_flight_is_allowed_over_the_cap`, plus the bound inside `assert_internally_consistent` | hand-written for the number (work unit 3C), property for the shape |
+//! | A send in flight is never the row eviction takes | `a_send_in_flight_is_never_the_row_that_is_evicted` | `#[rstest]`, pending and failed |
+//! | A reader scrolled into history keeps their row | `a_reader_scrolled_into_history_keeps_their_row_when_the_head_is_evicted` in `tests/ui_message_list.rs` | hand-written, at 10 001 messages through a real window |
 //!
 //! # The two properties, and why they are two tests
 //!
@@ -97,7 +100,8 @@ use sh_nexus::state::actions::{
     set_channels, ApplyOutcome, IgnoreReason, SendOutcome,
 };
 use sh_nexus::state::app_state::{
-    AppState, DeliveryState, MAX_TYPING_CHANNELS, MAX_TYPING_USERS_PER_CHANNEL,
+    AppState, DeliveryState, MAX_MESSAGES_PER_CHANNEL, MAX_TYPING_CHANNELS,
+    MAX_TYPING_USERS_PER_CHANNEL,
 };
 use uuid::Uuid;
 
@@ -2338,7 +2342,425 @@ fn the_sidebar_is_cached_ordered_and_history_outlives_a_missing_channel() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. The rendered-segment cache
+// 8. The history bound
+// ---------------------------------------------------------------------------
+
+/// A channel that overflows its cap keeps exactly the cap, and loses the oldest.
+///
+/// **The cap is read from the constant, never restated.** A literal copied into
+/// this test is a test that keeps passing after somebody moves the number, and
+/// `docs/BASELINES.md`'s 12,8 MB measurement is *about* 10 000 messages — so a
+/// test that pinned 10 000 as a literal would be asserting a coincidence rather
+/// than the invariant.
+///
+/// **The arrival is the newest, so the head is the thing that goes.** The rows go
+/// in ascending timestamp order, which is what makes the assertion about *which*
+/// row is evicted meaningful: an implementation that evicted the newest, or one
+/// that evicted the row it had just inserted, would satisfy a count-only test.
+#[test]
+fn a_channel_at_its_bound_keeps_the_cap_and_loses_the_oldest() {
+    let mut state = loaded();
+    let over_by = 3;
+    let total = MAX_MESSAGES_PER_CHANNEL + over_by;
+
+    for n in 0..total as u128 {
+        fire(
+            &mut state,
+            DomainEvent::MessageReceived(stored(
+                &format!("m_{n}"),
+                n,
+                "c_0",
+                "u_ada",
+                "body",
+                n as i64,
+            )),
+        );
+    }
+
+    assert_eq!(
+        state.message_count("c_0"),
+        MAX_MESSAGES_PER_CHANNEL,
+        "AGENTS.md 7.1's bound must hold after an overflow"
+    );
+
+    let held = state.messages("c_0");
+    assert_eq!(
+        held.first().map(|message| message.id.as_str()),
+        Some(format!("m_{over_by}").as_str()),
+        "the {over_by} oldest rows are what a cap costs, and it costs the oldest"
+    );
+    assert_eq!(
+        held.last().map(|message| message.id.as_str()),
+        Some(format!("m_{}", total - 1).as_str()),
+        "and the row that just arrived is the one that is kept"
+    );
+}
+
+/// **The cap is per channel, and the other channels are untouched by it.**
+///
+/// `AGENTS.md` §6.2's budget row is about cached history and `MessageList` is per
+/// channel, so a global ceiling would let one busy channel starve every other one
+/// — a worse failure than the unboundedness the cap exists to close. Asserting
+/// the neighbour's full count is the only way that stays a property of the
+/// design rather than a comment.
+#[test]
+fn the_cap_is_per_channel_and_one_busy_channel_does_not_starve_another() {
+    let mut state = loaded();
+    let total = MAX_MESSAGES_PER_CHANNEL + 1;
+
+    for n in 0..total as u128 {
+        fire(
+            &mut state,
+            DomainEvent::MessageReceived(stored(
+                &format!("m_{n}"),
+                n,
+                "c_0",
+                "u_ada",
+                "body",
+                n as i64,
+            )),
+        );
+    }
+    // A disjoint identity range, and the disjointness is load-bearing rather
+    // than tidy: a `client_msg_id` is globally unique, so reusing one across the
+    // two channels is a *server* disagreement about where a message lives, and
+    // `ingest_by_identity` resolves it by **moving the row out of `c_0`**. A
+    // range that overlapped would make this test measure the move path and
+    // report a count that looks like a broken cap. The bound is derived from the
+    // cap rather than written down, so it stays disjoint if the cap moves.
+    for n in 0..8u128 {
+        fire(
+            &mut state,
+            DomainEvent::MessageReceived(stored(
+                &format!("n_{n}"),
+                MAX_MESSAGES_PER_CHANNEL as u128 + 1 + n,
+                "c_1",
+                "u_ada",
+                "body",
+                n as i64,
+            )),
+        );
+    }
+
+    assert_eq!(state.message_count("c_0"), MAX_MESSAGES_PER_CHANNEL);
+    assert_eq!(
+        state.message_count("c_1"),
+        8,
+        "a full channel elsewhere must not cost this one a single row"
+    );
+}
+
+/// A send this client is waiting on is never the row that is evicted, and the
+/// eviction skips it to reach the next oldest.
+///
+/// **This is the trap the whole mechanism exists to avoid, and both halves of it
+/// are asserted.** `state/actions.rs`'s `acknowledge` asks `channel_holding(..)`
+/// before anything else, so a pending send that was evicted answers `None` and
+/// falls through to the adoption path — a silent reordering and a row that looks
+/// duplicated, and the user watches their own message vanish before the server
+/// answered. So the assertion is on the *pending row's survival*, not on the
+/// count: a count-only test passes for an implementation that drops the send and
+/// takes a newer row instead.
+///
+/// **The three cases are the three things a send can be**, and they are one
+/// `#[rstest]` because the shape is identical and only the delivery state
+/// differs. `Acked` is the fourth and it is *not* here: the server has spoken, so
+/// an acknowledged row is ordinary history and must remain evictable — a
+/// `#[case]` for it would have to assert the opposite, and putting that in the
+/// same list would make the test say two things.
+#[rstest]
+#[case("pending", "a send the server has not answered")]
+#[case("failed", "a send the server refused terminally")]
+fn a_send_in_flight_is_never_the_row_that_is_evicted(#[case] state_of: &str, #[case] why: &str) {
+    let mut state = loaded();
+
+    // The pending row is the OLDEST row in the channel, so it is first in line
+    // for eviction. That is the arrangement that makes the guard load-bearing:
+    // an implementation that always took the head would drop it here.
+    //
+    // **The identity is out of the range the arriving messages use, and that is
+    // load-bearing rather than tidy.** `cid(n)` is `from_u128(n + 1)`, so an
+    // identity of `cid(1)` would be the *same identity* the first arriving
+    // message carries — and the arrival would reconcile against the optimistic
+    // row instead of being a new row, the head would never be this client's
+    // pending send, and this test would pass for an implementation that drops
+    // sends. The offset is a named constant so the reason travels with it.
+    const CLEAR_OF_THE_ARRIVALS: u128 = 1_000_000;
+    let in_flight = cid(CLEAR_OF_THE_ARRIVALS);
+    assert!(matches!(
+        begin_send(&mut state, "c_0", "my own message", in_flight, at(0)),
+        SendOutcome::Pending { .. }
+    ));
+    if state_of == "failed" {
+        fire(
+            &mut state,
+            DomainEvent::MessageSendFailed {
+                client_msg_id: in_flight,
+                code: "rejected".to_owned(),
+                detail: "the server refused this one".to_owned(),
+            },
+        );
+    }
+    assert_eq!(
+        state.delivery(&in_flight),
+        Some(if state_of == "failed" {
+            DeliveryState::Failed
+        } else {
+            DeliveryState::Pending
+        }),
+        "the fixture must be in the state its case names, or it proves nothing ({why})"
+    );
+
+    for n in 1..(MAX_MESSAGES_PER_CHANNEL + 1) as u128 {
+        fire(
+            &mut state,
+            DomainEvent::MessageReceived(stored(
+                &format!("m_{n}"),
+                n,
+                "c_0",
+                "u_ada",
+                "body",
+                n as i64,
+            )),
+        );
+    }
+
+    assert_eq!(
+        state.message_count("c_0"),
+        MAX_MESSAGES_PER_CHANNEL,
+        "and the cap still holds -- the guard skips a row, it does not suspend the bound"
+    );
+    assert!(
+        state.message("c_0", &in_flight).is_some(),
+        "a {state_of} send must survive the overflow: {why}. An evicted send is \
+         re-inserted by acknowledge's adoption path, which is a silent \
+         reordering and a row that looks duplicated"
+    );
+    assert!(
+        state.message("c_0", &cid(1)).is_none(),
+        "and the eviction reached the *next* oldest rather than stopping short: \
+         the first arriving message is the row that was taken, so the guard \
+         skipped one row and still evicted one"
+    );
+    assert_eq!(
+        state.messages("c_0").first().map(|m| m.client_msg_id),
+        Some(in_flight),
+        "so the send in flight is now the head of the channel -- it is still the \
+         oldest row, it is simply the oldest row eviction is not allowed to take"
+    );
+}
+
+/// The unread count goes down with the row it counted, so it cannot exceed what
+/// the channel holds.
+///
+/// **This is the property the unread set's own documentation claims is
+/// structural** — *"it cannot exceed the channel's held messages"* — and
+/// `evict_one_over_cap` could break it in exactly one way: by removing a row
+/// without retiring its element. It routes through `remove_message` for that
+/// reason, and the count is what proves the route was taken rather than a
+/// neighbouring one that looks identical.
+///
+/// **Both directions are in one test because a count that merely stops growing
+/// would pass a "does not exceed" assertion** — the eviction has to make the
+/// count *fall* by the number of rows it took, or nothing was retired at all.
+#[test]
+fn evicting_a_row_retires_its_unread_element_with_it() {
+    let mut state = loaded();
+    let total = MAX_MESSAGES_PER_CHANNEL + 4;
+
+    for n in 0..total as u128 {
+        fire(
+            &mut state,
+            DomainEvent::MessageReceived(stored(
+                &format!("m_{n}"),
+                n,
+                "c_0",
+                "u_ada",
+                "body",
+                n as i64,
+            )),
+        );
+    }
+
+    let held = state.message_count("c_0") as i64;
+    let unread = i64::from(state.unread("c_0"));
+    assert_eq!(
+        unread, held,
+        "every row here is a foreign message in a background channel, so all of \
+         them counted -- and the 4 that were evicted took their elements with them"
+    );
+    assert!(
+        unread < total as i64,
+        "and the count really did fall: four rows left, so four elements went. \
+         A count that merely stopped growing would satisfy the line above"
+    );
+
+    // And the set-based property itself, through the helper the whole file uses.
+    assert_internally_consistent(&state, &BTreeSet::new(), 0);
+}
+
+/// The `Vec` and the positional index agree after a head eviction, which is the
+/// one removal that shifts every index below it.
+///
+/// **`assert_internally_consistent` is the assertion, not a hand-written subset of
+/// it.** A head eviction moves *every* index under it by one, so it is the
+/// removal most able to desynchronise `by_client_msg_id` from the `Vec` — and
+/// the helper is what walks both, resolves every identity through the positional
+/// index, and checks the server-id index alongside. The rows are then spot-checked
+/// by identity to make the *direction* of the shift explicit: a helper that only
+/// checked self-consistency would pass for an implementation whose index was
+/// uniformly wrong.
+#[test]
+fn a_head_eviction_leaves_the_vector_and_the_identity_index_agreeing() {
+    let mut state = loaded();
+    let total = MAX_MESSAGES_PER_CHANNEL + 2;
+
+    for n in 0..total as u128 {
+        fire(
+            &mut state,
+            DomainEvent::MessageReceived(stored(
+                &format!("m_{n}"),
+                n,
+                "c_0",
+                "u_ada",
+                "body",
+                n as i64,
+            )),
+        );
+    }
+    assert_internally_consistent(&state, &BTreeSet::new(), 0);
+
+    // The first row of the window, and the one immediately below it. The second
+    // is the row whose index moved: it was at 1 before the two evictions and is
+    // at 0 now, and `message(..)` resolves it through the positional index.
+    let window_head = cid(2);
+    let just_below = cid(3);
+    assert_eq!(
+        state.messages("c_0").first().map(|m| m.client_msg_id),
+        Some(window_head),
+        "the window starts at the third row: the two oldest were evicted"
+    );
+    let at_zero = state.message("c_0", &just_below);
+    assert_eq!(
+        at_zero.map(|m| m.id.as_str()),
+        Some("m_3"),
+        "the positional index must resolve the identity to the row it names, at \
+         the position the eviction moved it to"
+    );
+    assert_eq!(
+        state.messages("c_0")[0].id,
+        "m_2",
+        "and index 0 is the row the index says it is, not a stale neighbour"
+    );
+}
+
+/// A channel whose every row is a send in flight is **allowed over the cap**, and
+/// the over-cap is asserted rather than left implicit.
+///
+/// **This is the one case where the invariant does not hold, and the test exists
+/// so that it is a stated exception rather than a hole.** The alternative —
+/// evicting a send to satisfy a memory bound — is the failure `AGENTS.md` §7.5's
+/// *"failures are never silently dropped"* is written to prevent, and it costs
+/// the user a message they can see. An over-cap channel is bounded, visible and
+/// self-correcting; a dropped send is none of those.
+///
+/// **The over-cap is exactly one row per insert, not one per send.** The
+/// candidate scan is bounded by the arriving row's own index
+/// ([`evict_one_over_cap`]'s `before`), so when every *older* row is in flight
+/// there is no candidate and the arrival is kept — which means the channel
+/// overshoots by one and stays there rather than growing without limit. That is
+/// the shape which makes the exception safe, so it is the shape asserted.
+///
+/// **The correction is asserted too, because "self-correcting" is a claim.** Once
+/// the oldest send is answered, it becomes an ordinary row and the next arrival
+/// evicts it — one row per arrival, back down to the cap.
+///
+/// [`evict_one_over_cap`]: sh_nexus::state::app_state::AppState::evict_one_over_cap
+#[test]
+fn a_channel_whose_every_row_is_a_send_in_flight_is_allowed_over_the_cap() {
+    let mut state = loaded();
+
+    // Fill to the cap entirely with this client's own unanswered sends, so the
+    // channel has no evictable row at all.
+    for n in 0..MAX_MESSAGES_PER_CHANNEL as u128 {
+        let _ = begin_send(
+            &mut state,
+            "c_0",
+            "queued while the server was away",
+            cid(n + 1),
+            at(n as i64),
+        );
+    }
+    assert_eq!(state.message_count("c_0"), MAX_MESSAGES_PER_CHANNEL);
+
+    let newest = cid(MAX_MESSAGES_PER_CHANNEL as u128 + 1);
+    let _ = begin_send(
+        &mut state,
+        "c_0",
+        "one more than the cap allows",
+        newest,
+        at(MAX_MESSAGES_PER_CHANNEL as i64),
+    );
+
+    assert_eq!(
+        state.message_count("c_0"),
+        MAX_MESSAGES_PER_CHANNEL + 1,
+        "the documented exception: over the cap by exactly one, because the \
+         candidate scan is bounded by the arrival and no older row is evictable"
+    );
+    assert!(
+        state.message("c_0", &cid(1)).is_some(),
+        "and not one of the sends in flight was dropped to make room"
+    );
+    assert!(
+        state.message("c_0", &newest).is_some(),
+        "nor was the row that just arrived, which the arrival floor protects"
+    );
+
+    // The oldest send is answered, so it is ordinary history now. The next
+    // arrival finds a candidate and takes it.
+    let oldest = cid(1);
+    fire(
+        &mut state,
+        DomainEvent::MessageAcked {
+            client_msg_id: oldest,
+            message: stored(
+                "m_oldest",
+                1,
+                "c_0",
+                "u_me",
+                "queued while the server was away",
+                0,
+            ),
+        },
+    );
+    let _ = begin_send(
+        &mut state,
+        "c_0",
+        "and the one after that",
+        cid(MAX_MESSAGES_PER_CHANNEL as u128 + 2),
+        at(MAX_MESSAGES_PER_CHANNEL as i64 + 1),
+    );
+
+    assert_eq!(
+        state.message_count("c_0"),
+        MAX_MESSAGES_PER_CHANNEL + 1,
+        "one row in, one row out: the exception holds at the overshoot rather \
+         than draining, and every arrival keeps it there"
+    );
+    assert!(
+        state.message("c_0", &oldest).is_none(),
+        "and the row the server answered is the one that goes next -- an \
+         acknowledged send is ordinary history, so it is the oldest *candidate* \
+         and the scan takes it. This is what makes the exception cost nothing: \
+         the channel does not sit over the cap waiting to be rescued, it sheds \
+         the first row the moment shedding is allowed"
+    );
+    assert_internally_consistent(&state, &BTreeSet::new(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 9. The rendered-segment cache
 // ---------------------------------------------------------------------------
 
 /// A parsed message is cached by `client_msg_id`, and a pending message can be
@@ -3121,6 +3543,32 @@ fn assert_internally_consistent(state: &AppState, retried: &BTreeSet<Uuid>, at_s
             unread <= held.len() as i64,
             "{where_}: {channel_id} claims {unread} unread out of {} held messages",
             held.len()
+        );
+    }
+
+    // The history bound, checked here so the property above covers it on every
+    // step rather than only at the end of a sequence. **With the one documented
+    // exception stated rather than assumed:** a channel over the cap is only
+    // legitimate when every row it holds is a send this client is waiting on, so
+    // that is what the message says and what the condition below encodes. The
+    // proptest's universe is far too small to reach the cap, so this arm is
+    // unexercised here — `a_channel_whose_every_row_is_a_send_in_flight_is_allowed_over_the_cap`
+    // in this file is what puts the number under test, and this is what makes the
+    // property honest about the exception if the universe is ever widened.
+    for channel_id in every_channel(state) {
+        let held = state.message_count(&channel_id);
+        assert!(
+            held <= MAX_MESSAGES_PER_CHANNEL
+                || state.messages(&channel_id).iter().all(|message| {
+                    matches!(
+                        state.delivery(&message.client_msg_id),
+                        Some(DeliveryState::Pending | DeliveryState::Failed)
+                    )
+                }),
+            "{where_}: {channel_id} holds {held} messages, over \
+             MAX_MESSAGES_PER_CHANNEL, and not every one of them is a send in \
+             flight -- so the cap is breached rather than the documented \
+             exception holding"
         );
     }
 

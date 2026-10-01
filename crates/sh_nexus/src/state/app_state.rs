@@ -205,6 +205,20 @@
 //!   Phase 3. A send made while disconnected still gets a `Pending` row here —
 //!   that is the Optimistic Send Flow and it is connection-independent — and
 //!   [`AppState::can_send`] tells the caller which case it is in.
+//! - **No backfill for what [`MAX_MESSAGES_PER_CHANNEL`] evicts, so eviction
+//!   loses it.** That is the one cost of the bound, and it is stated here rather
+//!   than left for somebody to discover: a channel past 10 000 rows has no
+//!   record that the older ones existed, and nothing in this layer can fetch them
+//!   back. `PLAN.md`'s *"load history on startup, paged with cursors"* is Phase 3
+//!   and `db/`'s, and until it lands there is no "scroll up to load more" either
+//!   — so a reader who scrolls past the head of the window is at the head of the
+//!   window, full stop. **The alternative was not an unbounded `Vec`:** §7.1
+//!   names message history first, and the budget row this constant comes from
+//!   (`§6.2`, *"RAM with 10k cached messages < 200 MB"*) is only a budget if a
+//!   client holds 10 000 and not 10 001. What §1 ranks second is *"no lost
+//!   messages"*, and the honest reading of the two together is that a message
+//!   older than the window is history the user has not asked for in this session
+//!   — not a message in flight, which is why eviction never takes one.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -258,6 +272,81 @@ pub const MAX_TYPING_USERS_PER_CHANNEL: usize = 32;
 /// so the bound costs a missing indicator on the sixty-fifth busy channel and
 /// never a vanished one on a channel the user is already watching.
 pub const MAX_TYPING_CHANNELS: usize = 64;
+
+/// How many messages one channel holds before its oldest row is evicted.
+///
+/// `AGENTS.md` §7.1 forbids *"unbounded growth of in-memory state"* and names
+/// *"message history"* first. The two constants above are the precedent for
+/// what this is: a bound with a stated basis, in the layer that owns the state
+/// it bounds, beside the others rather than in a policy file.
+///
+/// **Ten thousand, and the number is the project's own.** `AGENTS.md` §6.2
+/// budgets *"RAM with 10k cached messages < 200 MB"*, and `docs/BASELINES.md`
+/// records the measurement that row is written about: 10 000 messages cost
+/// **12,8 MB**, 6,4% of that budget. So §6.2's row *already assumes* a client
+/// holds 10 000 messages, and this constant is what makes that assumption true
+/// rather than aspirational.
+///
+/// **Per channel, not global.** §6.2's row is about cached history,
+/// `MessageList` is per channel, and a global ceiling would let one busy channel
+/// starve every other one — which is a worse failure than the unboundedness
+/// this exists to close.
+///
+/// # What is evicted, and through which door
+///
+/// The **oldest** row, by the order [`ChannelMessages`] already maintains
+/// (`core::ordering::compare`, ascending, so the head is the oldest), and
+/// through [`remove_message`](AppState::remove_message) rather than past it.
+/// That is not a style preference: `remove_message` is the only thing that
+/// retires `message_index` and the unread set's element, so an eviction that
+/// reached into `ChannelMessages` directly would leave a counted message with
+/// no row behind it — and the unread set's own property 1, *"it cannot exceed
+/// the channel's held messages"*, is a property of *that* path rather than of
+/// anybody's care.
+///
+/// # The two rows eviction may never take
+///
+/// **1. A send this client is still waiting on** — anything in `outgoing` as
+/// [`DeliveryState::Pending`] or [`DeliveryState::Failed`], or in `failures`.
+/// `state/actions.rs`'s `acknowledge` asks `channel_holding(..)` before
+/// anything else, so an evicted send in flight answers `None`, falls through to
+/// the adoption path, and is re-inserted as if this client had never seen it:
+/// a silent reordering, a row that looks duplicated, and a message the user
+/// watches disappear before the server answered it. A bound that costs the
+/// user a message they can see is a worse bug than an unbounded `Vec`.
+///
+/// **2. The row this insert just added**, and everything at or after it.
+/// Evicting the row that has just arrived is not merely unfair, it is
+/// *incorrect*: the caller has not yet run the unread rule for it, so the
+/// unread set would gain an element naming a message that is no longer held —
+/// the one invariant this whole design is built to make structural. So
+/// candidates are the rows **strictly older** than the arrival, which is
+/// "evict the oldest" with a floor, and which is also why the scan is bounded
+/// by the arrival's index rather than by the channel's length.
+///
+/// # The one case where the bound does not hold
+///
+/// **When every held row is a send in flight, eviction takes nothing and the
+/// channel stays over the cap.** That is the deliberate choice: dropping a send
+/// to satisfy a memory bound is the failure §7.1's *"failures are never
+/// silently dropped"* is written to prevent, and an over-cap channel is a
+/// bounded, self-correcting condition rather than a lost message.
+///
+/// **The over-cap is bounded by the number of unacknowledged sends, and that
+/// bound is stated rather than assumed.** The task document for this unit
+/// attributed it to [`MAX_PENDING_EVENTS`](crate::state::bridge::MAX_PENDING_EVENTS)
+/// (1024), and **that is wrong**: 1024 bounds the events queued for the main
+/// thread, while a `Pending` row is created by `begin_send` — a user gesture,
+/// not an inbox delivery — and nothing in this layer bounds how many a user may
+/// send before the server answers. The honest bound is therefore "however many
+/// sends this client is waiting on", which is unbounded here and is a separate
+/// §7.1 finding, not something this constant can fix. The condition resolves
+/// itself as sends are acknowledged: each later arrival evicts one row per
+/// arrival until the channel is back inside the cap.
+///
+/// `a_channel_whose_every_row_is_a_send_in_flight_is_allowed_over_the_cap` in
+/// `crates/sh_nexus/tests/state_actions.rs` is that sentence as an assertion.
+pub const MAX_MESSAGES_PER_CHANNEL: usize = 10_000;
 
 /// Entries in the rendered-segment cache before it evicts by recency.
 ///
@@ -518,7 +607,7 @@ impl TypingUsers {
 /// |---|---|
 /// | Who | [`self_user_id`](Self::self_user_id) — the account this client is, and the identity the unread rule of module-docs §5 is stated against |
 /// | Channels | the channel list, plus the sidebar's cached ordering of it |
-/// | Messages | per channel, ascending, one row per `client_msg_id` |
+/// | Messages | per channel, ascending, one row per `client_msg_id`, bounded by [`MAX_MESSAGES_PER_CHANNEL`] |
 /// | Delivery | this client's own sends and how far each got ([`DeliveryState`]) |
 /// | Unread | per channel, per the rule in module-docs §5 |
 /// | Selection | which channel the chat view is showing |
@@ -599,7 +688,11 @@ pub struct AppState {
     ///    would need the removal path to decrement it, and a path that forgets is
     ///    exactly the bug the proptest in `tests/state_actions.rs` hunts for --
     ///    it found the first version of this, where a message the server moved
-    ///    between channels left its old channel's count behind.
+    ///    between channels left its old channel's count behind. **The history
+    ///    bound is what makes the first clause a live constraint rather than a
+    ///    tautology:** [`evict_one_over_cap`](Self::evict_one_over_cap) evicts
+    ///    through [`remove_message`](Self::remove_message) for exactly this
+    ///    reason, and the count of an evicted message goes with its row.
     /// 2. **It cannot go negative**, because there is nothing to subtract.
     /// 3. **Moving a message is exact.** Relocating a row stops counting it where
     ///    it was and re-evaluates the rule where it now is, with no need to
@@ -1100,15 +1193,34 @@ impl AppState {
 
     /// The one place a message becomes newly held.
     ///
-    /// Returns the index it occupies, or `None` if its `client_msg_id` was
-    /// already held in that channel — **a dedup decision, made here so that no
-    /// caller can hold two rows for one identity.**
+    /// Returns the index the message occupies **once this call has settled**,
+    /// or `None` if its `client_msg_id` was already held in that channel — **a
+    /// dedup decision, made here so that no caller can hold two rows for one
+    /// identity.**
     ///
     /// Only the two index entries are copied out of the message before the move
     /// into the channel: its `client_msg_id` is `Copy`, and its server id is
     /// empty for a message the server has not accepted. **The body is never
     /// cloned** — `AGENTS.md` §2.3's "no deep clones in hot paths" is why this
     /// takes the message by value rather than by reference.
+    ///
+    /// # The cap is enforced here, and that placement is a decision
+    ///
+    /// [`MAX_MESSAGES_PER_CHANNEL`] is applied by this function rather than by
+    /// its callers, and the reason is the same one [`insert_at_order`] gives for
+    /// refusing a duplicate identity: **a bound maintained by every path that
+    /// can breach it is maintained by whichever path somebody forgot.** There
+    /// are three call sites here today and a fourth would be one more thing to
+    /// remember, and a caller that inserted without evicting would not fail —
+    /// it would simply leave the channel uncapped, which is the violation
+    /// `AGENTS.md` §7.1 names first and the one this layer's whole set/index
+    /// design exists to make impossible.
+    ///
+    /// **The index this returns is therefore the post-eviction one**, and a
+    /// caller that uses it for anything other than a `Some`/`None` check would
+    /// be reading a position this function may have just moved. No caller does:
+    /// `begin_send`, `ingest_by_identity` and `acknowledge` each use it only as
+    /// a refusal signal.
     pub(crate) fn insert_message(&mut self, incoming: Message) -> Option<usize> {
         let server_id = incoming.id.clone();
         let client_msg_id = incoming.client_msg_id;
@@ -1121,9 +1233,131 @@ impl AppState {
             .insert_at_order(incoming)?;
         if !server_id.is_empty() {
             self.message_index
-                .insert(server_id, (channel_id, client_msg_id));
+                .insert(server_id, (channel_id.clone(), client_msg_id));
         }
+
+        // **After the insert, and bounded by the arrival's own index.** Two
+        // rules, both load-bearing, both documented on the constant:
+        //
+        // - *after*, so the row being added can never be the row evicted — the
+        //   caller has not yet run the unread rule for it, and evicting it here
+        //   would leave the unread set naming a message that is no longer held.
+        // - *before `at`*, so a channel whose every older row is a send in
+        //   flight falls into the documented over-cap case instead of dropping
+        //   the message that just arrived.
+        //
+        // The returned index is adjusted for the shift, which is why the
+        // `Some`/`None` shape of the signature is unchanged: one insertion adds
+        // one row, so at most one eviction restores the invariant, and a `while`
+        // here would be the shape that hides an off-by-one.
+        let settled = match self.evict_one_over_cap(&channel_id, at) {
+            Some(removed_at) if removed_at < at => at - 1,
+            _ => at,
+        };
+        Some(settled)
+    }
+
+    /// Evicts one row from `channel_id` if it is over
+    /// [`MAX_MESSAGES_PER_CHANNEL`], and reports the index it was at.
+    ///
+    /// **Candidates are the rows strictly older than `before`.** `before` is the
+    /// index the just-inserted row occupies, and the floor is what keeps the
+    /// arrival itself safe — see the constant's documentation for why that is a
+    /// correctness requirement and not a preference.
+    ///
+    /// **A send in flight is never a candidate**, and that is the trap this
+    /// whole mechanism exists to avoid: `state/actions.rs`'s `acknowledge` asks
+    /// `channel_holding(..)` before anything else, so an evicted pending send
+    /// would answer `None` and be re-inserted down the adoption path as if this
+    /// client had never sent it.
+    ///
+    /// **Through [`remove_message`](Self::remove_message), never past it.** That
+    /// method is the only thing that retires `message_index` and the unread
+    /// set's element, and the unread set's bound is structural *because* it
+    /// travels with the row. Returns `None` for a channel within the cap and for
+    /// the documented all-sends case alike, which are the same answer: nothing
+    /// was retired.
+    ///
+    /// The returned row is dropped, not stored and not cloned: `AGENTS.md` §2.3's
+    /// "no deep clones in hot paths" is why `remove_message` takes the row back
+    /// by value — a caller that wanted it back gets it by value, and this caller
+    /// wants it gone.
+    pub(crate) fn evict_one_over_cap(&mut self, channel_id: &str, before: usize) -> Option<usize> {
+        if self.message_count(channel_id) <= MAX_MESSAGES_PER_CHANNEL {
+            return None;
+        }
+        let at = self.oldest_candidate(channel_id, before)?;
+        // The identity is copied out before the second borrow, so the removal is
+        // a plain `&mut self` call rather than a re-entrant one.
+        let client_msg_id = self.messages.get(channel_id)?.messages[at].client_msg_id;
+        self.remove_message(channel_id, &client_msg_id)?;
         Some(at)
+    }
+
+    /// Where the oldest row this channel may lose sits, or `None` if there is
+    /// none.
+    ///
+    /// **The scan walks the head forward and stops at `before`**, which is the
+    /// index the just-inserted row occupies. The `Vec` is ascending by
+    /// [`ordering::compare`], so the first candidate found is by construction the
+    /// oldest thing eviction is allowed to take — *"evict the oldest"* is
+    /// therefore not a rule this function has to implement, it is a property of
+    /// the order [`ChannelMessages`] already maintains.
+    ///
+    /// **The `before` floor is the arrival protection.** The row that has just
+    /// arrived, and anything newer, are outside the scan: the caller has not yet
+    /// run the unread rule for the arrival, so retiring it here would leave the
+    /// unread set naming a message that is no longer held. See
+    /// [`MAX_MESSAGES_PER_CHANNEL`].
+    ///
+    /// **The cost, stated rather than assumed.** A channel within its bound never
+    /// gets here (the caller checks the count first), and a full channel's head is
+    /// the first element, so the common case is one step. The walk is only as
+    /// long as the run of sends in flight at the head — bounded by what this
+    /// client is waiting on, never by the history.
+    fn oldest_candidate(&self, channel_id: &str, before: usize) -> Option<usize> {
+        self.messages
+            .get(channel_id)?
+            .messages
+            .iter()
+            .take(before)
+            .position(|message| !self.has_outstanding_send(&message.client_msg_id))
+    }
+
+    /// Where a held message sits in its channel, if it is held there.
+    ///
+    /// **A public read accessor because a view has to be able to say "that row,
+    /// specifically" after the indices under it have moved.** `MessageList` uses
+    /// it to keep the row a reader is looking at under the reader when
+    /// [`MAX_MESSAGES_PER_CHANNEL`] evicts the head of the channel — the count
+    /// tells it how many rows there are, and this tells it which one is the one
+    /// that was under the reader before. It is one hash probe, and it is the same
+    /// answer [`message`](Self::message) gives about a row, asked about a
+    /// position instead of a message.
+    pub fn position_of(&self, channel_id: &str, client_msg_id: &Uuid) -> Option<usize> {
+        self.messages.get(channel_id)?.position_of(client_msg_id)
+    }
+
+    /// Whether this client is still waiting on the server about this message.
+    ///
+    /// **Both maps, and `failures` as well as `outgoing`, because either one
+    /// alone answers the question wrongly.** A `Failed` row is in `outgoing` as
+    /// [`DeliveryState::Failed`] and in `failures`; a `Pending` row is in
+    /// `outgoing` as [`DeliveryState::Pending`] and in neither. `AGENTS.md` §7.5's
+    /// *"failures are never silently dropped"* makes the failed case the one that
+    /// must not be evicted, and it is the case a check on `Pending` alone would
+    /// wave through.
+    ///
+    /// An `Acked` row is **not** outstanding: the server has spoken, so the
+    /// message is ordinary history and an ordinary eviction candidate.
+    fn has_outstanding_send(&self, client_msg_id: &Uuid) -> bool {
+        if self.failures.contains_key(client_msg_id) {
+            return true;
+        }
+        matches!(
+            self.outgoing.get(client_msg_id),
+            Some((_, DeliveryState::Pending | DeliveryState::Failed))
+        )
     }
 
     /// Removes a held message and retires its index entries.

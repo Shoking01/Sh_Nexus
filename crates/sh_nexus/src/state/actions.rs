@@ -106,6 +106,15 @@
 //! is the failure this whole layer exists to prevent. The ACK carries the full
 //! stored message, so adopting costs one insertion and needs nothing else.
 //!
+//! **And the fourth reason is the one this decision depends on not happening:
+//! eviction.** [`acknowledge`] asks [`AppState::channel_holding`] *before* it
+//! gets here, so a message that was evicted while its ACK was in flight answers
+//! `None` and lands on this path — a silent reordering and a row that looks
+//! duplicated, for a message the user watched vanish before the server answered.
+//! That is why [`AppState::evict_one_over_cap`] never takes a row with a send in
+//! flight: adoption is the right answer for a message the client never saw, and
+//! the wrong one for a message it is still waiting on.
+//!
 //! # 5. A `ResyncRequested` is a question this layer answers
 //!
 //! `core/models/events.rs` calls `ResyncRequested` a *request*, because *"the

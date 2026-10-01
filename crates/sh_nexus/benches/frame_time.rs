@@ -290,6 +290,7 @@ use sh_nexus::app::{self, Shell};
 use sh_nexus::core::models::events::DomainEvent;
 use sh_nexus::core::models::message::Message;
 use sh_nexus::state::bridge::{self, Delivery, EventSender};
+use sh_nexus::state::MAX_MESSAGES_PER_CHANNEL;
 use sh_nexus::ui::views::message_list::MessageList;
 use sh_nexus::UNSIGNED_IN_USER;
 use smallvec::SmallVec;
@@ -514,9 +515,21 @@ const PEER: &str = "u_bench_peer";
 /// How many messages the scroll phase scrolls through.
 ///
 /// `AGENTS.md` section 6.2's row is explicitly "10k messages", and
-/// `state/app_state.rs` has no history bound, so all 10 000 are loadable through
-/// the production path in either mode.
-const TOTAL_MESSAGES: usize = 10_000;
+/// `state/app_state.rs` now bounds a channel at
+/// [`sh_nexus::state::MAX_MESSAGES_PER_CHANNEL`]. **These are the same number,
+/// deliberately**: the cap is the project's own figure (section 6.2's
+/// *"RAM with 10k cached messages < 200 MB"* row), and seeding exactly the cap
+/// means the bench measures the state the budget row is written about rather
+/// than a state one message short of it.
+///
+/// **So this fixture sits exactly on the boundary, and the first insert past it
+/// is the first eviction.** That is a useful property rather than a hazard: the
+/// figure `docs/BASELINES.md` records was measured on a channel that had never
+/// evicted, which is still the right figure for a *load* of 10 000, and the
+/// bench's own conclusion about which end of the array is the bottleneck does not
+/// depend on what happens at 10 001. It is stated here because a reader who
+/// assumes the two numbers are independent would be wrong about one of them.
+const TOTAL_MESSAGES: usize = MAX_MESSAGES_PER_CHANNEL;
 
 /// Bodies the fixtures use, cycled by index.
 ///
