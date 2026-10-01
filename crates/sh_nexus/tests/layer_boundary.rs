@@ -23,6 +23,8 @@
 //! | `network/` names no `gpui` | §3.2 | `network_names_no_gpui` |
 //! | `ui/` reaches the layers below it only through the seam | §3.2, `PLAN.md` §4, ADR-006 step 1 | `ui_reaches_gpui_and_the_bridge_and_nothing_below_them` |
 //! | that rule can still catch a violation | — | `the_ui_boundary_rejects_the_layers_below_it` |
+//! | The destructive discard has no UI caller, on purpose | work unit 3D | `the_destructive_discard_has_no_ui_caller` |
+//! | that decision is enforced, not vacuous | — | `the_discard_decision_is_enforced_and_not_vacuous` |
 //! | The protocol does not depend on the client | ADR-002 | `the_wire_crate_does_not_depend_on_the_client` |
 //! | The client depends on the protocol | ADR-002 | `the_client_depends_on_the_wire_crate` |
 //!
@@ -728,6 +730,102 @@ fn the_ui_boundary_rejects_the_layers_below_it() {
             .iter()
             .any(|token| "let c = crate::core::cache::LruCache::new(1);".contains(token)),
         "a fully qualified path must still trip the token scan"
+    );
+}
+
+/// The destructive discard has no UI caller, and that is asserted as a decision.
+///
+/// **`actions::discard_failed_send` is reachable from nowhere outside
+/// `src/state/`, and this is what keeps that a decision rather than an
+/// oversight.** `retry_send` sits beside it in the same module and *is* wired:
+/// `bridge::try_retry_send` and `MessageList::retry_failed_send` reach it, and
+/// `tests/ui_message_list.rs` clicks the badge that calls them. So the shape of
+/// the omission is not obvious from the code — two sibling mutators, one used and
+/// one not, and nothing at the call site to say which is deliberate.
+///
+/// The reasoning lives on the function itself (`state/actions.rs`), and the short
+/// form is: it removes a message the user wrote, a destructive action wants
+/// confirmation or undo, and `ui/` has neither yet. Choosing among those is a
+/// design decision with a real trade-off, and taking it as a side effect of "make
+/// the failed badge clickable" is how the wrong one gets taken.
+///
+/// **Both halves of the door are checked, because a caller can reach it two ways.**
+/// A `ui/` file could name the mutator through the forbidden `actions` path — which
+/// [`ui_reaches_gpui_and_the_bridge_and_nothing_below_them`] already rejects — or
+/// through a new `bridge` door, which is the more likely mistake and the one no
+/// existing check would notice. So `src/state/bridge.rs` is scanned for a discard
+/// door as well, and the bridge's own §5 documentation is not enough to satisfy
+/// this: comments are stripped first, precisely so that prose about a boundary
+/// cannot stand in for the boundary.
+///
+/// Removing this test is the first step of wiring the affordance, and
+/// `state/actions.rs` says so.
+#[test]
+fn the_destructive_discard_has_no_ui_caller() {
+    let ui_dir = src_dir().join("ui");
+    let mut files = rust_files_under(&ui_dir);
+    files.push(src_dir().join("state").join("bridge.rs"));
+
+    for file in &files {
+        let stripped = without_comments(
+            &fs::read_to_string(file)
+                .unwrap_or_else(|error| panic!("{} should be readable: {error}", file.display())),
+        );
+
+        for token in ["discard_failed_send", "try_discard"] {
+            assert!(
+                !stripped.contains(token),
+                "{} names `{token}` after comment stripping. Work unit 3D decided \
+                 that discarding a failed send gets no UI caller and no bridge door: \
+                 it deletes a message the user wrote, a destructive action needs \
+                 confirmation or an undo, and ui/ has neither yet — so picking one \
+                 here would be a design decision taken as a side effect of making \
+                 the badge clickable. If you are wiring that affordance on purpose, \
+                 delete this test in the same commit and say in the PR which \
+                 confirmation or undo you chose.",
+                file.display()
+            );
+        }
+    }
+}
+
+/// The scanner above can still catch what it rejects.
+///
+/// Same reasoning as [`the_ui_boundary_rejects_the_layers_below_them`]: a green
+/// tree proves only that nothing *currently* violates the rule. Both spellings a
+/// caller would actually write are demonstrated on synthetic sources — the mutator
+/// itself, and the bridge door that would be added to reach it — and the comment
+/// stripper is exercised on the prose that must *not* trip it, which is what lets
+/// `state/actions.rs` explain the omission at length.
+#[test]
+fn the_discard_decision_is_enforced_and_not_vacuous() {
+    for violation in [
+        "use crate::state::actions::discard_failed_send;",
+        "let outcome = actions::discard_failed_send(&mut state, id);",
+        "pub fn try_discard(cx: &mut App, id: Uuid) -> Option<ApplyOutcome> { None }",
+    ] {
+        assert!(
+            without_comments(violation).contains("discard_failed_send")
+                || without_comments(violation).contains("try_discard"),
+            "`{violation}` should reach a token the discard decision rejects"
+        );
+    }
+
+    // Prose about the decision is stripped, so the documentation can be honest
+    // about it without tripping the check.
+    let prose = concat!(
+        "/// `discard_failed_send` has no door on purpose.\n",
+        "/// Nothing under ui/ may name it.\n",
+        "pub fn retry_send(state: &mut AppState, id: Uuid) -> ApplyOutcome { todo!() }\n",
+    );
+    let stripped = without_comments(prose);
+    assert!(
+        !stripped.contains("discard_failed_send"),
+        "the comment stripper must remove prose about the decision, got {stripped:?}"
+    );
+    assert!(
+        stripped.contains("retry_send"),
+        "and must keep the code that was never commented out, got {stripped:?}"
     );
 }
 

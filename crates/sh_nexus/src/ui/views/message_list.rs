@@ -30,10 +30,19 @@
 //!
 //! Every read of the application state goes through `bridge::try_read`, every
 //! channel switch through `bridge::try_select_channel`, and every send through
-//! `bridge::try_begin_send`. `AGENTS.md` §3.2 gives this layer no access to the
-//! state's mutators and `tests/bridge.rs` fails the build on a view that names
-//! the state's type, so the seam is the only door and the named doors in
-//! `bridge.rs` are the audit trail.
+//! `bridge::try_begin_send` or `bridge::try_retry_send`. `AGENTS.md` §3.2 gives
+//! this layer no access to the state's mutators and `tests/bridge.rs` fails the
+//! build on a view that names the state's type, so the seam is the only door and
+//! the named doors in `bridge.rs` are the audit trail.
+//!
+//! **A row's control dispatches *here*, and that is what keeps
+//! [`super::message_row`] free of a `Context`.** The badge is built inside
+//! `MessageRow::render`, so a listener written there can only reach the row; the
+//! row therefore holds a `WeakEntity<MessageList>` — a handle to the view that
+//! owns it, never a handle to the application state — and calls
+//! [`MessageList::retry_failed_send`]. So every gesture a row can offer arrives
+//! here, reads the state back the same way [`MessageList::begin_send`] does, and
+//! asks for its own frame from here.
 //!
 //! **And every height-changing action routes its `remeasure_items` or `splice`
 //! from here**, which is the part of ADR-006's plan that is easy to get subtly
@@ -153,16 +162,19 @@ impl MessageList {
     /// client that opens scrolled to the middle of history is a bug the user has
     /// to fix by hand.
     ///
-    /// The `cx` parameter is unused and taken for symmetry with GPUI's view
-    /// constructors, which is cheaper to explain than a constructor with a
-    /// different arity from every other view in the crate.
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    /// The `cx` parameter is used for exactly one thing: handing the row cache a
+    /// weak handle to this view, so a control a row draws has somewhere to
+    /// dispatch to ([`super::message_row::MessageRow::owner`]). That is also why
+    /// it is taken for symmetry with GPUI's view constructors rather than left off
+    /// — a constructor with a different arity from every other view in the crate
+    /// is more to explain than a used parameter.
+    pub fn new(cx: &mut Context<Self>) -> Self {
         let list = ListState::new(0, ListAlignment::Bottom, px(OVERDRAW_PX));
         list.set_follow_mode(FollowMode::Tail);
 
         Self {
             list,
-            rows: RowCache::new(),
+            rows: RowCache::new(cx.weak_entity()),
             channel: None,
             colors: Colors::default(),
             count: 0,
@@ -489,6 +501,101 @@ impl MessageList {
             cx.notify();
         }
         on_screen
+    }
+
+    /// Puts a failed send back in flight, on the badge's behalf.
+    ///
+    /// **This is the whole gesture. It does not transmit anything, and the
+    /// difference is the honest limit of work unit 3D.**
+    /// [`bridge::try_retry_send`] moves the send from
+    /// [`DeliveryState::Failed`] to [`DeliveryState::Pending`] and stops: there is
+    /// no socket on this side of the seam, and the outbox that would put a
+    /// `Pending` send on a wire is `PLAN.md` §7's Phase 3 work. **A user who
+    /// clicks retry therefore watches the badge change from `failed: …` to
+    /// `sending…`, and it stays there** until an outbox exists to move it. That is
+    /// what the label says and what this method does; neither claims more.
+    ///
+    /// **The gesture asks for a frame here rather than in the listener.** The badge
+    /// is drawn by [`super::message_row`], which cannot schedule anything: a row
+    /// holds no `Context` and has nothing to notify. And the frame is needed — a
+    /// gesture that changed a row's badge and asked for nothing would leave the old
+    /// badge on screen until something unrelated repainted.
+    ///
+    /// **A pointer click would mask a missing `notify`, and that is why this method
+    /// is tested by calling it directly.** Pressing a stateful element updates that
+    /// element's hover and pressed state, which dirties the window on its own, so a
+    /// click-driven test cannot tell "the gesture asked for a frame" from "the
+    /// framework happened to repaint". `tests/ui_message_list.rs`
+    /// (`the_retry_gesture_schedules_its_own_frame`) closes that gap by driving the
+    /// gesture the way a non-pointer activation would have to.
+    ///
+    /// # Returns whether *this* gesture moved the send, and why that is the question
+    ///
+    /// **Not "does the badge read `sending…`", and the difference is a real bug.**
+    /// Asking the second question answers `true` for a send that was *already*
+    /// `Pending` — so a second click on a badge the first click has already
+    /// retired would report success, ask for a frame, and redraw a list whose
+    /// contents had not changed. Asking the first question cannot: it is a
+    /// comparison, and a refused retry changes nothing to compare.
+    ///
+    /// **The comparison, and why there are two reads.** The seam answers in its own
+    /// vocabulary — an outcome enum this layer may not name
+    /// (`crate::state::actions` is on the forbidden-token list in
+    /// `tests/layer_boundary.rs`) and has no business rendering. So the state is
+    /// read before and after, and the answer is the difference. That costs two extra
+    /// `try_global` probes on a gesture a user performs once per failed send, which
+    /// is not a cost worth optimising away in exchange for a `ui/` file naming a
+    /// state type.
+    ///
+    /// **`false` covers every case where the badge must not change:** no bridge
+    /// installed, nothing held under that id, and — the one that matters — **a send
+    /// that is no longer failed because the server's ACK landed between the frame
+    /// that painted the badge and the click that hit it.** The state reports that as
+    /// a refusal for exactly this reason, and the row is already correct.
+    ///
+    /// **The `if retried` guard also keeps a refusal from repainting, and that part
+    /// is documented rather than tested.** A refusal changes nothing, so the frame it
+    /// would produce is identical to the one already on screen; the harness exposes
+    /// no frame counter, so a test could not tell the two apart and would pass for
+    /// the wrong reason. `tests/ui_message_list.rs`
+    /// (`the_retry_gesture_schedules_its_own_frame`) asserts the half that *is*
+    /// observable — that a successful gesture schedules its own frame — and its
+    /// documentation names this half as untested so the coverage gap is on the
+    /// record.
+    pub fn retry_failed_send(&mut self, client_msg_id: Uuid, cx: &mut Context<Self>) -> bool {
+        // `None` for "no bridge installed" and `None` for "no delivery recorded"
+        // are the same value here on purpose: a list cannot tell them apart, and
+        // neither can it act differently on either.
+        let before = bridge::try_read(cx, |state| state.delivery(&client_msg_id)).unwrap_or(None);
+
+        // The door's own answer is deliberately discarded. `Option` is
+        // `#[must_use]` and so is the outcome inside it, and the comparison below
+        // is both more honest and more useful than matching on a refusal taxonomy.
+        let _ = bridge::try_retry_send(cx, client_msg_id);
+
+        let after = bridge::try_read(cx, |state| state.delivery(&client_msg_id)).unwrap_or(None);
+        let retried = after == Some(DeliveryState::Pending) && before != after;
+
+        if retried {
+            // One frame for one gesture. `sync` is *not* called and does not need
+            // to be: a retry changes no message and no count, so there is nothing
+            // to splice or reset — only the row's badge, which `RowSpec::differs_from`
+            // catches on the next render because it compares `delivery` and
+            // `failure_detail`. That comparison then reports `changed`, so the
+            // height change is remeasured through the deferred path the module docs
+            // describe.
+            //
+            // **This notify is load-bearing even though a pointer click refreshes
+            // the window on its own.** A mousedown on a stateful element updates
+            // that element's hover and pressed state, which dirties the window
+            // whether or not anything asked it to — so the badge would appear to
+            // repaint either way, and a reader could not tell this line from
+            // decoration. The gesture that cannot rely on that is any future
+            // non-pointer activation, and the test that pins the contract calls
+            // this method directly rather than through the pointer.
+            cx.notify();
+        }
+        retried
     }
 
     /// How many messages the state holds for a channel.

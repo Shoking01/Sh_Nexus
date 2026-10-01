@@ -661,11 +661,20 @@ measurement from a later step.
    content, with an explicit `.text_color()` on every text element (GPUI does
    not inherit color; §7.3). This is the first consumer of a 1,956-line module
    that nothing calls today.
-5. **The state seam.** `bridge::try_read` to obtain rows, `try_select_channel`
-   and `try_begin_send` for the gestures, and `FollowMode::Tail` +
-   `pause_following_tail()` for stick-to-bottom. **Every height-changing action
-   routes its `remeasure_items` or `splice` from here**, so the obligation lives
-   in one place rather than at each call site.
+5. **The state seam.** `bridge::try_read` to obtain rows, `try_select_channel`,
+   `try_begin_send` and `try_retry_send` for the gestures, and
+   `FollowMode::Tail` + `pause_following_tail()` for stick-to-bottom. **Every
+   height-changing action routes its `remeasure_items` or `splice` from here**, so
+   the obligation lives in one place rather than at each call site.
+   **A row's control dispatches here too, which is how a row with no `Context`
+   offers an affordance**: `MessageRow` holds a `WeakEntity<MessageList>` — a handle
+   to the view that owns it, never to the application state — and the failed-send
+   badge's click lands in `MessageList::retry_failed_send`. `try_retry_send` **does
+   not transmit**: `actions::retry_send` moves the send to `Pending` and stops, and
+   the outbox that would put it on a wire is Phase 3. `actions::discard_failed_send`
+   has no door and no `ui/` caller on purpose, and
+   `tests/layer_boundary.rs::the_destructive_discard_has_no_ui_caller` is what keeps
+   that a decision.
 6. **Measure, and record it.** §6.2's **<8ms** scroll frame time at 10k
    messages, and the **idle RAM** figure `docs/BASELINES.md` has been carrying as
    deliberately-unmeasured. Both are owed and both need a real window, which
