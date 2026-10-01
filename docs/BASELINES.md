@@ -112,10 +112,10 @@ work units.
 | `state/` coverage | **98.16%** regions | `docs/COVERAGE.md` |
 | `state/bridge.rs` | **100%** (185/185 regions, 29/29 functions) | `docs/COVERAGE.md` |
 | Workspace coverage | **96.42%** regions | `docs/COVERAGE.md` |
-| Release binary | **10.80 MB** (was 9.95 MB before work unit 3A) | this file |
+| Release binary | **10.85 MB** (was 10.80 MB before work unit 3B) | this file |
 | Release build | **288 s** at `-j 6` | this file |
 | Dev build (warm) | 14 s | this file |
-| Source | 42 `.rs` files, 31,341 lines | — |
+| Source | 43 `.rs` files, +666 lines (`ui/views/input_bar.rs`, plus `app.rs` and the tests) | — |
 | Direct dependencies | 12 rows | `docs/DEPENDENCIES.md` |
 | Idle RAM | **51.6 MB** empty / **64.4 MB** with 10k, bench shell only (floor) | this file, §"Measured: idle RAM" — added by work unit 2B |
 | Idle RAM, app level | **51.7 MB** empty / **64.5 MB** with 10k, real `app::Shell` | this file, §"Measured: idle RAM" — added with `--mode app` |
@@ -132,6 +132,23 @@ above is either measured here or points at the file where it is measured.
 5 MB.** Measured: 9,946,368 B before, 11,325,440 B after — **+899,072 B,
 +8.6%**, built with `cargo build --release --workspace -j 6` on the same machine
 for both arms.
+
+**Work unit 3B — the composer — grew it by 48,128 B, which is 0.05 MB and 0.42%,
+against the same 5 MB threshold.** Measured: 11,325,440 B before,
+**11,373,568 B** after, same command and same machine. A whole view, an
+eight-method `EntityInputHandler` implementation, and its eight tests cost less
+than a hundredth of the margin, which is the number that makes
+`docs/DEPENDENCIES.md`'s decision to build a text field over `ui_input::InputField`
+measurable rather than rhetorical: three more crates would have been the same
+kind of judgement call, and this is what it is worth.
+
+**The two feature declarations in that unit cost nothing here, and the reason is
+that they were already paid for.** `chrono/clock` and `uuid/v4` were in the
+resolved graph and in the binary before this unit — gpui's tree enables both, and
+Cargo unifies features per crate version — so declaring them in
+`crates/sh_nexus/Cargo.toml` changed a lie in a comment into a fact in a manifest
+and moved the binary by an amount this measurement cannot distinguish from zero.
+`docs/DEPENDENCIES.md` has the `cargo metadata` evidence.
 
 The likely cause is that `core/theme.rs` was already compiled into the crate but
 previously unreachable from `run()`, so the linker could drop it; `src/app.rs`

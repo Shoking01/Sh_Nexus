@@ -15,6 +15,23 @@
 //! nothing else, and is an `Entity` because the list asks for one: a row's state
 //! has to survive being scrolled out of view and back, which a rebuilt element
 //! cannot do.
+//!
+//! # And where the composer sits relative to both
+//!
+//! [`input_bar`] is a *sibling* of the list rather than a third stage of it, and
+//! the reason is the direction of the two dependencies. The list and the row
+//! point downwards: a row is a *projection* of a message the state holds, and
+//! `MessageList` is a container that *asks* for rows. The composer points the
+//! other way — it holds the list and *calls into it*, through
+//! `MessageList::begin_send` — so folding it into `message_list.rs` would make
+//! that file the owner of both a container and the thing that drives it, which
+//! is the two-way coupling ADR-006's step order exists to avoid.
+//!
+//! **The composer builds its own text field rather than composing one, and that
+//! is a finding about the framework rather than a preference**: `gpui` at
+//! `rev e683fd7` has no text-input element and no `InputState`. Its module docs
+//! record the verified evidence and the dependency that was rejected instead.
 
+pub mod input_bar;
 pub mod message_list;
 pub mod message_row;

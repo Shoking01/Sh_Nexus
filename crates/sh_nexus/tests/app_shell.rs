@@ -19,6 +19,48 @@
 //! | One tick applies **every** queued event, and the rows are on screen | [`one_tick_applies_every_queued_event_and_puts_the_rows_on_screen`] | runtime, parameterised |
 //! | The applied palette is the active built-in theme, all the way to the rows | [`the_shell_applies_the_active_theme_to_the_rows`] | runtime + parsed document |
 //! | The shell's one key reaches the list | [`escape_returns_the_list_to_the_newest_message`] | runtime, simulated keystroke |
+//! | The composer is on screen, below the log, and is the production view | [`the_input_bar_is_on_screen_below_the_list`] | runtime, real bounds |
+//! | The window opens with the field focused, not the shell root | [`the_window_opens_with_the_composer_focused`] | runtime |
+//! | **Typing reaches the draft** | [`typing_reaches_the_draft_through_the_platform_input_handler`] | runtime, platform input path |
+//! | Enter sends and clears, and no newline is left behind | [`enter_sends_the_draft_and_clears_it`] | runtime |
+//! | A blank Enter neither sends nor destroys the draft | [`a_blank_enter_does_not_send_and_does_not_destroy_the_draft`] | runtime, negative |
+//! | The optimistic row is up before any ACK, and stays `Pending` | [`the_optimistic_row_is_on_screen_before_any_ack`] | runtime |
+//! | Escape hands focus to the shell and does **not** fire its gesture | [`escape_hands_focus_to_the_shell_without_returning_the_list_to_the_tail`] | runtime, negative |
+//! | The draft is bounded, by a constant that already exists | [`the_draft_is_bounded_by_the_message_ceiling`] | runtime + parsed constant |
+//!
+//! # The composer tests are the ones that could pass for the wrong reason
+//!
+//! **Every test above the composer section could be written without a text field
+//! and would still pass**, which is why the composer needs tests of its own here
+//! rather than a line in the table above. Four of them are negative, and that is
+//! deliberate: the failure modes `ui/views/input_bar.rs`'s module documents are
+//! all *absences*.
+//!
+//! | The defect | How it presents | The test that catches it |
+//! |---|---|---|
+//! | a key handler that stops propagation on character keys | the field renders, keys arrive, **no text ever appears** | [`typing_reaches_the_draft_through_the_platform_input_handler`] |
+//! | a key handler that lets `enter` propagate | the message sends **and then a newline lands in the cleared draft** | [`enter_sends_the_draft_and_clears_it`] asserts the draft is `""`, not `"\n"` |
+//! | a `send` that clears unconditionally | a refused send **silently eats what the user typed** | [`a_blank_enter_does_not_send_and_does_not_destroy_the_draft`] |
+//! | a composer's `escape` that fails to stop propagation | `escape` also yanks the log to the newest message | [`escape_hands_focus_to_the_shell_without_returning_the_list_to_the_tail`] |
+//! | a composer's `escape` that drops focus instead of handing it over | `escape` works once, and then **the shell's own `escape` is dead forever** | the same test, second half |
+//!
+//! **The first of those is the one that cannot be caught by reading the code.**
+//! `Window::dispatch_keystroke` forwards a character to the focused input
+//! handler only when the key propagated (`gpui/src/window.rs:5365`), so a
+//! handler that stops propagation on `"h"` compiles, runs, and drops the
+//! character. Only a test that types through the platform path and asks the view
+//! what it received can tell the difference — which is why this file uses
+//! `simulate_input` rather than calling the handler or the view's text method
+//! directly.
+//!
+//! **The last row was found by a failing test and not by reading the framework,
+//! which is why it is worth stating.** "Blur and stop" looked right, and
+//! `Window`'s own code seems to agree: with no focused element it routes keys to
+//! `DispatchTree::root_node_id()`. What neither the docs nor the code comment
+//! says is that this node is **not** the root view's element — so a window with
+//! nothing focused delivers every key to an empty listener list. The proof lives
+//! in [`escape_hands_focus_to_the_shell_without_returning_the_list_to_the_tail`]:
+//! blurring and stopping passes that test's first half and fails its second.
 //!
 //! # Why the pump is driven by the clock rather than by `run_until_parked`
 //!
@@ -39,13 +81,15 @@
 //! (`PLAN.md` §4).
 
 use chrono::{DateTime, TimeZone, Utc};
-use gpui::{px, Entity, Focusable, TestAppContext, VisualTestContext};
+use gpui::{px, Entity, EntityInputHandler, Focusable, TestAppContext, VisualTestContext};
 use rstest::rstest;
 use sh_nexus::app::{self, Shell, DRAIN_INTERVAL, STARTUP_CHANNEL};
+use sh_nexus::core::markdown::MAX_MESSAGE_BYTES;
 use sh_nexus::core::models::events::DomainEvent;
 use sh_nexus::core::models::message::Message;
 use sh_nexus::core::theme::BuiltIn;
 use sh_nexus::state::bridge::{self, Delivery, EventSender};
+use sh_nexus::state::DeliveryState;
 use sh_nexus::ui::Colors;
 use sh_nexus::UNSIGNED_IN_USER;
 use smallvec::SmallVec;
@@ -177,6 +221,62 @@ fn following_tail(cx: &VisualTestContext, shell: &Entity<Shell>) -> bool {
         shell
             .list()
             .read_with(app, |list, _| list.is_following_tail())
+    })
+}
+
+/// Focuses the composer, which is exactly what `app::open` does on launch.
+///
+/// **The test harness builds the shell directly rather than through `open`, so
+/// every test that needs a focused field asks for one here** — and the
+/// `run_until_parked` is load-bearing rather than tidy: focusing marks the
+/// window dirty, the frame that follows is the one whose paint registers the
+/// platform input handler, and a keystroke dispatched before that frame is a
+/// keystroke with no handler to receive it.
+fn focus_composer(cx: &mut VisualTestContext, shell: &Entity<Shell>) {
+    shell.update_in(cx, |shell, window, cx| {
+        shell.composer_focus_handle(cx).focus(window, cx);
+    });
+    cx.run_until_parked();
+}
+
+/// What the user has typed, read from the view rather than from the element tree.
+fn draft(cx: &VisualTestContext, shell: &Entity<Shell>) -> String {
+    shell.read_with(cx, |shell, app| {
+        shell
+            .input()
+            .read_with(app, |input, _| input.draft().to_owned())
+    })
+}
+
+/// The first message in the startup channel, with this client's delivery state.
+///
+/// **Read through the seam, and through a closure that names no state type.**
+/// `tests/bridge.rs` fails the build on a module outside `state/` that names the
+/// state type, and a closure parameter is inferred rather than written, so this
+/// is the shape that can read the state without naming it. Ordered rather than
+/// keyed because the composer mints its `client_msg_id` with `Uuid::new_v4()`
+/// and the test has no way to know which one it was — which is precisely the
+/// property the seam's contract creates.
+///
+/// **Read off the shell rather than off the `App`, and that is a convenience
+/// rather than an accident:** `Entity::read_with` hands the closure a `&App`,
+/// which is exactly what `bridge::try_read` takes, so the test needs no `update`
+/// and cannot be confused with the two-argument `TestAppContext::update` that
+/// the rest of this file uses for draining.
+fn first_sent(
+    cx: &VisualTestContext,
+    shell: &Entity<Shell>,
+) -> Option<(String, Option<DeliveryState>, bool)> {
+    shell.read_with(cx, |_shell, app| {
+        bridge::try_read(app, |state| {
+            let message = state.messages(STARTUP_CHANNEL).first()?;
+            Some((
+                message.content.clone(),
+                state.delivery(&message.client_msg_id),
+                message.user_id.as_str() == state.self_user_id(),
+            ))
+        })
+        .flatten()
     })
 }
 
@@ -545,10 +645,16 @@ fn the_active_theme_can_be_any_built_in_theme_without_a_translucent_colour(
 /// next layout is entitled to undo, and a test that only paused would assert
 /// nothing. The scroll to the top is what makes "away from the bottom" real.
 ///
-/// **The shell must be focused for the key to arrive at all**, which is why
-/// `app::open` focuses the root on open: `AGENTS.md` §5.2 requires the feature to
-/// work from the keyboard alone, and a window nothing focuses is a window whose
-/// keys go nowhere.
+/// **This test focuses the shell root on purpose, and the reason changed when the
+/// composer landed.** `app::open` now focuses the composer, because a chat
+/// window that opens with its text field focused is one the user can type into.
+/// That does not make this gesture unreachable — it makes it *second*: `Escape`
+/// in the field hands focus to the shell's root handle, and the `Escape` after
+/// that is this handler's. So the test states the state it needs rather than
+/// inheriting whatever the window happened to focus: the two halves are
+/// [`escape_hands_focus_to_the_shell_without_returning_the_list_to_the_tail`] and
+/// this one, and between them they are the whole of `AGENTS.md` §5.2's `Escape`
+/// requirement.
 #[gpui::test]
 fn escape_returns_the_list_to_the_newest_message(cx: &mut TestAppContext) {
     let (shell, cx) = shell(cx);
@@ -593,6 +699,465 @@ fn escape_returns_the_list_to_the_newest_message(cx: &mut TestAppContext) {
     assert!(
         following_tail(cx, &shell),
         "the shell's one key must reach the list and resume tail-following"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. The composer
+// ---------------------------------------------------------------------------
+
+/// The composer is on screen, below the log, and is the production view.
+///
+/// **The vertical ordering is asserted rather than assumed, and it is the half
+/// that a "does it render" test would miss.** A composer that laid out *above*
+/// the log would satisfy every other assertion in this section — it would be on
+/// screen, it would be focusable, and it would type — while being a chat client
+/// upside down. `PLAN.md` §6 puts the field under the chat area, so the shell
+/// puts it last in a `flex_col`.
+#[gpui::test]
+fn the_input_bar_is_on_screen_below_the_list(cx: &mut TestAppContext) {
+    let (shell, cx) = shell(cx);
+    cx.run_until_parked();
+
+    let list = cx
+        .debug_bounds("message-list")
+        .expect("the message list must record its bounds");
+    let bar = cx
+        .debug_bounds("input-bar")
+        .expect("the composer must record its bounds");
+
+    assert!(
+        bar.size.height > px(0.),
+        "the composer must be laid out, got {:?}",
+        bar.size
+    );
+    assert!(
+        bar.size.width > px(0.) && bar.size.width <= list.size.width,
+        "the composer spans the log's width: it is a sibling in the shell's column, \
+         so it cannot be wider than the log beside it -- got {bar:?} against \
+         {list:?}"
+    );
+    assert!(
+        bar.origin.y >= list.origin.y + list.size.height,
+        "PLAN.md section 6 puts the input bar under the chat area: the field must \
+         start at or below the end of the log, got bar {bar:?} and list {list:?}"
+    );
+
+    // And the view behind those bounds is the production composer, for the same
+    // reason `the_shell_renders_the_production_message_list` checks the list: a
+    // stand-in that looked like a text field would satisfy every bounds assertion
+    // above and none of the behaviour in the tests below.
+    let composed = shell.read_with(cx, |shell, app| {
+        shell
+            .input()
+            .read_with(app, |input, _| input.draft().is_empty())
+    });
+    assert!(
+        composed,
+        "the view behind those bounds is the production InputBar, already built and \
+         holding an empty draft"
+    );
+}
+
+/// The window opens with the field focused, not the shell root.
+///
+/// **Asserted on the view's own answer, not on the window's.** `InputBar::
+/// is_focused` reads the focus handle, which is the same handle
+/// `Window::handle_input` is keyed on during paint — so this is asking the
+/// question the typing path depends on, rather than the question "is anything
+/// focused".
+#[gpui::test]
+fn the_window_opens_with_the_composer_focused(cx: &mut TestAppContext) {
+    let (shell, cx) = shell(cx);
+
+    // What `app::open` does, done here because the harness builds the shell
+    // directly; see `focus_composer`.
+    focus_composer(cx, &shell);
+
+    shell.update_in(cx, |shell, window, cx| {
+        assert!(
+            shell.input().read(cx).is_focused(window),
+            "AGENTS.md 5.2 requires the feature to be reachable from the keyboard \
+             alone, and a chat window that does not open with its field focused is \
+             one the user has to click before they can type"
+        );
+    });
+}
+
+/// Typing reaches the draft, through the platform's input handler.
+///
+/// **This is the test that exists because the failure is invisible in the code.**
+/// `gpui` has no text-input widget at this rev, so the field registers itself
+/// with `Window::handle_input` from a canvas's *paint* callback; a keystroke
+/// character then travels
+///
+/// ```text
+/// simulate_input -> Window::dispatch_keystroke -> dispatch_event (the key tree)
+///                -> if the key propagated: platform_window.take_input_handler()
+///                -> ElementInputHandler::dispatch_input
+///                -> InputBar::replace_text_in_range
+/// ```
+///
+/// and **every arrow in that chain is a place the character can be lost** without
+/// an error. The one this file's module docs name is propagation:
+/// `dispatch_keystroke` returns before forwarding `key_char` when the key did not
+/// propagate (`gpui/src/window.rs:5375`). A field whose handler stopped
+/// propagation on `"h"` would render, handle the key, and receive nothing — and
+/// asserting the element tree would not catch it, because the tree is built
+/// whether or not the platform ever calls back.
+///
+/// **So the test types like a user and asks the view what it got.** `simulate_input`
+/// builds one keystroke per character *with* `key_char` set, which is the only
+/// representation that exercises the forwarding branch.
+#[gpui::test]
+fn typing_reaches_the_draft_through_the_platform_input_handler(cx: &mut TestAppContext) {
+    let (shell, cx) = shell(cx);
+    focus_composer(cx, &shell);
+
+    assert_eq!(draft(cx, &shell), "", "the field opens empty");
+
+    cx.simulate_input("hello");
+    cx.run_until_parked();
+
+    assert_eq!(
+        draft(cx, &shell),
+        "hello",
+        "a character reaches the draft only if the key propagated, the paint-time \
+         handler was registered, and the platform forwarded `key_char`. A composer \
+         that stopped propagation on character keys would fail here with no error \
+         anywhere -- see this file's module docs"
+    );
+
+    // And a second batch appends rather than replacing, which is what pins the
+    // shape of the field: the caret is the end, so insertion is at the end.
+    cx.simulate_input(" there");
+    assert_eq!(
+        draft(cx, &shell),
+        "hello there",
+        "successive insertions append: this field has no caret, so the end is the \
+         only insertion point (InputBar::selected_text_range returns None)"
+    );
+    assert_eq!(
+        showing(cx, &shell),
+        0,
+        "typing is not sending: PLAN.md says the message goes on Enter, and a \
+         composer that sent on every keystroke would be unusable"
+    );
+}
+
+/// Enter sends the draft, clears it, and leaves nothing behind.
+///
+/// **The `""` assertion is the whole test, and it is not a restatement of "it
+/// cleared".** `Window::dispatch_keystroke` begins with
+/// `keystroke.with_simulated_ime()`, and that synthesises `key_char` for named
+/// keys — including `"enter" => Some("\n")`
+/// (`gpui/src/platform/keystroke.rs:242`). A `Enter` that propagated would
+/// therefore send the message *and then* append a newline to the draft it had
+/// just cleared: one keypress, one message sent, and a composer holding `"\n"`
+/// that looks empty and is not, and that a second `Enter` would refuse to send
+/// because it trims to nothing.
+///
+/// **So this is the test that forces the inverse propagation rule.** The same
+/// handler must *let characters through* (see
+/// [`typing_reaches_the_draft_through_the_platform_input_handler`]) and *stop
+/// `enter`*, and the only way to know both are right is to assert the draft is
+/// empty and not merely that something was sent.
+#[gpui::test]
+fn enter_sends_the_draft_and_clears_it(cx: &mut TestAppContext) {
+    let (shell, cx) = shell(cx);
+    focus_composer(cx, &shell);
+
+    cx.simulate_input("ship it");
+    assert_eq!(draft(cx, &shell), "ship it");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        showing(cx, &shell),
+        1,
+        "Enter must put the optimistic row on screen"
+    );
+    let (content, delivery, is_self) =
+        first_sent(cx, &shell).expect("the state must hold the message the composer sent");
+    assert_eq!(
+        content, "ship it",
+        "the body the user typed is the body that was sent, verbatim"
+    );
+    assert_eq!(
+        delivery,
+        Some(DeliveryState::Pending),
+        "PLAN.md section 8.1's Optimistic Send Flow: the row is on screen as \
+         `sending...` before the server has seen the message, and no ACK has been \
+         delivered in this test -- only a `DomainEvent` can produce one"
+    );
+    assert!(
+        is_self,
+        "the state must attribute the message to this client, or the row would \
+         render as somebody else's"
+    );
+    assert_eq!(
+        draft(cx, &shell),
+        "",
+        "a sent draft is cleared, and it is cleared *entirely*: dispatch_keystroke \
+         synthesises key_char \"\\n\" for enter (gpui/src/platform/keystroke.rs), so \
+         a propagating Enter would leave a newline in the draft it just cleared. \
+         An empty string, not \"\\n\" -- that is the assertion with teeth"
+    );
+}
+
+/// A blank `Enter` neither sends nor destroys what the user typed.
+///
+/// **The destructive half is the point, and it is why the composer checks the
+/// draft before minting anything.** `actions.rs` refuses a whitespace-only body
+/// with `IgnoreReason::EmptyContent` — *"a message with no body and no attachment
+/// is not a message"* — so the send is going to be refused regardless. A
+/// composer that cleared the draft anyway would destroy what the user was in the
+/// middle of typing, on a keypress that sent nothing.
+///
+/// **The composer restores rather than re-reads, which is why the assertion can
+/// be exact.** `InputBar::send` takes the draft, hands it to
+/// `MessageList::begin_send`, and puts it back when the answer is that no row is
+/// on screen. So the refused path round-trips the user's bytes untouched, and
+/// `assert_eq!` on the whole string is the strongest form of that claim.
+#[gpui::test]
+fn a_blank_enter_does_not_send_and_does_not_destroy_the_draft(cx: &mut TestAppContext) {
+    let (shell, cx) = shell(cx);
+    focus_composer(cx, &shell);
+
+    // Whitespace only, and not the empty string: an empty draft is the trivial
+    // case, and `actions.rs` refuses on `content.trim().is_empty()`, so a body of
+    // spaces is the one that would slip past a `is_empty()` check.
+    cx.simulate_input("   ");
+    assert_eq!(
+        draft(cx, &shell),
+        "   ",
+        "spaces are characters like any other: they must reach the draft, or this \
+         test would pass without ever putting a blank draft in front of Enter"
+    );
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        showing(cx, &shell),
+        0,
+        "a whitespace-only body is not a message (actions.rs: EmptyContent), so \
+         Enter on one must not put a row on screen"
+    );
+    assert_eq!(
+        draft(cx, &shell),
+        "   ",
+        "and the draft must survive the refusal byte for byte: a refused send that \
+         cleared the field would destroy what the user was typing, which is the one \
+         thing a composer must never do"
+    );
+    assert_eq!(
+        first_sent(cx, &shell),
+        None,
+        "nothing at all reached the state"
+    );
+}
+
+/// The optimistic row is on screen before any `ACK`, and is not delivered yet.
+///
+/// **`PLAN.md` §8.1's Optimistic Send Flow is a claim about *ordering*, and this
+/// test is the only place that ordering can be observed**: it asserts that the
+/// message is visible while the state still says `Pending`, and it does that
+/// without delivering a single `DomainEvent`. An ACK is a network event and there
+/// is no network here, so the absence is structural rather than asserted — which
+/// is what makes "before any ACK" a fact about this test and not a hope.
+#[gpui::test]
+fn the_optimistic_row_is_on_screen_before_any_ack(cx: &mut TestAppContext) {
+    let (shell, cx) = shell(cx);
+    focus_composer(cx, &shell);
+
+    cx.simulate_input("optimistic");
+    cx.simulate_keystrokes("enter");
+    // No tick: the drain pump is irrelevant here, because a send goes straight
+    // through the seam on the gesture rather than through the inbox.
+    cx.run_until_parked();
+
+    assert_eq!(
+        showing(cx, &shell),
+        1,
+        "the row is on screen from the gesture itself -- it does not wait for a \
+         tick, let alone for a server"
+    );
+    let (_, delivery, _) = first_sent(cx, &shell).expect("the message is held by the state");
+    assert_eq!(
+        delivery,
+        Some(DeliveryState::Pending),
+        "and the state still says `sending...`, which is what the row draws"
+    );
+
+    // The row is a real laid-out element, not a count: `item_count` is bookkeeping
+    // the list updates itself, and a non-zero rectangle is a row that was painted.
+    let row = cx
+        .debug_bounds("message-row")
+        .expect("the optimistic row must have recorded its bounds");
+    assert!(
+        row.size.height > px(0.),
+        "the optimistic row must be laid out with a non-zero height, got {:?}",
+        row.size
+    );
+}
+
+/// `Escape` in the field hands focus to the shell, and does **not** fire its
+/// gesture.
+///
+/// **Two owners for one key, split by focus, and this test is what makes the
+/// split observable rather than asserted in a comment.** `Shell::on_key_down`
+/// still returns the log to the newest message on `Escape` — that is the half
+/// [`escape_returns_the_list_to_the_newest_message`] covers — but only once the
+/// field has given the key up. While the composer holds focus, its handler moves
+/// focus to the shell's root handle and calls `cx.stop_propagation`;
+/// `Window`'s bubble pass walks the path focused-node-first and returns the
+/// moment propagation stops (`gpui/src/window.rs:6068`), so the shell's handler
+/// is never called.
+///
+/// **So the first `Escape` asserts `false`, and that is the assertion with
+/// teeth.** The log is set up scrolled away from the tail *first*, which means a
+/// leaked `Escape` would flip it to `true`. Without that setup both outcomes are
+/// `false` and the test would pass whatever the composer did.
+///
+/// **The second `Escape` is here rather than left to the other test, because it
+/// is the half that caught the real bug.** A composer that blurred and stopped
+/// there would pass the first assertion and quietly break the shell's gesture
+/// forever: with no element focused, `Window` routes keys to
+/// `DispatchTree::root_node_id()` (`gpui/src/window.rs:6258`), and that node is
+/// **not** the root view's element, so every key lands on an empty listener list.
+/// `InputBar::fallback_focus` exists to prevent exactly that, and this is the
+/// test that says it works.
+#[gpui::test]
+fn escape_hands_focus_to_the_shell_without_returning_the_list_to_the_tail(cx: &mut TestAppContext) {
+    let (shell, cx) = shell(cx);
+
+    for n in 0..ENOUGH_TO_OVERFLOW {
+        queued(
+            cx,
+            &shell,
+            DomainEvent::MessageReceived(stored(n, "a body long enough to be a row", n as i64)),
+        );
+    }
+    tick(cx);
+    cx.run_until_parked();
+
+    // Away from the bottom, so that a leaked Escape has something to change.
+    shell.update_in(cx, |shell, _window, cx| {
+        shell.list().update(cx, |list, cx| {
+            list.pause_following_tail(cx);
+            list.list_state().scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        !following_tail(cx, &shell),
+        "the reader has scrolled away, so the log's own Escape gesture has \
+         something to do -- otherwise the assertion below could not fail"
+    );
+
+    focus_composer(cx, &shell);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    shell.update_in(cx, |shell, window, cx| {
+        assert!(
+            !shell.input().read(cx).is_focused(window),
+            "AGENTS.md 5.2's focus order: Escape must leave the text field, not \
+             leave the user typing into one they cannot see"
+        );
+    });
+    assert_eq!(
+        draft(cx, &shell),
+        "",
+        "Escape blurs; it does not send. The field was empty here on purpose so \
+         that a send would show up as a row rather than as a change of contents"
+    );
+    assert_eq!(
+        showing(cx, &shell),
+        ENOUGH_TO_OVERFLOW as usize,
+        "and nothing was sent: a blur is not a submit"
+    );
+    assert!(
+        !following_tail(cx, &shell),
+        "the shell's Escape gesture must NOT also have run. The composer's \
+         stop_propagation is what prevents it, and this is the only assertion in \
+         the file that can see a leak of that ownership"
+    );
+
+    // The second `Escape` is now the shell's. Proving both halves here rather
+    // than only in the other test is what shows the split is by focus and not by
+    // the key being claimed once and for all -- and it is the assertion that
+    // fails if the composer's Escape leaves the window with nothing focused.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        following_tail(cx, &shell),
+        "the composer's Escape must hand focus to the shell's root handle, not \
+         merely drop it. With nothing focused, Window routes every key to \
+         DispatchTree::root_node_id(), which is not the root view's element, so \
+         the shell's own Escape would be stranded forever -- AGENTS.md 5.2 \
+         keyboard-only operation broken by the key meant to provide it"
+    );
+}
+
+/// The draft is bounded by a constant the project already had.
+///
+/// **`AGENTS.md` §7.1 bans unbounded growth of in-memory state, and a draft grows
+/// by however much a user pastes into it.** The bound is enforced where every
+/// byte enters, so it is asserted on the entry point itself —
+/// `EntityInputHandler::replace_text_in_range` — rather than through simulated
+/// keystrokes. That is not a shortcut: it is the *same public method* typing and
+/// [`EntityInputHandler::paste`] both arrive at, and simulating 131 072
+/// keystrokes to reach a 128 KB buffer is a test that measures the harness.
+///
+/// **The constant is `core::markdown::MAX_MESSAGE_BYTES` and not a number chosen
+/// for this view**, and that is the claim worth making checkable: it is the
+/// largest body the render path will show faithfully, since the parser truncates
+/// past it. A draft longer than that is a message this client cannot display, so
+/// accepting it would be letting someone send something they have not seen.
+#[gpui::test]
+fn the_draft_is_bounded_by_the_message_ceiling(cx: &mut TestAppContext) {
+    let (shell, cx) = shell(cx);
+    focus_composer(cx, &shell);
+
+    // Well past the ceiling, and a whole-character payload: the truncation walks
+    // back to a character boundary, and a payload that needed walking back would
+    // be testing that rather than the bound.
+    let overlong = "x".repeat(MAX_MESSAGE_BYTES * 2);
+    let bar = shell.read_with(cx, |shell, _| shell.input().clone());
+    bar.update_in(cx, |bar, window, cx| {
+        bar.replace_text_in_range(None, &overlong, window, cx);
+    });
+    cx.run_until_parked();
+
+    let held = draft(cx, &shell);
+    assert_eq!(
+        held.len(),
+        MAX_MESSAGE_BYTES,
+        "AGENTS.md 7.1 asks for a bound and for it to be stated; the draft stops at \
+         the same ceiling the parser stops at, so the user cannot compose a body \
+         this client would silently truncate on the way to the screen"
+    );
+    assert!(
+        held.chars().all(|character| character == 'x'),
+        "and the accepted prefix is intact text: the cut is on a character boundary"
+    );
+
+    // And the bound holds on the *second* insertion too, which is the case a
+    // check against the incoming text alone would miss.
+    bar.update_in(cx, |bar, window, cx| {
+        bar.replace_text_in_range(None, "yyyy", window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        draft(cx, &shell).len(),
+        MAX_MESSAGE_BYTES,
+        "a full draft accepts nothing further: the bound is on the draft, not on \
+         any single insertion"
     );
 }
 
