@@ -1,0 +1,89 @@
+name: CI
+
+# Every command below is the one `AGENTS.md` 5.1 makes mandatory, kept
+# byte-identical to what a developer runs locally -- `-j 6` before the `--`,
+# `--all-features` so the `profiling` bench target is linted too, and the
+# doctests run separately because `cargo test` does not include them.
+#
+# The toolchain is pinned to the version this project was verified on (see the
+# MSRV notes in the root `Cargo.toml`) rather than to whatever a runner
+# happens to ship, so CI cannot silently drift away from local behaviour.
+#
+# Deliberately NOT in this workflow, and why:
+#   - `cargo build --release` and the binary-size check. `AGENTS.md` 6.1 and 6.3
+#     track the *release* artifact, and a release build of this dependency graph
+#     is several times the cost of everything here. It stays a deliberate local
+#     measurement, as `docs/BASELINES.md` records.
+#   - Required approving reviews. The repository has exactly one collaborator,
+#     so requiring one would block every future merge permanently. Revisit when
+#     a second person can review.
+#
+# A note on actions: only GitHub-owned `actions/*` are used. The popular
+# `Swatinem/rust-cache` is deliberately avoided -- `AGENTS.md` 7.2 prices
+# dependency supply-chain risk, and a third-party action runs with this
+# repository's token. The cache is spelled out instead.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege: the workflow only ever needs to read the repository.
+permissions:
+  contents: read
+
+# A new push supersedes the run for the same ref instead of queueing behind it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  verify:
+    name: fmt, clippy, tests
+    runs-on: windows-latest
+    # Generous ceiling for the 675-package dependency graph building from cold
+    # on a 4-core runner. Failing early here would produce a red X that says
+    # "your code is broken" when it means "the build was slow".
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
+          rustup default 1.98.1
+          rustc --version
+          cargo --version
+
+      # The dependency graph is the expensive part and it is pinned by
+      # `Cargo.lock`, so it is safe to key the cache on that file's hash: any
+      # change to a version bumps the key and forces a clean rebuild.
+      - name: Cache the registry, the git checkouts, and target/
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy --all-features --all-targets
+        run: cargo clippy --workspace --all-features --all-targets -j 6 -- -D warnings
+
+      - name: cargo test (unit and integration)
+        run: cargo test --workspace --tests -j 6
+
+      - name: cargo test (doctests)
+        run: cargo test --doc --workspace -j 6
