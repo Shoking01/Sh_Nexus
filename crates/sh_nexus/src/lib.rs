@@ -6,20 +6,17 @@
 //! by a test, and the headless test in `tests/spike_render.rs` is the
 //! load-bearing proof that `gpui_platform/test-support` works on Windows.
 //!
-//! Phase 1 moves the root view into `src/app.rs` per PLAN.md section 4; it is
-//! kept here for the spike so the spike's footprint stays small.
-//!
 //! # The module tree (AGENTS.md section 3.1)
 //!
-//! `app.rs`, `db/` and `platform/` are not declared yet. They are later work
-//! units, and they are absent rather than declared empty: a module that exists
-//! and does nothing reads as finished work. `state/bridge.rs` arrived in work
-//! unit 1E-2 and is the single module permitted to call `cx.update_global`;
-//! [`run`] installs the global it owns, before any window exists. [`ui`]
-//! arrived in work unit 2A with the message list, and it is the layer GPUI is
-//! confined to (`PLAN.md` section 4) — the reason this file's spike view is
-//! still here rather than in `app.rs` is that the spike's footprint is what
-//! Phase 0 had to prove.
+//! [`app`] is the root component and arrived with work unit 3A; [`run`] opens it.
+//! `db/` and `platform/` are not declared yet. They are later work units, and
+//! they are absent rather than declared empty: a module that exists and does
+//! nothing reads as finished work. `state/bridge.rs` arrived in work unit 1E-2
+//! and is the single module permitted to mutate a GPUI context, which is why
+//! [`app::open`] installs the global it owns and this file names no such call.
+//! [`ui`] arrived in work unit 2A with the message list, and it is the layer
+//! GPUI is confined to (`PLAN.md` section 4) -- [`app`] being the one place
+//! outside that layer that composes it.
 //!
 //! [`core`] is pure domain logic with no side effects -- no `gpui`, no `tokio`,
 //! no I/O (`AGENTS.md` section 3.2). [`network`] is protocol handling only: it
@@ -35,6 +32,7 @@
 // `sh_nexus_wire/src/lib.rs`.
 #![warn(missing_docs)]
 
+pub mod app;
 pub mod core;
 pub mod errors;
 pub mod network;
@@ -44,21 +42,27 @@ pub mod ui;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui::{
-    div, prelude::*, px, rgb, size, App, Bounds, Context, FocusHandle, Focusable, Render, Window,
-    WindowBounds, WindowOptions,
-};
-
-/// Width of the root window, in logical pixels.
-pub const WINDOW_WIDTH: f32 = 480.0;
-/// Height of the root window, in logical pixels.
-pub const WINDOW_HEIGHT: f32 = 320.0;
+use gpui::{div, prelude::*, rgb, App, Context, FocusHandle, Focusable, Render, Window};
 
 /// The spike's root view.
 ///
-/// Deliberately trivial. Its only job is to prove that on Windows we can
-/// register a root view, lay elements out, hit-test a pointer click onto an
-/// element, and deliver a keyboard event to a focused element.
+/// **Deliberately trivial, and deliberately no longer what [`run`] opens.** Its
+/// only job is to prove that on Windows we can register a root view, lay elements
+/// out, hit-test a pointer click onto an element, and deliver a keyboard event to
+/// a focused element. The application itself is [`app::Shell`], and
+/// [`app::open`] is what a launch callback calls.
+///
+/// **It is retained for `tests/spike_render.rs` and must not be deleted.** That
+/// test is the load-bearing proof that `gpui_platform/test-support` works on
+/// Windows, and this view is the subject it renders: a shell that composes a
+/// virtualized `gpui::List` is a *much* stronger harness claim, so if the list
+/// ever fails to lay out headlessly the spike would no longer notice, and
+/// `PLAN.md` section 8 makes the spike a hard gate.
+///
+/// **The window options that used to accompany it went with [`run`].** They
+/// described the spike's 480x320 window, which nothing opens any more; the
+/// shell's geometry lives in [`app::WINDOW_WIDTH`] and [`app::WINDOW_HEIGHT`],
+/// beside the view it describes.
 pub struct RootView {
     /// Incremented by the clickable button; asserted on by the spike test.
     count: u32,
@@ -93,9 +97,10 @@ impl RootView {
     /// Gives this view keyboard focus, so key events are dispatched to it.
     ///
     /// Exists for the headless test, which focuses through
-    /// `Entity::update_in` so the keyboard path has a focus target. `run()`
-    /// does the same thing inline via `Focusable::focus_handle`, because there
-    /// the view is being constructed and is not yet bound to a variable.
+    /// `Entity::update_in` so the keyboard path has a focus target. Nothing in
+    /// `src/` calls this any more -- [`app::open`] focuses the shell inline via
+    /// `Focusable::focus_handle`, because there the view is being constructed and
+    /// is not yet bound to a variable -- so the method exists for the test alone.
     pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window, cx);
     }
@@ -185,39 +190,36 @@ impl Render for RootView {
 /// nothing this client shows can be recognised as its own, so the unread rule
 /// over-counts. That is the safe direction -- a badge that over-reports is a
 /// badge the user dismisses, and an under-report is a message nobody reads.
+///
+/// **The one production caller of this placeholder is [`app::open`].** It stays
+/// here rather than moving beside the shell because `benches/frame_time.rs`
+/// installs its own state with it, and a constant that two independent pieces of
+/// startup code reach for belongs at the crate root rather than in the view that
+/// happens to be first today.
 pub const UNSIGNED_IN_USER: &str = "u_unsigned_in";
 
-/// The window options the spike opens with: a centred, windowed 480x320.
-fn spike_window_options(cx: &App) -> WindowOptions {
-    let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
-    WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
-        ..Default::default()
-    }
-}
-
-/// Starts the GPUI application and opens the single root window.
+/// Starts the GPUI application and opens the shell's single window.
 ///
-/// **The application state is installed here, and this is the one place in the
-/// binary that calls [`state::bridge::install`].** `PLAN.md` §4 makes
-/// `state/bridge.rs` the single owner of `cx.update_global`; registering the
-/// global it owns is the first half of that, and doing it inside the launch
-/// callback means the state exists before any window — and therefore before any
-/// view — can be built. The `EventSender` it returns is dropped here on purpose:
-/// `network/`'s WebSocket client is Phase 4, and the sender's only producer is
-/// a socket task that does not exist yet. **When that task lands, it is handed
-/// this sender, and the handle has to be *kept* rather than dropped** — a
-/// dropped sender closes the inbox and every later delivery is reported as
-/// [`state::bridge::DeliveryRefusal::BridgeDropped`].
+/// **This function opens a window and nothing else.** Installing the application
+/// state, keeping the producer handle alive, resolving the theme, arming the drain
+/// schedule and handling keys are [`app`]'s obligations (`AGENTS.md` §3.1), and
+/// [`app::open`] is the one call that does them in the order they require: the
+/// state is registered *before* a window exists, so no view is ever built against
+/// a global that is not there yet.
+///
+/// **The failure is carried out of the launch callback rather than returned from
+/// it.** The callback `Application::run` is given is `FnOnce(&mut App)` and cannot
+/// return a value, so the error travels through an `Rc<RefCell<_>>` and is
+/// surfaced after the event loop returns — the same shape `benches/frame_time.rs`
+/// uses, and for the same reason.
 ///
 /// # Errors
 ///
-/// Returns the platform error from `App::open_window` (window creation, D3D11
-/// device creation, or text-system initialisation). `Application::run` blocks
-/// until the platform event loop exits and its launch callback cannot return a
-/// value, so the failure is carried out through an `Rc<RefCell<_>>` and
-/// surfaced after the loop returns. No `unwrap`/`expect` is used on this path
-/// (AGENTS.md 2.1).
+/// [`app::open`]'s error: the application state could not be installed, or the
+/// window could not be created (window creation, D3D11 device creation, or
+/// text-system initialisation). It arrives here already reduced to
+/// [`errors::ShNexusError`] at the one boundary `errors.rs` permits. No
+/// `unwrap`/`expect` is used on this path (AGENTS.md 2.1).
 pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The launch callback passed to `Application::run` is `FnOnce(&mut App)` and
     // must be `'static`, so it cannot capture a `&mut`.
@@ -226,27 +228,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let failure_in_callback = Rc::clone(&failure);
 
     gpui_platform::application().run(move |cx: &mut App| {
-        // A second install is impossible here -- the launch callback runs once
-        // per process -- but the refusal is surfaced rather than unwrapped, per
-        // AGENTS.md 2.1, and a client with no application state has nothing worth
-        // showing, so the window is not opened at all.
-        if let Err(error) = state::bridge::install(cx, UNSIGNED_IN_USER) {
-            *failure_in_callback.borrow_mut() = Some(Box::new(error));
-            return;
-        }
-
-        let options = spike_window_options(cx);
-        let opened = cx.open_window(options, |window, cx| {
-            let view = cx.new(RootView::new);
-            // Focus the root so `simulate_keystrokes` has somewhere to deliver
-            // to, mirroring how a real app focuses its input bar on open.
-            view.focus_handle(cx).focus(window, cx);
-            view
-        });
-
-        match opened {
+        // Both failure modes are the same shape here: a client with no state and
+        // a client with no window have nothing worth showing, so `app::open`
+        // refuses to open one and the reason is reported rather than unwrapped
+        // (AGENTS.md 2.1).
+        match app::open(cx) {
             Ok(_) => cx.activate(true),
-            Err(error) => *failure_in_callback.borrow_mut() = Some(error.into()),
+            Err(error) => *failure_in_callback.borrow_mut() = Some(Box::new(error)),
         }
     });
 

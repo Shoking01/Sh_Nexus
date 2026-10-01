@@ -166,6 +166,37 @@ impl MessageRow {
         true
     }
 
+    /// Replaces the row's palette, and reports whether it changed.
+    ///
+    /// **A palette change is a change, and reporting it as one is what keeps a
+    /// theme change from being half-applied.** A row holds its own `Colors` — it
+    /// outlives the view that built it — so a caller that replaces the list's
+    /// palette has to say so here or every row already on screen keeps drawing the
+    /// theme it was created under.
+    ///
+    /// **A changed palette is reported as changed even when its text did not
+    /// change**, because a different fill can be a different height and
+    /// `gpui::List` is told about heights by this return value. The cost is one
+    /// remeasure of the visible range on the frame after a theme change, coalesced
+    /// by `MessageList::flush_remeasures` into a single range call; the saving is
+    /// rows that stay where they were told to be.
+    pub fn set_colors(&mut self, colors: Colors, cx: &mut Context<Self>) -> bool {
+        if self.colors == colors {
+            return false;
+        }
+        self.colors = colors;
+        cx.notify();
+        true
+    }
+
+    /// The palette this row draws with.
+    ///
+    /// Exposed so a test can assert that a theme change reached the rows rather
+    /// than only the container they sit in.
+    pub fn colors(&self) -> Colors {
+        self.colors
+    }
+
     /// The element for the author-and-time line.
     fn header(&self) -> AnyElement {
         let colors = self.colors;
@@ -329,6 +360,14 @@ impl RowCache {
     /// Returns the row and whether it changed, which is what
     /// [`MessageRow::set`] reports and what the list turns into a remeasure.
     /// A freshly created row counts as changed: it has never been measured.
+    ///
+    /// **`colors` is pushed into an existing row as well as read for a new one,
+    /// and that is not a detail.** A row keeps its own palette, so a caller that
+    /// replaced the list's palette without this would repaint the container and
+    /// leave every recycled row on the previous theme — the failure `AGENTS.md`
+    /// §7.3's rule is about and the one no structural assertion can see. The two
+    /// change reports are folded with `||` because the list's answer to both is the
+    /// same one: remeasure this row.
     pub fn row(
         &mut self,
         spec: RowSpec,
@@ -338,7 +377,15 @@ impl RowCache {
         let key = spec.client_msg_id;
 
         if let Some(existing) = self.rows.get(&key) {
-            let changed = existing.update(cx, |row, cx| row.set(spec, cx));
+            let changed = existing.update(cx, |row, cx| {
+                // Both updates must run, so the fold is a bitwise or rather than
+                // `||`: they are independent writes, and short-circuiting would
+                // silently drop the second one whenever the first reported a
+                // change -- which is exactly the frame a theme switch happens on.
+                let recoloured = row.set_colors(colors, cx);
+                let restated = row.set(spec, cx);
+                recoloured | restated
+            });
             return (existing.clone(), changed);
         }
 
