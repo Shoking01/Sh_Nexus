@@ -7,8 +7,8 @@
 //! |---|---|
 //! | root component | [`Shell`]'s `Render` impl |
 //! | global state | [`open`], through [`bridge::install`] |
-//! | theme provider | [`theme_colors`], handed to the list through `MessageList::set_colors` |
-//! | key handling | [`Shell::on_key_down`] |
+//! | theme provider | [`theme_colors`], handed to the list and the composer at construction |
+//! | key handling | [`Shell::on_key_down`] for `Escape`, and [`InputBar::on_key_down`] for the field's two keys |
 //!
 //! **The list is short because every obligation that could have been written as
 //! a fifth thing here has a named owner somewhere else**, and duplicating an
@@ -103,15 +103,28 @@
 //!
 //! # 5. What this file deliberately does not contain
 //!
-//! `PLAN.md` §6 asks for *"App shell: sidebar + chat area + input bar"*, and **two
-//! of those three are not constructible today**, verified rather than assumed.
+//! `PLAN.md` §6 asks for *"App shell: sidebar + chat area + input bar"*, and the
+//! input bar now exists — [`views::input_bar::InputBar`], composed in
+//! [`Render`] and focused by [`open`]. **It is a separate view rather than a
+//! section of this file, and the reason is the one `bridge.rs` §5 argues
+//! generally: a second place to do something is the audit trail, and a composer
+//! held here would be a second place to answer "what does Enter do".**
+//!
+//! The other two of §6's three are still not constructible today, verified
+//! rather than assumed.
 //!
 //! | Missing | Why it is not here |
 //! |---|---|
 //! | the channel rail | `actions::set_channels` has zero callers because no `DomainEvent` carries a channel list (`bridge.rs` §5), so a rail would render zero channels, permanently |
-//! | the input bar | constructible today through `bridge::try_begin_send`, and it is its own view with its own tests; folding it in here would double the unit and the review slice |
 //! | thread panel, search, editing | `docs/ARCHITECTURE.md` ADR-006 places them outside this work |
 //! | a `tracing::error!` for a failed open | `errors.rs` assigns this file a source-chain log, `tracing` is not in the workspace, and §7.2's approval process is not this unit's business |
+//!
+//! **The composer is not listed among the missing things any more, because
+//! `AGENTS.md` §3.2's rule is that a module that exists and does nothing reads
+//! as finished work** — and the flip side is that a row claiming a feature is
+//! deliberately withheld has to be removed when it is not. It was there in the
+//! draft of this file that first composed the list, and the input-bar work unit
+//! deleted it for exactly that reason.
 //!
 //! **And the shell is silent, which is `AGENTS.md` §7.1's ban on `println!`
 //! arriving as a consequence rather than as a preference.** There is no sanctioned
@@ -128,6 +141,7 @@ use gpui::{
 use crate::core::theme::BuiltIn;
 use crate::errors::ShNexusError;
 use crate::state::bridge::{self, EventSender};
+use crate::ui::views::input_bar::InputBar;
 use crate::ui::views::message_list::MessageList;
 use crate::ui::Colors;
 use crate::UNSIGNED_IN_USER;
@@ -226,6 +240,14 @@ pub fn theme_colors() -> Colors {
 pub struct Shell {
     /// The production message list, the one view this shell composes.
     list: Entity<MessageList>,
+    /// The composer, above nothing and below the list.
+    ///
+    /// **An `Entity` for the same reason [`Self::list`] is one** — see this
+    /// struct's documentation — and for one more: the shell's render must hand
+    /// the composer a stable identity across frames, or the platform's input
+    /// handler, which is registered from a paint callback keyed on the *entity*,
+    /// would be rebuilt against a different target on every frame.
+    input: Entity<InputBar>,
     /// The producer handle `bridge::install` returned, held for the shell's life.
     ///
     /// See the module docs, §2: dropping it closes the inbox.
@@ -241,6 +263,13 @@ pub struct Shell {
     ///
     /// A root component that never takes focus is a window no key reaches, and
     /// `AGENTS.md` §5.2 requires the feature to work from the keyboard alone.
+    ///
+    /// **This is the shell's *fallback* focus target, not the one the window
+    /// opens on.** [`open`] focuses [`Self::composer_focus_handle`] instead,
+    /// because a client that opens with a text field focused is a client the user
+    /// can type into, and this handle is what still catches a key once
+    /// `Escape` has blurred the composer — which is what keeps
+    /// [`RETURN_TO_TAIL_KEY`] a live gesture rather than an orphan.
     focus_handle: FocusHandle,
 }
 
@@ -256,12 +285,18 @@ impl Shell {
     /// receives what it installed and keeps it.
     ///
     /// Three things happen once, here, rather than on a later event: the palette
-    /// is resolved and handed to the list, the list is pointed at
+    /// is resolved and handed to both views, the list is pointed at
     /// [`STARTUP_CHANNEL`], and the drain pump is armed. All three are one-time
     /// wiring, and a constructor is the one place a reader can be sure they are
     /// not conditional.
     pub fn new(sender: EventSender, cx: &mut Context<Self>) -> Self {
         let colors = theme_colors();
+
+        // Taken before either view is built, and moved into `Self` at the end,
+        // because the composer needs it: `Escape` in the field has to hand focus
+        // *somewhere*, and a window left with nothing focused delivers every key
+        // to a dispatch node with no listener on it. See `InputBar::fallback_focus`.
+        let focus_handle = cx.focus_handle();
 
         let list = cx.new(MessageList::new);
         list.update(cx, |list, cx| {
@@ -271,11 +306,21 @@ impl Shell {
             list.show_channel(STARTUP_CHANNEL, cx);
         });
 
+        // The composer is built from the finished list rather than the other way
+        // round, and the order is the dependency: `InputBar` holds the list
+        // because the send gesture is the list's own door
+        // (`MessageList::begin_send`), so a composer built first would be
+        // building a reference to a list that does not exist yet. The palette is
+        // passed in rather than pushed afterwards, because it is applied once
+        // here — see this file's module docs, §4.
+        let input = cx.new(|cx| InputBar::new(list.clone(), focus_handle.clone(), colors, cx));
+
         let shell = Self {
             list,
+            input,
             sender,
             colors,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
         };
         shell.start_drain_pump(cx);
         shell
@@ -288,6 +333,25 @@ impl Shell {
     /// that looks like it.
     pub fn list(&self) -> &Entity<MessageList> {
         &self.list
+    }
+
+    /// The composer this shell composes.
+    ///
+    /// Exposed for the same reason [`Self::list`] is: a test asserting that the
+    /// input bar on screen is the production [`InputBar`] and not a stand-in is
+    /// what makes the wiring claim checkable rather than prose.
+    pub fn input(&self) -> &Entity<InputBar> {
+        &self.input
+    }
+
+    /// The focus handle of the composer — the one this window opens with.
+    ///
+    /// **A dedicated accessor rather than letting [`open`] reach through
+    /// `input().read(..)`, because "what does a new window focus" is a question
+    /// with one answer and `bridge.rs` §5's audit-trail argument is about there
+    /// being one place to read it.**
+    pub fn composer_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input.read(cx).focus_handle(cx)
     }
 
     /// The producer handle, still open.
@@ -370,23 +434,55 @@ impl Shell {
 
     /// Handles a key-down aimed at the window.
     ///
-    /// **One key, and the count is the point rather than a shortfall.** There is
-    /// no input bar in this shell (see the module docs, §5), so there is no text
-    /// field whose keys need consuming, and the one gesture a chat log needs from
-    /// the keyboard is the way back to the newest message: ADR-006's table names
+    /// **One key, and the count is the point rather than a shortfall.** The one
+    /// gesture a chat log needs from the keyboard that a composer does not
+    /// already own is the way back to the newest message: ADR-006's table names
     /// *"stick to the newest message"* as a first-class feature of `List`, and
-    /// `MessageList::follow_tail` is the half of it that a reader who has scrolled
-    /// away needs. `AGENTS.md` §5.2 lists `Escape` among the keys that must work
-    /// from the keyboard alone.
+    /// `MessageList::follow_tail` is the half of it that a reader who has
+    /// scrolled away needs. `AGENTS.md` §5.2 lists `Escape` among the keys that
+    /// must work from the keyboard alone.
     ///
-    /// **Not intercepted, and that matters.** Every other key falls through, and
-    /// GPUI's own `DispatchPhase::Bubble` documentation is why: in the bubble
-    /// phase *"keyboard event listeners are invoked from the focused element to the
+    /// **`Escape` has two owners, and the split is by focus rather than by
+    /// arbitration.** While the composer holds focus, `Escape` is the composer's:
+    /// it hands focus back to [`Self::focus_handle`] and calls
+    /// `cx.stop_propagation`, so this handler never runs. With this handle
+    /// focused, `Escape` is this shell's. **The two keys are sequential
+    /// gestures, not competing ones**, and the user gets both from one key.
+    ///
+    /// **The composer has to *hand focus over* rather than simply drop it, and
+    /// that is a measured property of the framework rather than a style
+    /// preference.** With no element focused, `Window` routes keys to
+    /// `DispatchTree::root_node_id()` (`gpui/src/window.rs:6258`) — and that node
+    /// is **not** this view's element, so a window with nothing focused delivers
+    /// every key to an empty listener list. A composer that blurred and stopped
+    /// would consume `Escape` *and* strand this gesture, breaking `AGENTS.md`
+    /// §5.2's keyboard-only requirement with the very key meant to satisfy it.
+    /// `InputBar::fallback_focus` is the handle it is given for exactly this, and
+    /// `tests/app_shell.rs` asserts both halves: this `Escape` works after the
+    /// composer's, and the composer's does not fire it.
+    ///
+    /// **And this handler adds no `is_focused` test of its own, which was the
+    /// obvious design and the wrong one.** A guard here reading "give up if the
+    /// composer has focus" is **unreachable in every state it tests**:
+    /// `dispatch_key_down_up_event` walks the bubble path focused-node-first
+    /// (`gpui/src/window.rs:6068`) and returns the moment
+    /// `cx.propagate_event` is false, so the composer's `stop_propagation` means
+    /// this function is *not called at all* while the composer has focus. A
+    /// condition that can never be false is a branch nothing tests, and
+    /// `AGENTS.md` §6.1's "any new warning fails the build" is the smaller half
+    /// of why that is a cost. The ownership is real, it is enforced by the
+    /// framework's own ordering, and
+    /// `tests/app_shell.rs::escape_blurs_the_composer_without_returning_the_list_to_the_tail`
+    /// is what proves it rather than restating it in a condition.
+    ///
+    /// **Every other key falls through**, and GPUI's own
+    /// `DispatchPhase::Bubble` documentation is why: in the bubble phase
+    /// *"keyboard event listeners are invoked from the focused element to the
     /// root of the element tree"*, so this handler runs **after** anything the
-    /// focused child handled and a child that stops propagation is not overridden.
-    /// That ordering is what lets the input-bar work unit claim `Escape` for
-    /// itself — a shell that swallowed every key would be a shell that cannot be
-    /// typed into, and fixing that would mean editing this function.
+    /// focused child handled. That ordering is what lets the composer claim
+    /// `Escape` and `Enter` for itself — a shell that swallowed every key would
+    /// be a shell that cannot be typed into, and fixing that would mean editing
+    /// this function.
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.key != RETURN_TO_TAIL_KEY {
             return;
@@ -424,6 +520,13 @@ impl Render for Shell {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.list.clone())
+            // The composer, below the list and last in the column, and the order
+            // is `PLAN.md` §6's: the log above, the field below, which is what a
+            // chat client has looked like since before any of this was a
+            // framework. It is not `flex_grow_1` — the list is — so the field
+            // takes the height its content needs and the log takes the rest,
+            // rather than the two sharing a row of an unbounded column.
+            .child(self.input.clone())
     }
 }
 
@@ -477,11 +580,17 @@ pub fn open(cx: &mut App) -> crate::errors::Result<WindowHandle<Shell>> {
     let options = window_options(cx);
     let opened = cx.open_window(options, move |window, cx| {
         let shell = cx.new(|cx| Shell::new(sender, cx));
-        // Focus the root on open, mirroring how a real client focuses whatever
-        // will receive typing. With no input bar yet that is the shell, and
-        // `AGENTS.md` 5.2 requires the feature to be reachable from the keyboard
-        // alone -- a window nothing focuses is a window whose keys go nowhere.
-        shell.read(cx).focus_handle(cx).focus(window, cx);
+        // Focus the composer on open, mirroring how a real client focuses
+        // whatever will receive typing. That is now the composer and not the
+        // root: a chat window that opens with a text field focused is one the
+        // user can type into, and `AGENTS.md` 5.2 requires the feature to be
+        // reachable from the keyboard alone -- a window nothing focuses is a
+        // window whose keys go nowhere.
+        //
+        // The root is still focusable and still takes `Escape` (see
+        // `Shell::on_key_down`), so nothing is lost by the root not being what
+        // the window starts on.
+        shell.read(cx).composer_focus_handle(cx).focus(window, cx);
         shell
     });
 

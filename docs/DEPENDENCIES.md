@@ -43,8 +43,8 @@ individually is not this file's job, and `gpui`'s own rev is what controls them.
 | 4 | `thiserror` | `2.0.21` | prod (both) | `§3.3` defines `ShNexusError` as a `#[derive(Error)]` enum and `§2.2` mandates `thiserror`. | The constitution names it | `MIT OR Apache-2.0` | verified |
 | 5 | `serde` | `1.0.229` | prod (**wire only**) | The wire boundary. **The client does not depend on it** — see below. | §5 puts serialization at the wire/domain boundary | `MIT OR Apache-2.0` | verified |
 | 6 | `serde_json` | `1.0.151` | prod (both) | The encoding `sh_nexus_wire` speaks. In the client: `errors.rs`'s `Serialization` variant, and `core/theme.rs`'s JSON parsing. | §2.2 mandates it; hand-writing a JSON parser is not an option | `MIT OR Apache-2.0` | verified |
-| 7 | `chrono` | `0.4.45` | prod (both) | `§2.1` requires `DateTime<Utc>` for every timestamp and forbids hand-formatted RFC-3339. | std has no timezone-aware calendar | `MIT OR Apache-2.0` | verified |
-| 8 | `uuid` | `1.26.1` | prod (both) | `§7.4` requires a client-generated UUID as `client_msg_id`. **Defaults only**; `rng` is deliberately off. | `std` has no UUID type | `Apache-2.0 OR MIT` | verified |
+| 7 | `chrono` | `0.4.45` | prod (both) | `§2.1` requires `DateTime<Utc>` for every timestamp and forbids hand-formatted RFC-3339. **`clock` enabled for the client only** — see below. | std has no timezone-aware calendar | `MIT OR Apache-2.0` | verified |
+| 8 | `uuid` | `1.26.1` | prod (both) | `§7.4` requires a client-generated UUID as `client_msg_id`. **`v4` enabled for the client only** — see below. | `std` has no UUID type | `Apache-2.0 OR MIT` | verified |
 | 9 | `smallvec` | `1.16.2` | prod (both) | `§2.3` mandates it for small collections and names "reactions on a message". No deps, no build script, no C. | Inline `[Reaction; 2]` is the only zero-cost alternative | `MIT OR Apache-2.0` | verified |
 | 10 | `pulldown-cmark` | `0.13.4` | prod (client) | `§4.2` names markdown as a mandatory test target. `default-features = false` to drop the HTML renderer. | `§4.2` names the behaviour; no std equivalent | `MIT` | verified |
 | 11 | `proptest` | `1.11.0` | dev (both) | `§4.4` mandates property tests. `default-features = false`, `features = ["std"]`. | The constitution names it | `MIT OR Apache-2.0` | verified |
@@ -53,6 +53,58 @@ individually is not this file's job, and `gpui`'s own rev is what controls them.
 `License` was read from **each crate's own manifest** via `cargo metadata`, not
 from a summary. Every one is MIT or Apache-2.0, both compatible with this
 project's `MIT`.
+
+## Two feature declarations that were wrong, and the reason it took this long to notice
+
+**Neither `chrono` nor `uuid` gained a crate in this audit. Both gained a
+*feature*, and the reason that is recorded as its own section rather than a
+footnote on the two rows is that the failure mode is invisible.**
+
+Cargo unifies features per crate version, so a crate in the graph that asks for
+`chrono/clock` or `uuid/v4` hands those features to every dependent — including
+this one, whose own manifest did not. Both calls therefore **compiled before this
+project declared them**, and both are called from code this project owns:
+
+| Call | Site | Feature | Who was really enabling it |
+|---|---|---|---|
+| `Utc::now()` | `ui/views/input_bar.rs` | `chrono/clock` | `gpui`, which enables chrono's `default` set |
+| `Uuid::new_v4()` | `ui/views/input_bar.rs` | `uuid/v4` → `uuid/rng` | gpui's tree, via `accesskit` |
+
+**That is the failure mode `PLAN.md` §7's "an assumption that was unverifiable
+rather than merely unmeasured is worse than one that was never made" names, and
+it ran in the direction the file's own §7.2 row 8 used to warn about.** The old
+row said *"Defaults only; `rng` is deliberately off"*, and the old manifest said
+`rng` "will be added when the first real generator lands" — while the build
+already had `rng`, and the only thing missing was the first generator. So the
+declaration was a statement about intent that the resolved graph contradicted,
+and no test could see it: `cargo build` was green either way.
+
+**What changed is that both features are now declared by the crate that uses
+them**, in `crates/sh_nexus/Cargo.toml`, and `cargo metadata` is the check:
+
+```
+sh_nexus      chrono features: ["std","serde","clock"]   uuid features: ["v4"]
+sh_nexus_wire chrono features: ["std","serde"]
+```
+
+**The wire crate's row is the part worth noticing, and it is the boundary
+holding.** It reads no clock and generates no id — `PLAN.md` §5 puts the wall
+clock and the identity on the client side of the boundary, and
+`crates/sh_nexus_wire/tests/dependency_direction.rs` is what keeps it that way.
+Declaring `clock` and `v4` on the client therefore does not make the wire crate
+non-deterministic, and its `mapping` tests, whose `timestamp_floor` and
+`timestamp_ceiling` rules depend on a supplied timestamp rather than a wall
+clock, still do.
+
+**The compile-time cost is zero and the binary-size cost is unmeasured, stated as
+such.** Both features were already in the resolved graph and in the built binary;
+§7.2.4's numbers below are therefore unchanged, and the release-binary figure in
+`docs/BASELINES.md` is the one that would have moved if this had been a real
+dependency. `uuid/v4` adds a `getrandom` call **per generated id** — one per
+`Enter` — which is a per-gesture cost and not a per-frame one, and it is the cost
+`PLAN.md`'s idempotent-send design is built on: a `client_msg_id` that exists
+before the server has seen the message is what makes the optimistic row and the
+later `ACK` the same row.
 
 ## §7.2.2 — maintenance signals, stated honestly
 

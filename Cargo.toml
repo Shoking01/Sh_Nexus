@@ -70,14 +70,26 @@ serde_json = "1"
 #   timestamps and PLAN.md 3 forbids hand-formatted RFC-3339. chrono is the
 #   only crate that satisfies that; `std` time cannot do timezone-aware UTC
 #   arithmetic or RFC-3339 round-tripping.
-#   Feature choice: `default-features = false` with `["std", "serde"]`.
-#   The default set is `["clock", "std", "oldtime", "wasmbind"]`; `clock` pulls
-#   `iana-time-zone` and `Utc::now()`, and work unit 1A needs neither. Excluding
-#   them also keeps timestamp *validation* pure and deterministic -- see the
+#   Feature choice: `default-features = false` with `["std", "serde"]` here, and
+#   `crates/sh_nexus/Cargo.toml` adds `clock` for itself. The default set is
+#   `["clock", "std", "oldtime", "wasmbind"]`; `clock` pulls `iana-time-zone` and
+#   `Utc::now()`.
+#   `clock` was excluded because work unit 1A needed neither, and excluding it
+#   kept timestamp *validation* pure and deterministic -- see the
 #   `timestamp_floor`/`timestamp_ceiling` rules in `network/mapping.rs`, whose
-#   tests would otherwise depend on a wall clock. GPUI's own tree may enable
-#   `clock` transitively (features unify per-build), so this is a declaration
-#   of what THIS crate needs, not a guarantee the binary omits `iana-time-zone`.
+#   tests would otherwise depend on a wall clock. It is now needed, and the
+#   reason is narrow: `ui/views/input_bar.rs` calls `Utc::now()` when Enter
+#   mints a send, because `AGENTS.md` 3.2 gives `state/` no clock and
+#   `bridge.rs` assigns the timestamp to the *caller*.
+#   The determinism argument still holds where it was written, because the
+#   *wire* crate keeps `["std", "serde"]` -- `cargo metadata` shows
+#   `sh_nexus_wire` with no `clock` -- and `network/mapping.rs` does not read a
+#   clock. Adding `clock` to the client does not make a validation deterministic
+#   by depending on anything new; it names the one call site that exists.
+#   The honest part: `Utc::now()` compiled here before `clock` was declared,
+#   because gpui enables chrono's `default` features and features unify per
+#   crate version. The previous version of this comment said so and then treated
+#   it as acceptable; it is the reason the feature is declared explicitly now.
 # ---------------------------------------------------------------------------
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 
@@ -86,14 +98,24 @@ chrono = { version = "0.4", default-features = false, features = ["std", "serde"
 #   recent commits | no new compile units.
 #   Criterion 1: `AGENTS.md` 7.4 requires a client-generated UUID
 #   (`client_msg_id`) on every client frame, and `PLAN.md` 2 lists uuid.
-#   Feature choice: defaults only (`std`). The `v4`/`rng` features are NOT
-#   enabled in 1A: no production code in this unit generates an id -- the
-#   generators are `state/actions.rs` and `network/`, which are Phase 4. The
-#   1A tests build ids deterministically from `Uuid::from_bytes`, which is
-#   better test hygiene than a random id per assertion. `rng` will be added
-#   when the first real generator lands, as its own justified change.
-#   `serde` is likewise not needed: the wire crate carries `client_msg_id` as a
+#   Feature choice: defaults only (`std`) here; `crates/sh_nexus/Cargo.toml`
+#   adds `v4` for itself. The `v4`/`rng` features were NOT enabled through work
+#   unit 1A because no production code generated an id: the 1A tests built ids
+#   deterministically from `Uuid::from_bytes`, which is better test hygiene than
+#   a random id per assertion, and this comment said `rng` "will be added when
+#   the first real generator lands, as its own justified change".
+#   That generator is `ui/views/input_bar.rs`: Enter mints the `client_msg_id`
+#   for the optimistic row, because `bridge.rs` states the bridge has no id
+#   source and the caller mints it. `v4` implies `rng`, which is a `getrandom`
+#   call per generated id -- one per Enter, not per frame. The alternative, a
+#   counter through `from_u128`, is an identity the server would have to trust
+#   and would collide across two clients.
+#   `serde` is still not needed: the wire crate carries `client_msg_id` as a
 #   `String` and the boundary parses it, so the wire layer holds no uuid.
+#   The honest part, and the reason the feature is declared explicitly rather
+#   than left to unify: `Uuid::new_v4()` compiled here before `v4` was
+#   declared, because gpui's tree enables `uuid/v4`. A declaration that says
+#   nothing while the build depends on someone else's is not a declaration.
 # ---------------------------------------------------------------------------
 uuid = "1"
 

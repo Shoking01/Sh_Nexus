@@ -65,20 +65,38 @@ serde_json = { workspace = true }
 # chrono: `AGENTS.md` 2.1 requires chrono::DateTime<Utc> for every timestamp and
 # forbids hand-formatted RFC-3339, and PLAN.md section 3 repeats it. Used by the
 # domain models and by the boundary's timestamp validation.
-chrono = { workspace = true }
+#
+# `clock` is the one feature beyond `std` and `serde`, and it is declared here
+# rather than left to chance. `ui/views/input_bar.rs` calls `Utc::now()` on
+# Enter: `state/` is given no clock by `AGENTS.md` 3.2 and `bridge.rs` states
+# that the *caller* supplies the timestamp, so the composer is that caller and
+# somebody has to read the clock. It already compiled before this line existed
+# -- but only because gpui enables chrono's `default` features and Cargo
+# unifies features per crate version, so this declaration was lying about what
+# the crate needs. Relying on another crate's feature set is precisely the
+# fragility the comment below used to describe; `docs/DEPENDENCIES.md` row 7
+# records the audit.
+chrono = { workspace = true, features = ["clock"] }
 
 # uuid: `AGENTS.md` 7.4 requires a client-generated UUID as the client_msg_id, and
 # PLAN.md section 5 types it `Uuid` in the domain where the wire carries a
 # String. That split is what makes "must be a UUID" a rule the boundary can
 # enforce and a test can check.
 #
-# Defaults only (`std`); the `v4`/`rng` features are deliberately NOT enabled.
-# Nothing in work unit 1A generates an id -- the generators are
-# state/actions.rs and network/, which are Phase 4 -- and the 1A tests build ids
-# deterministically with Uuid::from_bytes, which is better hygiene than a random
-# id per assertion. `rng` is added as its own justified change when the first
-# real generator lands.
-uuid = { workspace = true }
+# `v4` is the first real generator, and it lives in `ui/views/input_bar.rs`:
+# Enter mints the `client_msg_id` for the optimistic row, because `bridge.rs`
+# states the bridge has no id source -- the caller mints it. `v4` implies
+# `rng`, which is a `getrandom` call per id; that is one call per Enter, not a
+# per-frame cost, and the alternative (`from_u128` off a counter) is an identity
+# the server would have to trust.
+#
+# This feature was previously absent *by policy* -- the comment said `rng` "will
+# be added when the first real generator lands, as its own justified change".
+# That change is this one. The part worth recording is that `Uuid::new_v4()`
+# compiled before it was declared, because gpui's tree enables `uuid/v4` and
+# Cargo unifies features per crate version: our declaration was not the reason
+# the code built. `docs/DEPENDENCIES.md` row 8 carries the audit.
+uuid = { workspace = true, features = ["v4"] }
 
 # smallvec: `AGENTS.md` 2.3 mandates it for small collections and names
 # "reactions on a message" as the case; PLAN.md section 5 sizes the inline buffers
