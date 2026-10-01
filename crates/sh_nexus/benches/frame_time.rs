@@ -15,12 +15,14 @@
 //!
 //! # Why this is a bench target and not `src/main.rs`
 //!
-//! `src/lib.rs::run` still opens the Phase 0 spike's `RootView`, and `app.rs`
-//! (the real shell) is a later work unit in `PLAN.md` section 4. Building
-//! `app.rs` in order to measure it would fold a planned feature into a
-//! measurement one, and sections 6.1 and 6.3 both track the *release binary* --
-//! so the instrument lives behind `required-features = ["profiling"]`, next to
-//! nothing else, and reaches no product artifact.
+//! `src/app.rs` is the real shell and `run()` opens it, but this bench builds
+//! **its own** root view -- `BenchRoot`, holding one `MessageList` and nothing
+//! else -- rather than the application's: the question here is what the message
+//! list costs under a known viewport with no other consumer, and a shell that
+//! also carried a rail and an input bar would answer a different one. Sections
+//! 6.1 and 6.3 both track the *release binary*, so the instrument lives behind
+//! `required-features = ["profiling"]`, next to nothing else, and reaches no
+//! product artifact.
 //!
 //! # How to run it
 //!

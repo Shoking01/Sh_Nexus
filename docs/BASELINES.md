@@ -108,7 +108,7 @@ work units.
 | `state/` coverage | **98.16%** regions | `docs/COVERAGE.md` |
 | `state/bridge.rs` | **100%** (185/185 regions, 29/29 functions) | `docs/COVERAGE.md` |
 | Workspace coverage | **96.42%** regions | `docs/COVERAGE.md` |
-| Release binary | **9.95 MB** | this file |
+| Release binary | **10.80 MB** (was 9.95 MB before work unit 3A) | this file |
 | Release build | **288 s** at `-j 6` | this file |
 | Dev build (warm) | 14 s | this file |
 | Source | 42 `.rs` files, 31,341 lines | — |
@@ -121,6 +121,23 @@ The coverage and test figures are re-derived from `cargo llvm-cov
 rules in `docs/COVERAGE.md` §5.5 — a percentage that disagrees with its own
 fraction survived four correct reconciliations in work unit 1D, so every number
 above is either measured here or points at the file where it is measured.
+
+**The binary grew 0.86 MB in work unit 3A, and §6.3's justification threshold is
+5 MB.** Measured: 9,946,368 B before, 11,325,440 B after — **+899,072 B,
++8.6%**, built with `cargo build --release --workspace -j 6` on the same machine
+for both arms.
+
+The likely cause is that `core/theme.rs` was already compiled into the crate but
+previously unreachable from `run()`, so the linker could drop it; `src/app.rs`
+now resolves `BuiltIn::Dark` at startup, which pulls the theme parser and its
+`serde_json` deserialiser into the binary. **That explanation is inference, not
+measurement** — it was not established by comparing symbol tables, and it should
+not be quoted as a fact without doing that. What *is* measured is the 899,072
+bytes.
+
+It is still under §6.3's threshold, so no exception is required. It is recorded
+here because a baseline row that moves silently is the failure mode this file
+exists to prevent.
 
 ## Message list: one figure measured, one measured only as a floor
 

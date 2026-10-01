@@ -157,6 +157,41 @@ impl MessageList {
         self.colors
     }
 
+    /// Replaces the palette every row draws with.
+    ///
+    /// **The theme provider's only door into this view, and it exists because
+    /// without one `AGENTS.md` §3.1's obligation is unfulfillable.** `colors` was
+    /// hard-coded at construction and only readable, so a shell that resolved a
+    /// theme had no way to hand it over — a theme provider that cannot reach the
+    /// renderer is a provider that renders nothing.
+    ///
+    /// **This notifies, and that is the whole difference from [`MessageList::sync`].**
+    /// `sync` runs at the top of every render and must not schedule a frame, or
+    /// the view would mark itself dirty during its own frame and ask for another
+    /// one forever. A theme change is the opposite: it is a caller-driven change
+    /// to something the view draws, made between frames, and the caller is
+    /// entitled to exactly one repaint for it. Two calls, two contracts, and the
+    /// reason to say so is that merging them into a single "reconcile and repaint"
+    /// method is the obvious refactor and it would reintroduce the redraw loop.
+    ///
+    /// **Every row is told, not only the container.** A row caches its own
+    /// `Colors` (see [`super::message_row`]), so a palette that stopped at this
+    /// view would repaint the list's background and leave every recycled row
+    /// drawing the theme it was built under — which `AGENTS.md` §7.3's rule is
+    /// about, and which no structural assertion would notice: a bubble in the old
+    /// background is still a bubble.
+    ///
+    /// No remeasure is requested here, and `MessageList::render_row` will record
+    /// the rows that changed on the next pass: a row whose palette changed is
+    /// reported as changed by the cache, which routes to `remeasure_items` through
+    /// the deferred path the module docs describe. Doing it eagerly from this
+    /// method would be the `remeasure` from inside a layout that §"What this file
+    /// deliberately does not do" is written against.
+    pub fn set_colors(&mut self, colors: Colors, cx: &mut Context<Self>) {
+        self.colors = colors;
+        cx.notify();
+    }
+
     /// The list's own state, for a caller that needs to scroll it.
     ///
     /// Handed out because scrolling to a message (`scroll_to_reveal_item`) and
