@@ -731,6 +731,108 @@ real frame loop; the headless harness has no renderer on Windows (Phase 0 findin
 3), so neither can be produced from here. `docs/BASELINES.md` states the method
 for both and what is now measurable that was not before.
 
+#### Implementation notes — work unit 3E, 2026-10-01
+
+Work unit 3D shipped a retry affordance that was pointer-only and recorded the
+omission as a defect; `AGENTS.md` §5.2 requires keyboard-only operation. This
+section is the design that closed it, and it is here rather than in a code
+comment because **3D left the choice open and a reader of this ADR would
+otherwise have to re-derive it from the framework.**
+
+1. **The keyboard model is a list-level selection, not per-row focus handles.**
+   A row cannot host one: a `FocusHandle` is state on a row that step 3's
+   recycling says must hold none, `RowCache` evicts at `MAX_RETAINED_ROWS`, and —
+   the decisive property — **GPUI rebuilds the tab-stop registry every painted
+   frame** (`window.rs` clears `tab_stops`; `div.rs` inserts during paint), so a
+   handle's tab stop exists only on frames where its element is painted. A row
+   scrolled out of the overdraw would take a window's focus with it, and
+   `focus_next` reads the already-rendered frame. A `client_msg_id` held by the
+   list has neither failure mode: the list is never evicted and is painted on
+   every frame the window exists.
+2. **The selection is an identity, not an index, and the history bound is why.**
+   Step 3's bound evicts the channel's **oldest** row, which shifts every index
+   below it down by one. An index-keyed cursor would point at a different message
+   one arrival after it was placed. `client_msg_id` is also the key `RowSpec` and
+   `RowCache` already use, so this is the third appearance of that identity rather
+   than a new notion of it.
+3. **`ListState::scroll_to`, and not `scroll_to_reveal_item`, and the reason is
+   this ADR's implementation note 1 above.** `scroll_to_reveal_item` does not call
+   `stop_following`, so on a tail-following chat log its `logical_scroll_top` is
+   re-anchored to the end sentinel on the next layout and the cursor the user just
+   placed is undone by the frame that draws it. `scroll_to` suspends following
+   whenever the target is below the end — and it is applied **only when the row is
+   actually off screen**, because called unconditionally it would drag the log to
+   the top of the cursor row on every arrow keypress.
+4. **`enter` and `space` stop propagation only when they changed something.**
+   `Window::dispatch_keystroke` synthesises a `key_char` for both
+   (`platform/keystroke.rs`), so a list that swallowed `enter` on a row with
+   nothing to do would leave a newline in whatever text input a future focus
+   arrangement put inside it. Today nothing observes that — the composer is a
+   *sibling* and registers its input handler only while it holds focus — which is
+   precisely why the rule is written for the future rather than for today.
+
+**What this work unit did not do, and it is a real gap rather than an omission.**
+Nothing binds `Tab` to `Window::focus_next`: `focus_next` has **no caller
+anywhere in `gpui` at this rev** outside the framework's own tests, and this crate
+has no keymap. Adding that binding is a gesture and a product decision, so it is
+recorded rather than picked. What was *not* deferred is the decision 3B made and
+3E kept: `app::open` continues to focus the composer, because a client that opens
+on the log is a client that cannot be typed into.
+
+#### Implementation notes — the `Escape` ladder, 2026-10-01
+
+**The gap above was closed by a route that is not `Tab`, and this section exists
+because the ADR is where a reader looks before believing that.** The list's cursor
+was reachable by API and by test and by no key in the shipped client; it is now
+reachable by **`Escape`, twice**:
+
+```text
+composer --escape--> shell root --escape--> log --down/up--> cursor --enter--> retry
+```
+
+`InputBar`'s `escape` already handed focus to the shell's root handle — that part
+existed and was tested, and its purpose was only to keep the shell's own gesture
+reachable. What was missing was the **third rung**: `Shell::on_key_down` now also
+hands focus to `MessageList`'s handle, which is the handle 3E put on the list.
+
+5. **The chain is a ladder and it stops at the bottom. It is not a ring, and the
+   reason is the requirement rather than a preference.** The alternative was for
+   the log to hand `escape` *back* to the composer, which would make the key a
+   three-way toggle: a user pressing it repeatedly would walk the three views
+   forever. It was rejected for one reason stated three times — it would need a
+   **second owner** of `escape` against the rule note 4 above, it would make the
+   log's own *return-to-newest* gesture unreachable from *inside* the log (exactly
+   where a reader who has scrolled away most wants it), and it is a focus loop.
+6. **Termination is a measured property of the framework, not a flag in this
+   crate.** `Window::focus` returns early when the handle it is given already holds
+   the focus (`gpui/src/window.rs:2303`), so the shell re-asserting the log's handle
+   on every press is free and cannot recurse. Combined with note 4 — the list's
+   handler does not claim `escape`, so the shell's is the only owner — the result
+   is that the outcome of a press is a function of where focus already is, and
+   nothing in the crate ever moves focus back up. `tests/app_shell.rs`
+   (`a_second_escape_on_the_log_is_a_fixed_point_and_does_not_bounce`) presses
+   three times rather than once, because one press cannot tell a fixed point from
+   a two-cycle, and two cannot tell a two-cycle from a three-way toggle.
+7. **The cost, stated rather than hidden: the ladder is one-way, so a keyboard-only
+   user cannot get *back* from the log to the field.** This is a real hole and it
+   is **pre-existing, not introduced**: before the ladder, a single `escape` already
+   stranded the keyboard on the shell root, and no key in the crate returns focus to
+   the composer either way. The cure is the `Tab` binding recorded above — which
+   would reach the log by traversal *and* return by traversal — not a fourth rung.
+   **`AGENTS.md` §5.2 is therefore not satisfied in full by what exists**, and no
+   code comment, test name or table in this repository claims that it is.
+8. **`tab_index(0)` is deliberately absent on the log's handle.** With nothing
+   calling `focus_next` and the tab-stop registry rebuilt every painted frame, a
+   `tab_index` would declare an intent nothing implements — which reads as *more*
+   complete than the absence it would appear to fill, and is strictly worse.
+
+**What a keyboard purist would object to, named in one sentence:** `Escape` now
+means two different things depending on where focus is (leave the field; return the
+log to its newest message), and the traversal key a user expects to move between
+panes does not exist. That is the trade this work unit makes, and it is recorded
+here rather than in a code comment because the next reader's first question is
+"where is `Tab`".
+
 #### Alternatives considered
 
 | Option | Why not chosen |

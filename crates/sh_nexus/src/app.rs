@@ -8,7 +8,7 @@
 //! | root component | [`Shell`]'s `Render` impl |
 //! | global state | [`open`], through [`bridge::install`] |
 //! | theme provider | [`theme_colors`], handed to the list and the composer at construction |
-//! | key handling | [`Shell::on_key_down`] for `Escape`, and [`InputBar::on_key_down`] for the field's two keys |
+//! | key handling | [`Shell::on_key_down`] for the `Escape` ladder, and [`InputBar::on_key_down`] for the field's two keys |
 //!
 //! **The list is short because every obligation that could have been written as
 //! a fifth thing here has a named owner somewhere else**, and duplicating an
@@ -200,7 +200,13 @@ pub const STARTUP_CHANNEL: &str = "c_startup";
 pub const ACTIVE_THEME: BuiltIn = BuiltIn::Dark;
 
 /// The key [`Shell::on_key_down`] acts on, as `gpui`'s keystroke parser spells it.
-const RETURN_TO_TAIL_KEY: &str = "escape";
+///
+/// **Named for the key rather than for the effect, and that is a correction.** It
+/// was `RETURN_TO_TAIL_KEY`, which was honest while the handler did one thing.
+/// The handler now does two — the log returns to the newest message *and* the log
+/// takes the keyboard — and a constant named after half of it is the kind of name
+/// that makes the next reader look for a second handler that does not exist.
+const ESCAPE_KEY: &str = "escape";
 
 /// Resolves [`ACTIVE_THEME`] into the colours every element in the shell's tree
 /// draws with.
@@ -264,12 +270,14 @@ pub struct Shell {
     /// A root component that never takes focus is a window no key reaches, and
     /// `AGENTS.md` §5.2 requires the feature to work from the keyboard alone.
     ///
-    /// **This is the shell's *fallback* focus target, not the one the window
-    /// opens on.** [`open`] focuses [`Self::composer_focus_handle`] instead,
-    /// because a client that opens with a text field focused is a client the user
-    /// can type into, and this handle is what still catches a key once
-    /// `Escape` has blurred the composer — which is what keeps
-    /// [`RETURN_TO_TAIL_KEY`] a live gesture rather than an orphan.
+    /// **This is the shell's *middle* focus target, not the one the window opens
+    /// on and not the one the keyboard ends on.** [`open`] focuses
+    /// [`Self::composer_focus_handle`] instead, because a client that opens with a
+    /// text field focused is a client the user can type into. This handle is the
+    /// rung between: it is what [`InputBar`] hands focus to when `Escape` leaves
+    /// the field, and [`Shell::on_key_down`] hands focus *on* to the log from it.
+    /// **The three are a ladder and not a ring**, and
+    /// [`Shell::on_key_down`] says why the ladder does not come back up.
     focus_handle: FocusHandle,
 }
 
@@ -449,6 +457,57 @@ impl Shell {
     /// focused, `Escape` is this shell's. **The two keys are sequential
     /// gestures, not competing ones**, and the user gets both from one key.
     ///
+    /// # The chain: composer → shell → log, and where it stops
+    ///
+    /// **This handler is the middle rung, and it is the rung that makes the log
+    /// reachable by key at all.** `InputBar`'s `fallback_focus` is this shell's own
+    /// root handle, so the first `Escape` lands here; the second hands focus to the
+    /// list's handle, and from there `up`/`down` move the log's cursor and `enter`
+    /// retries a failed send. Before this, the log was reachable by API and by test
+    /// and by **no key in the shipped client** — the gap ADR-006's 3E notes record
+    /// (`docs/ARCHITECTURE.md`).
+    ///
+    /// **The chain is a ladder, and it stops at the bottom rather than
+    /// alternating.** A second `Escape` while the list is focused runs *this*
+    /// handler again — [`MessageList::on_key_down`] deliberately does not claim
+    /// `escape`, so the key travels up the dispatch path — and lands on exactly the
+    /// same state: the log snaps to the newest message and the list holds focus,
+    /// which it already did. **That is idempotent because of a measured property of
+    /// the framework rather than a flag in this file:** [`Window::focus`] returns
+    /// early when the handle it is given already holds the focus
+    /// (`gpui/src/window.rs:2303`), so re-asserting it is free, cannot recurse, and
+    /// no handler in this crate ever targets the shell from below. "Terminating"
+    /// means exactly that: the result is a function of where focus already is, and
+    /// nothing moves it back up.
+    ///
+    /// **The alternative was a cycle — the list handing `Escape` back to the
+    /// composer — and it is rejected for one reason stated three times.** It would
+    /// make `escape` a toggle, so a user pressing it repeatedly walks three views
+    /// forever, which is the focus loop this chain exists to avoid. It would need a
+    /// **second owner** of `escape`, against the rule 3D established and the
+    /// paragraph below depends on: one key, one place that answers what it does.
+    /// And it would make the log's own "back to the newest message" gesture
+    /// unreachable from *inside* the log — which is exactly where a reader who has
+    /// scrolled away most wants it.
+    ///
+    /// **The cost is stated rather than hidden: the ladder does not come back up, so
+    /// a keyboard-only user who presses `Escape` twice cannot return to the composer
+    /// with a key.** That is a real hole and it is **pre-existing rather than
+    /// introduced here**: with one rung, a single `Escape` already stranded the
+    /// keyboard on this shell root, and nothing in the crate has a key that returns
+    /// focus to the composer. The missing piece is a `Tab` binding on
+    /// [`Window::focus_next`], which is a gesture and a product decision (ADR-006,
+    /// 3E) and is **not** taken here. What this change does is make the log
+    /// reachable and its retry operable from the keyboard, which is what
+    /// `AGENTS.md` §5.2 asks of the feature.
+    ///
+    /// **This is a real keyboard route and it is not `Tab`.** A keyboard purist
+    /// expects `Tab` to move between panes and `Shift+Tab` to move back, and this
+    /// client has neither; `Escape` meaning two different things depending on where
+    /// focus is is the trade this change makes instead of the one a binding would
+    /// have made. **`AGENTS.md` §5.2 is therefore *not* satisfied in full** — see
+    /// ADR-006's 3E notes — and nothing in this file claims otherwise.
+    ///
     /// **The composer has to *hand focus over* rather than simply drop it, and
     /// that is a measured property of the framework rather than a style
     /// preference.** With no element focused, `Window` routes keys to
@@ -461,19 +520,23 @@ impl Shell {
     /// `tests/app_shell.rs` asserts both halves: this `Escape` works after the
     /// composer's, and the composer's does not fire it.
     ///
-    /// **And this handler adds no `is_focused` test of its own, which was the
-    /// obvious design and the wrong one.** A guard here reading "give up if the
-    /// composer has focus" is **unreachable in every state it tests**:
+    /// **And this handler still adds no `is_focused` test of its own, which was
+    /// the obvious design and the wrong one.** A guard here reading "give up if
+    /// the composer has focus" is **unreachable in every state it tests**:
     /// `dispatch_key_down_up_event` walks the bubble path focused-node-first
-    /// (`gpui/src/window.rs:6068`) and returns the moment
-    /// `cx.propagate_event` is false, so the composer's `stop_propagation` means
-    /// this function is *not called at all* while the composer has focus. A
-    /// condition that can never be false is a branch nothing tests, and
-    /// `AGENTS.md` §6.1's "any new warning fails the build" is the smaller half
-    /// of why that is a cost. The ownership is real, it is enforced by the
-    /// framework's own ordering, and
-    /// `tests/app_shell.rs::escape_blurs_the_composer_without_returning_the_list_to_the_tail`
-    /// is what proves it rather than restating it in a condition.
+    /// (`gpui/src/window.rs:6068`) and returns the moment `cx.propagate_event`
+    /// is false, so the composer's `stop_propagation` means this function is *not
+    /// called at all* while the composer has focus. A condition that can never be
+    /// false is a branch nothing tests, and `AGENTS.md` §6.1's "any new warning
+    /// fails the build" is the smaller half of why that is a cost. **The same
+    /// argument covers the list, and it is why the hand-off below needs no guard
+    /// either:** the list's own handler does not claim `escape`, so this function
+    /// *is* called with the list focused, and doing the same thing in both cases
+    /// is what makes the chain idempotent. The ownership is real, it is enforced
+    /// by the framework's own ordering, and
+    /// `tests/app_shell.rs::escape_hands_focus_to_the_shell_without_returning_the_list_to_the_tail`
+    /// plus `escape_chains_from_the_composer_to_the_log_and_its_retry` is what
+    /// proves it rather than restating it in a condition.
     ///
     /// **Every other key falls through**, and GPUI's own
     /// `DispatchPhase::Bubble` documentation is why: in the bubble phase
@@ -482,12 +545,28 @@ impl Shell {
     /// focused child handled. That ordering is what lets the composer claim
     /// `Escape` and `Enter` for itself — a shell that swallowed every key would
     /// be a shell that cannot be typed into, and fixing that would mean editing
-    /// this function.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.key != RETURN_TO_TAIL_KEY {
+    /// this function. **It is also the ordering the hand-off relies on**: with the
+    /// list focused, this handler runs *after* the list's, so the list gets first
+    /// refusal on `escape` and can claim it in future without this function
+    /// noticing.
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key != ESCAPE_KEY {
             return;
         }
+
         self.list.update(cx, |list, cx| list.follow_tail(cx));
+
+        // The hand-off, and it is unconditional for the reason the section above
+        // gives: this handler is reached with the shell root focused *or* with the
+        // list focused, and both want the log to be where the keyboard is. A
+        // `focus` call on the handle that already holds focus returns before
+        // mutating anything (`gpui/src/window.rs:2303`), so the second `escape`
+        // costs one comparison and changes nothing.
+        //
+        // The handle is read out of the list rather than held here, so there is
+        // exactly one place in the crate that knows the log's focus target.
+        let log = self.list.read(cx).focus_handle(cx);
+        log.focus(window, cx);
     }
 }
 

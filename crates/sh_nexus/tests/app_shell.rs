@@ -19,6 +19,8 @@
 //! | One tick applies **every** queued event, and the rows are on screen | [`one_tick_applies_every_queued_event_and_puts_the_rows_on_screen`] | runtime, parameterised |
 //! | The applied palette is the active built-in theme, all the way to the rows | [`the_shell_applies_the_active_theme_to_the_rows`] | runtime + parsed document |
 //! | The shell's one key reaches the list | [`escape_returns_the_list_to_the_newest_message`] | runtime, simulated keystroke |
+//! | **`Escape` chains composer → shell → log, and the cursor activates there** | [`escape_chains_from_the_composer_to_the_log_and_its_retry`] | runtime, simulated keystroke, full chain |
+//! | **A second `Escape` on the log is a fixed point, not a focus loop** | [`a_second_escape_on_the_log_is_a_fixed_point_and_does_not_bounce`] | runtime, repeated keystroke |
 //! | The composer is on screen, below the log, and is the production view | [`the_input_bar_is_on_screen_below_the_list`] | runtime, real bounds |
 //! | The window opens with the field focused, not the shell root | [`the_window_opens_with_the_composer_focused`] | runtime |
 //! | **Typing reaches the draft** | [`typing_reaches_the_draft_through_the_platform_input_handler`] | runtime, platform input path |
@@ -43,6 +45,8 @@
 //! | a `send` that clears unconditionally | a refused send **silently eats what the user typed** | [`a_blank_enter_does_not_send_and_does_not_destroy_the_draft`] |
 //! | a composer's `escape` that fails to stop propagation | `escape` also yanks the log to the newest message | [`escape_hands_focus_to_the_shell_without_returning_the_list_to_the_tail`] |
 //! | a composer's `escape` that drops focus instead of handing it over | `escape` works once, and then **the shell's own `escape` is dead forever** | the same test, second half |
+//! | **the shell's `escape` that does not hand focus to the log** | the log renders, `up`/`down` work when the list is focused *by API*, and **no key in the client can reach it** — the cursor and its retry are pointer- and test-only | [`escape_chains_from_the_composer_to_the_log_and_its_retry`] |
+//! | **an `escape` handler that hands focus back up the chain** | a focus loop: `escape` stops doing anything, and focus ends up where nobody intended, with no error anywhere | [`a_second_escape_on_the_log_is_a_fixed_point_and_does_not_bounce`] |
 //!
 //! **The first of those is the one that cannot be caught by reading the code.**
 //! `Window::dispatch_keystroke` forwards a character to the focused input
@@ -245,6 +249,57 @@ fn draft(cx: &VisualTestContext, shell: &Entity<Shell>) -> String {
         shell
             .input()
             .read_with(app, |input, _| input.draft().to_owned())
+    })
+}
+
+/// The `client_msg_id` of the one message this client has sent, read through the
+/// seam.
+///
+/// **A helper rather than a fixture constant, and the reason is
+/// [`InputBar::send`]:** the composer mints the id with `Uuid::new_v4()`, so no
+/// test can know it in advance. [`first_sent`] exists for the same reason and
+/// returns everything *except* the id, because a test that needs to reject the
+/// send afterwards has to address it.
+fn sent_id(cx: &VisualTestContext, shell: &Entity<Shell>) -> Option<Uuid> {
+    shell.read_with(cx, |_shell, app| {
+        bridge::try_read(app, |state| {
+            state
+                .messages(STARTUP_CHANNEL)
+                .first()
+                .map(|message| message.client_msg_id)
+        })
+        .flatten()
+    })
+}
+
+/// Where the window's keyboard currently is, as a name a failure message can use.
+///
+/// **The three answers are the three rungs of the `Escape` ladder, and the
+/// question is asked on the window rather than inferred from what a gesture did.**
+/// `FocusHandle::is_focused` is `window.focus == Some(self.id)`
+/// (`gpui/src/window.rs:606`), so this reads the same fact the framework's own
+/// dispatch reads when it builds a key's path — which is what makes it the right
+/// question to ask about focus rather than "did anything move".
+///
+/// **`composer` is checked before `list` and `shell` because only one handle can
+/// hold the focus at a time**, so the order is only about which assertion message
+/// a broken chain produces; `none` is the fourth answer and the one the chain must
+/// never produce, because a window with nothing focused routes every key to
+/// `DispatchTree::root_node_id()` — a node that is not this view's element.
+fn focus_is_on(cx: &mut VisualTestContext, shell: &Entity<Shell>) -> &'static str {
+    shell.update_in(cx, |shell, window, cx| {
+        if shell.composer_focus_handle(cx).is_focused(window) {
+            "composer"
+        } else if shell
+            .list()
+            .read_with(cx, |list, app| list.focus_handle(app).is_focused(window))
+        {
+            "list"
+        } else if shell.focus_handle(cx).is_focused(window) {
+            "shell"
+        } else {
+            "none"
+        }
     })
 }
 
@@ -1101,6 +1156,225 @@ fn escape_hands_focus_to_the_shell_without_returning_the_list_to_the_tail(cx: &m
          DispatchTree::root_node_id(), which is not the root view's element, so \
          the shell's own Escape would be stranded forever -- AGENTS.md 5.2 \
          keyboard-only operation broken by the key meant to provide it"
+    );
+    assert_eq!(
+        focus_is_on(cx, &shell),
+        "list",
+        "and the shell's own `escape` is also the rung that hands the keyboard to \
+         the log. Asserted here because this test already holds the shell root \
+         focused, so it is free; walking the whole chain from the composer is \
+         `escape_chains_from_the_composer_to_the_log_and_its_retry`'s job"
+    );
+}
+
+/// The whole chain, by key: composer → shell → log → cursor → retry.
+///
+/// **This is the test that makes the log reachable by key a claim rather than a
+/// wiring diagram, and every arrow in it is a link that can break alone.** A
+/// chain that renders correctly and drops the focus one rung up satisfies every
+/// other test in this file: the composer still blurs, the log still snaps to the
+/// tail, and `tests/ui_message_list.rs` still proves the cursor and the retry work
+/// when the list is focused *by API*. So the assertions here are ordered along the
+/// chain and each one names the link it covers:
+///
+/// ```text
+/// composer --escape--> shell --escape--> list --down--> cursor --enter--> Pending
+/// ```
+///
+/// **The first `escape` is asserted to have reached the shell and not the log,
+/// because "the log is reachable" and "the log skipped a rung" are the same test
+/// passing for different reasons.** If the shell handed focus straight to the list
+/// the chain would still work end to end and this assertion would fail — which is
+/// the point: the shell root is a real stop, it owns the log's own
+/// *return-to-newest* gesture, and a chain that routed around it would have made
+/// that gesture unreachable from the shell.
+///
+/// **The fixture is a failed send, and it is built through the production door.**
+/// `MessageSendFailed` is a real [`DomainEvent`] delivered through the shell's own
+/// sender and applied by the shell's own pump, so the row is failed the way a
+/// server's rejection fails it — and `enter` at the end is the same key the
+/// listbox convention uses, dispatched through [`gpui::VisualTestContext::simulate_keystrokes`]
+/// so a handler that is not registered on the focused element cannot pass.
+///
+/// **`down` is the right key and not `up` for this fixture.** With no cursor,
+/// `down` selects the newest row and `up` the oldest; the failed send is the only
+/// row, so either would do — but `down` is the one a user reaches for after
+/// arriving at a log that is tail-following, and choosing it means the test walks
+/// the gesture a person would walk.
+#[gpui::test]
+fn escape_chains_from_the_composer_to_the_log_and_its_retry(cx: &mut TestAppContext) {
+    let (shell, cx) = shell(cx);
+
+    // The optimistic row, through the composer's own send path.
+    focus_composer(cx, &shell);
+    cx.simulate_input("ship it");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let send_id = sent_id(cx, &shell).expect("the composer must have minted a send");
+    assert_eq!(
+        first_sent(cx, &shell).map(|(_, delivery, _)| delivery),
+        Some(Some(DeliveryState::Pending)),
+        "the fixture must be a real optimistic send before anything can fail it"
+    );
+
+    // And the server's rejection, through the shell's own inbox and pump.
+    queued(
+        cx,
+        &shell,
+        DomainEvent::MessageSendFailed {
+            client_msg_id: send_id,
+            code: "forbidden".to_owned(),
+            detail: "you may not post here".to_owned(),
+        },
+    );
+    tick(cx);
+    assert_eq!(
+        first_sent(cx, &shell).map(|(_, delivery, _)| delivery),
+        Some(Some(DeliveryState::Failed)),
+        "the fixture must be a FAILED send before a retry means anything: a \
+         Pending send has nothing to retry and `enter` on it is a no-op"
+    );
+
+    // --- Link 1: composer -> shell. ---------------------------------------
+    assert_eq!(
+        focus_is_on(cx, &shell),
+        "composer",
+        "the window opens on the composer, and this test's first `escape` is the \
+         one that leaves it"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        focus_is_on(cx, &shell),
+        "shell",
+        "the first `escape` must land on the shell's own root handle, not skip \
+         straight to the log. That handle is a real stop: it is what owns the \
+         log's return-to-newest gesture, and a chain that routed around it would \
+         make that gesture unreachable"
+    );
+
+    // --- Link 2: shell -> list. ------------------------------------------
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        focus_is_on(cx, &shell),
+        "list",
+        "the shell's `escape` must hand focus to the log. This is the link the \
+         whole work unit exists for: without it the cursor is reachable by API \
+         and by test and by no key in the shipped client, and AGENTS.md 5.2's \
+         keyboard-only requirement is unmet for the retry"
+    );
+
+    // --- Links 3 and 4: cursor, then activation. -------------------------
+    assert!(
+        following_tail(cx, &shell),
+        "and the log must be at its newest message before the cursor moves, \
+         because the shell's gesture is a real part of what this chain buys"
+    );
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        shell.read_with(cx, |shell, app| shell
+            .list()
+            .read_with(app, |list, _| list.selected())),
+        Some(send_id),
+        "`down` with no cursor selects the newest row, and the fixture's only row \
+         is the failed send. A cursor that did not move here would mean the list's \
+         handler is not running on the focused node, and the `enter` below would \
+         then be pressing nothing"
+    );
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        first_sent(cx, &shell).map(|(_, delivery, _)| delivery),
+        Some(Some(DeliveryState::Pending)),
+        "`enter` on the selected failed row must put it back in flight, through \
+         the chain and not through a direct call. Nothing above this client \
+         transmits it -- `retry_send` does not send and the outbox is Phase 3 -- \
+         so `Pending` is the honest end state"
+    );
+    assert_eq!(
+        showing(cx, &shell),
+        1,
+        "and the same single row, in place: a retry reached by keyboard that \
+         added or removed a row would be a different message"
+    );
+}
+
+/// A second `Escape` on the log is a fixed point, not a bounce.
+///
+/// **The chain has to terminate, and "it does not crash" is not the claim.** The
+/// failure this test exists for is a *focus loop*: a keydown handler that hands
+/// focus somewhere whose handler hands it back, so one keypress moves focus
+/// forever. A loop is not a hang — `Window::focus` bumps a focus generation and
+/// marks the window dirty, and the dispatch walk has already returned by then — so
+/// it would show up as a client whose `Escape` does nothing and whose focus is
+/// somewhere nobody intended, with no error anywhere.
+///
+/// **So the assertion is on where focus is after each further press, and the
+/// presses are three rather than one.** One extra press distinguishes "the second
+/// `escape` reached the shell" from "the second `escape` bounced to the composer";
+/// three distinguishes a fixed point from a two-cycle, which is the shape a
+/// half-built chain takes. The composer is also asserted to be *unreachable* after
+/// the loop, because the alternative design — the log handing `escape` back up to
+/// the field — is precisely the cycle `Shell::on_key_down` rejects.
+///
+/// **`following_tail` is re-asserted rather than assumed idempotent.** The shell's
+/// gesture re-runs on every press, and `follow_tail` is `set_follow_mode(Tail)`
+/// plus `scroll_to_end`; if either were not idempotent the log would drift, and a
+/// test that only checked focus would call that a pass.
+#[gpui::test]
+fn a_second_escape_on_the_log_is_a_fixed_point_and_does_not_bounce(cx: &mut TestAppContext) {
+    let (shell, cx) = shell(cx);
+    focus_composer(cx, &shell);
+
+    // Onto the log, by the chain, so the state under test is the one a user is in.
+    cx.simulate_keystrokes("escape escape");
+    cx.run_until_parked();
+    assert_eq!(
+        focus_is_on(cx, &shell),
+        "list",
+        "the fixture must start on the log, or the presses below assert nothing"
+    );
+
+    for press in 1..=3 {
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        assert_eq!(
+            focus_is_on(cx, &shell),
+            "list",
+            "press {press}: `escape` on the log must be a fixed point. Focus \
+             bouncing between the shell and the log would leave it somewhere \
+             nobody intended with no error anywhere -- and bouncing on to the \
+             composer would make `escape` a three-way toggle, which is the cycle \
+             `Shell::on_key_down` rejects"
+        );
+        assert!(
+            following_tail(cx, &shell),
+            "press {press}: and the log's own gesture must still hold. It re-runs \
+             on every press, so a `follow_tail` that was not idempotent would drift \
+             the scroll while a focus-only assertion called it a pass"
+        );
+    }
+
+    // And the ladder is not a ring: the composer is not reachable from here.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        showing(cx, &shell),
+        0,
+        "the log's `enter` on an empty cursor must not have sent anything, and in \
+         particular must not have reached the composer. Nothing binds a key from \
+         the log back to the field, and that one-way ladder is the gap \
+         `Shell::on_key_down` states rather than hides"
+    );
+    assert_eq!(
+        focus_is_on(cx, &shell),
+        "list",
+        "focus must still be on the log after a key it did not claim: a handler \
+         that moved focus as a side effect of ignoring a key would be the same \
+         class of defect as one that swallowed it"
     );
 }
 
