@@ -43,8 +43,9 @@
 //! one crossing instead of many: the state is reachable only through the
 //! `gpui::Global` in [`bridge`], and that is reachable only from a main-thread
 //! context, because the *value* that crosses the thread boundary is a
-//! [`DomainEvent`] and the state never does. The global itself is `!Sync`, so no
-//! second thread can hold a reference to the state even in principle.
+//! [`crate::core::models::DomainEvent`] and the state never does. The global itself
+//! is `!Sync`, so no second thread can hold a reference to the state even in
+//! principle.
 //!
 //! **The residual gap is closed, by a scanner rather than a type.**
 //! `only_the_bridge_constructs_an_application_state` in

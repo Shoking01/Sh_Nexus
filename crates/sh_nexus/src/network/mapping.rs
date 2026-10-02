@@ -37,7 +37,7 @@
 //! 1. **Required ids are non-blank.** [`require_non_blank`].
 //! 2. **`client_msg_id` parses as a UUID.** [`parse_client_msg_id`].
 //! 3. **Timestamps are in a plausible window.** [`require_plausible_timestamp`].
-//! 4. **A message has content or an attachment.** [`require_body`].
+//! 4. **A message has content or an attachment.** `require_body`.
 //!
 //! Plus the one rule that belongs to the type rather than to a function: a
 //! `client_msg_id` on a client frame is *present* by construction, because
@@ -559,8 +559,8 @@ impl From<&Message> for WireMessage {
     /// a `Uuid` has 128 bits of entropy and its canonical hyphenated form is one
     /// particular spelling -- so a `Uuid` built from non-canonical bytes would not
     /// round-trip. Every `Uuid` this client produces comes from a generator, and
-    /// the boundary's [`parse_client_msg_id`](rules::parse_client_msg_id) is what
-    /// guarantees the ones that arrive are canonical hyphenated text, so the
+    /// the boundary's [`parse_client_msg_id`] is what guarantees the ones that
+    /// arrive are canonical hyphenated text, so the
     /// round trip holds in both directions.
     fn from(message: &Message) -> Self {
         Self {

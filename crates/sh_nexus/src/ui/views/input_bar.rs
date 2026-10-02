@@ -46,7 +46,8 @@
 //! ## 2. Character keys must **propagate**, and this is the one silently broken thing
 //!
 //! `Window::dispatch_keystroke` (`gpui/src/window.rs:5365`) forwards `key_char`
-//! to the focused [`InputHandler`] **only when the key propagated**:
+//! to the focused [`InputHandler`](gpui::InputHandler) **only when the key
+//! propagated**:
 //!
 //! ```text
 //! let result = self.dispatch_event(PlatformInput::KeyDown(..), cx);
@@ -221,8 +222,8 @@ pub struct InputBar {
 impl InputBar {
     /// Builds an empty composer for `list`, drawing with `colors`.
     ///
-    /// `fallback_focus` is where [`BLUR_KEY`] sends focus — see
-    /// [`InputBar::fallback_focus`] for why the field cannot simply blur and
+    /// `fallback_focus` is where `BLUR_KEY` sends focus — see
+    /// `InputBar::fallback_focus` for why the field cannot simply blur and
     /// stop. It is the shell's own handle rather than something this view
     /// invents, because the shell is what owns the gesture focus has to be handed
     /// back to, and a second handle nobody focuses would be the dead end again.
@@ -596,7 +597,7 @@ impl EntityInputHandler for InputBar {
     /// rather than a behaviour**: it says the variant *"affects only how the key
     /// is presented (icon or label); pressing it is still delivered as ordinary
     /// input"*. So nothing here is load-bearing — the key is routed to
-    /// [`InputBar::on_key_down`] either way — and the reason to set it is that
+    /// `InputBar::on_key_down` either way — and the reason to set it is that
     /// the alternative leaves a touch user with a key labelled for inserting a
     /// line break in a field that cannot hold one.
     fn text_input_configuration(

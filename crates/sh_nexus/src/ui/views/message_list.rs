@@ -52,8 +52,8 @@
 //! `List::layout_items` is called with `&mut StateInner`
 //! (`gpui/src/elements/list.rs:1027`), so a `remeasure_items` from inside
 //! `render_item` would take a second `&mut` borrow of the same `RefCell`. So a
-//! change found while rendering is *recorded* ([`MessageList::pending_remeasure`])
-//! and *applied* by [`MessageList::flush_remeasures`], which runs at the top of
+//! change found while rendering is *recorded* (`MessageList::pending_remeasure`)
+//! and *applied* by `MessageList::flush_remeasures`, which runs at the top of
 //! [`MessageList::render`] — before the list lays out for that frame, and
 //! outside every borrow of its state.
 //!
@@ -79,16 +79,18 @@
 //! **A row cannot host the handle, and the second row of that table is why.** A
 //! handle's tab stop exists only on frames where its element is painted, so a row
 //! scrolled out of the overdraw would take a window's focus with it; and
-//! [`RowCache`] evicts at [`MAX_RETAINED_ROWS`], which would leave a window
-//! focused on a released handle — a dangling focus, not a lost keystroke. **This
-//! view is never evicted and is painted on every frame the window exists**, so a
-//! `client_msg_id` here has neither failure mode. See [`MessageList::focus_handle`]
+//! [`RowCache`] evicts at
+//! [`MAX_RETAINED_ROWS`](super::message_row::MAX_RETAINED_ROWS), which would leave
+//! a window focused on a released handle — a dangling focus, not a lost keystroke.
+//! **This view is never evicted and is painted on every frame the window exists**,
+//! so a `client_msg_id` here has neither failure mode. See
+//! [`MessageList::focus_handle`]
 //! for how the keyboard reaches this handle, and for the one thing this unit does
 //! *not* do.
 //!
 //! **Four keys, and the count is the listbox convention rather than a shortfall.**
 //! `up`/`down` move the cursor and `enter`/`space` act on it. Every other key
-//! propagates, and [`MessageList::on_key_down`] says why that asymmetry — a
+//! propagates, and `MessageList::on_key_down` says why that asymmetry — a
 //! propagating `enter` synthesises a `"\n"` — is the whole of `AGENTS.md` §5.2's
 //! focus-order rule rather than a detail.
 //!
@@ -97,7 +99,7 @@
 //! an `escape` arriving after that has already done its job; claiming it here would
 //! either swallow a key 3D established this handler must never swallow, or start a
 //! cycle back up the ladder. Letting it propagate reaches
-//! [`crate::app::Shell::on_key_down`], which re-asserts this handle — a no-op,
+//! `crate::app::Shell::on_key_down`, which re-asserts this handle — a no-op,
 //! because [`Window::focus`] returns early when the handle already holds focus —
 //! and re-snaps the log to the newest message.
 //!
@@ -335,7 +337,7 @@ impl MessageList {
     ///
     /// The `cx` parameter is used for exactly one thing: handing the row cache a
     /// weak handle to this view, so a control a row draws has somewhere to
-    /// dispatch to ([`super::message_row::MessageRow::owner`]). That is also why
+    /// dispatch to (`super::message_row::MessageRow::owner`). That is also why
     /// it is taken for symmetry with GPUI's view constructors rather than left off
     /// — a constructor with a different arity from every other view in the crate
     /// is more to explain than a used parameter.
@@ -409,7 +411,7 @@ impl MessageList {
 
     /// How many messages this list is currently showing.
     ///
-    /// Read from the list state rather than from [`MessageList::count`], so a
+    /// Read from the list state rather than from `MessageList::count`, so a
     /// caller sees what the list has rather than what this view last told it.
     pub fn item_count(&self) -> usize {
         self.list.item_count()
@@ -551,8 +553,8 @@ impl MessageList {
     /// one, so a cached measurement now describes the message above it, and the
     /// scrollbar is fractionally wrong until those rows are scrolled into view
     /// and remeasured. The visible range is not affected —
-    /// [`MessageList::render_row`] sees a different spec for every shifted index,
-    /// records it, and [`MessageList::flush_remeasures`] remeasures that range in
+    /// `MessageList::render_row` sees a different spec for every shifted index,
+    /// records it, and `MessageList::flush_remeasures` remeasures that range in
     /// the same frame.
     ///
     /// **This never calls `cx.notify()`.** It runs at the top of every render,
@@ -568,7 +570,7 @@ impl MessageList {
     /// applied by the *state*, on a drain, with no callback to a view. The list
     /// therefore learns about it the same way it learns about every other change
     /// to the state: by reading the state. See
-    /// [`MessageList::drop_stale_selection`].
+    /// `MessageList::drop_stale_selection`.
     pub fn sync(&mut self, cx: &mut Context<Self>) -> usize {
         self.flush_remeasures();
 

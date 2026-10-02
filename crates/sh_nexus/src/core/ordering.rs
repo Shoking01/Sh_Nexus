@@ -111,7 +111,7 @@
 //!
 //! - **The ACK handoff.** `PLAN.md` §6's `message.ack` returns the stored
 //!   message with the same `client_msg_id` and a real server `id`, where the
-//!   optimistic copy had an empty one. [`precedence`] is explicit about this: a
+//!   optimistic copy had an empty one. `precedence` is explicit about this: a
 //!   real `id` beats an empty one, so the acknowledged copy is the one retained,
 //!   and the caller learns that the `id` field is what changed.
 //! - **An edit.** `Message::edited_at` documents that an edit arrives as a whole
@@ -199,7 +199,7 @@
 //! — not of arrival order, not of which frame happened to land first.
 //!
 //! The one documented exception, and it is a documented exception rather than a
-//! hidden hole: see [`precedence`].
+//! hidden hole: see `precedence`.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -475,7 +475,7 @@ pub enum IngestOutcome {
     ///
     /// * `this_copy_was_retained` - whether the copy just handed in is the one
     ///   [`OrderedMessages::messages`] holds, or whether the copy already held
-    ///   was kept. The retention rule is [`precedence`]; this flag tells the
+    ///   was kept. The retention rule is `precedence`; this flag tells the
     ///   caller which of *its* two values survived, which is the question it
     ///   actually has to answer.
     /// * `fields` - which fields disagreed, by name and never by value

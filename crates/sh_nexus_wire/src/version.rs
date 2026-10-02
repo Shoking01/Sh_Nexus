@@ -65,7 +65,7 @@ use thiserror::Error;
 /// The protocol major version this build speaks.
 ///
 /// Bump this only together with a change to
-/// [`SUPPORTED_MAJOR_VERSIONS`](self::SUPPORTED_MAJOR_VERSIONS) and a note in
+/// [`SUPPORTED_MAJOR_VERSIONS`] and a note in
 /// `docs/API.md`; `AGENTS.md` §5.3 requires a WebSocket protocol change to be
 /// documented there.
 pub const PROTOCOL_VERSION: u16 = 1;
