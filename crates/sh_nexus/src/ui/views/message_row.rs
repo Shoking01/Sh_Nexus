@@ -39,12 +39,20 @@
 //! draws has somewhere to dispatch to. It holds no application state, names no
 //! state type, and would survive every check above unchanged. The invariant it
 //! does not break is the one that was actually about safety.
+//!
+//! **A third arrived in work unit 3E, and it is a `bool` on the spec rather than
+//! a field at all.** [`RowSpec::is_selected`] says whether the list's keyboard
+//! cursor is on this row, which makes the row *show* a selection while adding no
+//! state to it: a row rebuilt from a spec cannot disagree with the list about
+//! which row is current, because the list is the only thing that knows. This is
+//! the same reason the owner handle is weak and the same reason nothing here
+//! reaches `cx.update_global` — the row reads a snapshot and draws it.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use gpui::{div, prelude::*, AnyElement, App, Context, Entity, Render, WeakEntity, Window};
+use gpui::{div, prelude::*, AnyElement, App, Context, Entity, Hsla, Render, WeakEntity, Window};
 use uuid::Uuid;
 
 use crate::core::markdown::Document;
@@ -129,6 +137,22 @@ pub struct RowSpec {
     /// Reactions, as `(emoji, count)`. `PLAN.md` §5 has the domain holding the
     /// reacting users; a chip shows a count, so the count is what crosses.
     pub reactions: Vec<(String, usize)>,
+    /// Whether this row is the one the list's keyboard cursor is on.
+    ///
+    /// **A flag in the spec rather than state in the row, and the reason is the
+    /// same one the whole file's contract rests on.** The selection lives on
+    /// [`MessageList`](super::message_list::MessageList) as a `client_msg_id`,
+    /// because the list is never evicted and a row is; storing it here would make
+    /// a row that is scrolled out and back disagree with the list about which
+    /// row is current. It arrives the way `delivery` does — as data the frame
+    /// draws — so the row's invariant still reads: no reference into the state,
+    /// no state type named.
+    ///
+    /// **A row that is not selected must still *look* the same size as one that
+    /// is**, because moving the cursor must not reflow the log. That is enforced
+    /// by [`MessageRow::selection_rule_color`] being a colour swap on a
+    /// constant-width border and never a width change.
+    pub is_selected: bool,
 }
 
 impl RowSpec {
@@ -141,6 +165,20 @@ impl RowSpec {
     /// walked. Two specs that share an `Arc` are the same parse; two that do not
     /// are re-parsed even when the text is identical, and redrawing is the safe
     /// answer for that case.
+    ///
+    /// **`is_selected` is compared, and the remeasure that comes with it is
+    /// conservative rather than necessary.** Leaving it out would be the cheaper
+    /// choice and a strictly worse one: the row under a cursor that moved onto it
+    /// would not be told to redraw, and an invisible selection is not a
+    /// selection. Including it means a cursor move also routes the two affected
+    /// rows through [`MessageRow::set`]'s `true`, which
+    /// [`MessageList`](super::message_list::MessageList) turns into one
+    /// coalesced `remeasure_items` over the visible range. **That remeasure
+    /// changes nothing, and it is deliberately so:** the selection rule is a
+    /// constant-width border whose *colour* changes
+    /// ([`MessageRow::selection_rule_color`]), so the row's geometry is
+    /// identical either way. The cost is one extra layout pass per cursor move,
+    /// against the alternative of a selection nobody can see.
     pub fn differs_from(&self, other: &RowSpec) -> bool {
         self.client_msg_id != other.client_msg_id
             || self.author != other.author
@@ -149,6 +187,7 @@ impl RowSpec {
             || self.delivery != other.delivery
             || self.failure_detail != other.failure_detail
             || self.reactions != other.reactions
+            || self.is_selected != other.is_selected
             || !Arc::ptr_eq(&self.document, &other.document)
     }
 
@@ -293,6 +332,63 @@ impl MessageRow {
         self.colors
     }
 
+    /// Whether this row is the one the list's keyboard cursor is on.
+    ///
+    /// **A read of the spec rather than a field, and that is the invariant
+    /// working.** The cursor is the *list's* state — an id, on the one view that
+    /// is never evicted — and this row was handed a snapshot of whether it
+    /// matches. Reading it back is how a test asks "did the cursor reach this
+    /// row" without walking the element tree.
+    pub fn is_selected(&self) -> bool {
+        self.spec.is_selected
+    }
+
+    /// The fill behind this row's text: its own bubble, not the other's.
+    ///
+    /// Named rather than inlined because two things need the same answer and
+    /// disagreeing about it would be a bug nobody could see: the bubble itself,
+    /// and the *unselected* end of the selection rule below.
+    fn bubble_color(&self) -> Hsla {
+        if self.spec.is_self {
+            self.colors.bubble_self
+        } else {
+            self.colors.bubble_other
+        }
+    }
+
+    /// The colour of this row's left-hand selection rule.
+    ///
+    /// **[`Colors::accent`] when the row is selected and the row's own bubble
+    /// colour when it is not, and both halves of that are load-bearing.**
+    ///
+    /// *`accent`, not `danger`.* The rule answers "where is the cursor", and
+    /// `danger` is the failed-send state (`ui/mod.rs`) — a rule in `danger`
+    /// would tell a keyboard user that the row they are standing on has failed,
+    /// which on most rows is a lie. `accent` is the palette's *interactive*
+    /// colour, so the rule reads as the affordance it is, the same word the
+    /// retry badge is drawn in.
+    ///
+    /// *The bubble colour, not a second palette entry.* Unselected, the rule is
+    /// invisible because it is painted in the fill it sits on. That is why
+    /// `Colors` does not grow a `selection_idle` key: an opaque rule in some
+    /// third colour would be a permanent stripe on every row of the log, and
+    /// `AGENTS.md` §7.3's theme test pins every colour to full opacity, so
+    /// "absent" cannot be expressed as a colour — it is expressed as the colour
+    /// it is hiding against.
+    ///
+    /// **Width never changes, and that is why this is a colour swap.** A rule
+    /// that appeared or vanished would change the row's height, and moving the
+    /// cursor would reflow every row below it — the same reason the retry badge
+    /// hovers on `bg` only. See [`RowSpec::differs_from`], which carries the
+    /// remeasure this conservative height-neutral change costs anyway.
+    pub fn selection_rule_color(&self) -> Hsla {
+        if self.spec.is_selected {
+            self.colors.accent
+        } else {
+            self.bubble_color()
+        }
+    }
+
     /// The element for the author-and-time line.
     fn header(&self) -> AnyElement {
         let colors = self.colors;
@@ -364,40 +460,46 @@ impl MessageRow {
     ///
     /// **There is no `Role::Button` here, and the omission is the point.** A role
     /// is a claim about how assistive technology may operate the element, and this
-    /// element has exactly one activation route: a pointer click. Giving it
-    /// `Role::Button` without a focus handle (nothing to `track_focus`) and
-    /// without an `on_a11y_action` handler (the route an AT uses to synthesise a
-    /// click) would announce a button that does nothing for precisely the users the
-    /// role exists for. `accesskit`'s `Action::Click` handler cannot be exercised by
+    /// element has exactly one activation route *on itself*: a pointer click, or
+    /// the list's cursor arriving here and pressing Enter
+    /// ([`MessageList::retry_failed_send`](super::message_list::MessageList::retry_failed_send)).
+    /// It has no focus handle of its own to `track_focus` and no `on_a11y_action`
+    /// handler (the route an AT uses to synthesise a click), so `Role::Button`
+    /// would still announce a button whose only *direct* activation is a pointer.
+    /// `accesskit`'s `Action::Click` handler cannot be exercised by
     /// this crate's headless harness either — `Window::a11y.is_active()` is false
     /// there — so shipping it would be shipping an untested activation path.
     ///
-    /// **Which leaves the keyboard omission, and it is a real one.** `AGENTS.md`
-    /// §5.2 requires keyboard-only operation and this control does not meet it.
-    /// Delivering it is not a matter of adding a key handler here:
+    /// # The keyboard omission recorded by work unit 3D, and what closed it
     ///
-    /// - A keyboard-operable element needs a [`gpui::FocusHandle`] plus
-    ///   `track_focus` and `tab_stop`, and a `FocusHandle` is *state on the row* —
-    ///   the exact thing this file's constructor exists to avoid.
+    /// **3D left a defect on the record here, and 3E closed it — the entry below is
+    /// kept as the reasoning that chose the mechanism, because that reasoning is
+    /// why this file still holds no focus handle.** `AGENTS.md` §5.2 requires
+    /// keyboard-only operation and a click is not that.
+    ///
+    /// 3D's argument was that a per-row fix is not available, and each of its four
+    /// legs still holds:
+    ///
+    /// - A keyboard-operable *element* needs a [`gpui::FocusHandle`] plus
+    ///   `track_focus`, and a `FocusHandle` is *state on the row* — the exact
+    ///   thing this file's constructor exists to avoid.
     /// - A focus handle would have to survive `RowCache::evict`, and eviction
     ///   happens at [`MAX_RETAINED_ROWS`]; a window left focused on a released
     ///   row's handle is a dangling focus, not a lost keystroke.
     /// - GPUI rebuilds the tab-stop map every painted frame from the handles that
     ///   were actually painted (`window.rs` clears `tab_stops` before each frame
     ///   and `div.rs` inserts into it during paint), so a row scrolled out of the
-    ///   overdraw loses its tab stop and takes the focus with it. A virtualized
-    ///   list needs a focus *model* — a selected row, or a retained handle — and
-    ///   this crate has none for rows anywhere.
-    /// - `on_key_down` on a row would in any case fire only for the focused
-    ///   node's dispatch path, so it needs the focus model before it needs the
-    ///   handler.
+    ///   overdraw loses its tab stop and takes the focus with it.
+    /// - `on_key_down` on a row fires only for the focused node's dispatch path,
+    ///   so it needs the focus model before it needs the handler.
     ///
-    /// So the two real options are a per-row focus handle with eviction-aware
-    /// focus management, or a list-level selection model that gives "the failed
-    /// send" an identity a key can name. **Both are designs this unit does not
-    /// have, and choosing between them is a decision with a real trade-off, so
-    /// this is recorded rather than picked.** `odd/tasks/3d-retry-failed-send.md`
-    /// and the work unit's report carry the same record.
+    /// **So the two options 3D named were a per-row handle with eviction-aware
+    /// focus management, or a list-level selection model. 3E took the second**,
+    /// and this is the file that shows what that costs: the row holds a
+    /// [`RowSpec::is_selected`] flag and draws it, and every question about *where
+    /// the cursor is* — the keys, the tab order, the focus handle, the eviction —
+    /// belongs to [`MessageList`](super::message_list::MessageList). The row stays
+    /// a function of its spec.
     fn delivery_badge(&self) -> Option<AnyElement> {
         let colors = self.colors;
         let (label, color) = match self.spec.delivery? {
@@ -493,7 +595,6 @@ impl MessageRow {
 impl Render for MessageRow {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors;
-        let is_self = self.spec.is_self;
 
         div()
             // Records this element's bounds under a selector the headless test
@@ -508,11 +609,20 @@ impl Render for MessageRow {
             .px_3()
             .py_2()
             .rounded_md()
-            .bg(if is_self {
-                colors.bubble_self
-            } else {
-                colors.bubble_other
-            })
+            .bg(self.bubble_color())
+            // A selection rule, always present and always this wide.
+            //
+            // **The width is unconditional and only the colour varies, and that
+            // pairing is the whole reason this is safe.** `border_l_2` on every
+            // row costs two pixels on every row, once; a rule whose width came
+            // and went with the cursor would move every row below it on each
+            // arrow key, in a virtualized list whose layout is measured exactly
+            // once per row. The colour answer is
+            // [`MessageRow::selection_rule_color`], called here rather than
+            // inlined so the test that asserts it asserts the value this frame
+            // paints rather than a copy of the rule.
+            .border_l_2()
+            .border_color(self.selection_rule_color())
             // Explicit, per AGENTS.md 7.3.
             .text_color(colors.text)
             .child(self.header())

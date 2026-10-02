@@ -27,18 +27,45 @@
 //! asserted without pixels: every run `ui/markdown.rs` produces carries an
 //! explicit colour, and the tests below read those colours back.
 //!
+//! # The keyboard section is the one that cannot pass for the wrong reason
+//!
+//! Every other test in this file calls a gesture — a method on the view — and can
+//! therefore only prove what the method does. **The work unit 3E tests drive real
+//! keystrokes through `cx.simulate_keystrokes`**, because the claim is not "the
+//! retry gesture works" but "a keypress reaches the retry gesture". A direct call
+//! to `MessageList::retry_failed_send` passes in a client where the focus handle is
+//! not tracked, where the handler is not registered, and where the activation is
+//! wired to nothing at all — three separate ways to ship a keyboard affordance
+//! that is not one.
+//!
+//! **That was checked rather than assumed.** Deleting `.track_focus` from the
+//! list's `div` fails **7 of the 8** tests in the section, and deleting the
+//! `.on_key_down` registration fails the same 7. The eighth,
+//! `the_list_takes_focus_and_starts_with_no_cursor`, keeps passing under both —
+//! which is not a gap in it: `FocusHandle::focus` sets the window's focus whatever
+//! the element does, so *that* test asserts focus and the other seven assert
+//! dispatch. The split is the reason both exist.
+//!
+//! **Two tests there are about propagation and need a view that is not the list.**
+//! `Window::dispatch_key_down_up_event` walks the bubble path leaf-first and
+//! returns the moment a handler clears `cx.propagate_event`, so "did the list keep
+//! this `enter`" is only answerable by a listener *above* it. `KeyCountingHost` is
+//! that listener: it composes the production `MessageList` unchanged and records
+//! every key that arrives.
+//!
 //! # Test placement
 //!
-//! Cargo auto-discovers `tests/*.rs` only. A file at
-//! `tests/ui/message_list.rs` would never be compiled and this suite would look
-//! green while containing nothing (`PLAN.md` §4).
+//! Cargo auto-discovers `tests/*.rs` only. A file at `tests/ui/message_list.rs`
+//! would never be compiled and this suite would look green while containing
+//! nothing (`PLAN.md` §4).
 
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::{
-    div, list, prelude::*, px, Context, Entity, FontStyle, FontWeight, IntoElement, ListAlignment,
-    ListState, Render, TestAppContext, TextStyle, VisualTestContext, WeakEntity, Window,
+    div, list, prelude::*, px, Context, Entity, Focusable, FontStyle, FontWeight, IntoElement,
+    KeyDownEvent, ListAlignment, ListState, Render, TestAppContext, TextStyle, VisualTestContext,
+    WeakEntity, Window,
 };
 use rstest::rstest;
 use sh_nexus::core::markdown as core_markdown;
@@ -124,6 +151,10 @@ fn spec_for(client_msg_id: u128, content: &str) -> RowSpec {
         delivery: None,
         failure_detail: None,
         reactions: Vec::new(),
+        // Unselected, so a fixture that is only about the cache cannot
+        // accidentally assert something about the keyboard cursor. The selection
+        // tests set this on purpose.
+        is_selected: false,
     }
 }
 
@@ -1518,5 +1549,795 @@ fn a_send_that_is_not_failed_offers_no_control_and_its_row_absorbs_a_click(
         1,
         "nor the number of rows: a stray click is not a discard, and the row is still \
          the user's message"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Work unit 3E — keyboard access to the same retry, by selection
+// ---------------------------------------------------------------------------
+
+/// Focuses the list, which is what every keystroke test below has to do first.
+///
+/// **Not a shortcut around the production path — the production path itself, and
+/// the reason it is not optional.** `Window::dispatch_key_event` builds a key's
+/// dispatch path from `focus_node_id_in_rendered_frame(window.focus)`
+/// (`gpui/src/window.rs`), so with nothing focused the walk starts at
+/// `DispatchTree::root_node_id()` and this list's handler is simply never
+/// reached. The `run_until_parked` is the same load-bearing step
+/// `tests/app_shell.rs`'s `focus_composer` documents: focusing dirties the
+/// window, and the frame that follows is the one whose paint registers the
+/// element in the frame the *next* keystroke dispatches against.
+fn focus_list(cx: &mut VisualTestContext, view: &Entity<MessageList>) {
+    view.update_in(cx, |list, window, cx| {
+        list.focus_handle(cx).focus(window, cx);
+    });
+    cx.run_until_parked();
+}
+
+/// Which row the keyboard cursor is on.
+fn cursor(cx: &VisualTestContext, view: &Entity<MessageList>) -> Option<Uuid> {
+    view.read_with(cx, |list, _| list.selected())
+}
+
+/// Whether the row for `client_msg_id` is drawing itself as the selected one.
+fn row_draws_the_cursor(
+    cx: &VisualTestContext,
+    view: &Entity<MessageList>,
+    client_msg_id: Uuid,
+) -> Option<bool> {
+    view.read_with(cx, |list, app| {
+        list.retained_row(&client_msg_id)
+            .map(|row| row.read_with(app, |row, _| row.is_selected()))
+    })
+}
+
+/// A `CHANNEL` filled to [`MAX_MESSAGES_PER_CHANNEL`], so the next arrival evicts.
+///
+/// **The cap is 10 000 and the fixture pays for it in full, because there is no
+/// cheaper door.** Eviction is a property of the *state*'s history bound, applied
+/// by `bridge::drain`, and a view cannot be made to drop a row it is still being
+/// shown — which is the whole point of the test. A fixture that mocked the
+/// eviction would prove that `drop_stale_selection` clears a field, which is not
+/// the claim.
+fn filled_to_the_cap(
+    cx: &mut TestAppContext,
+) -> (EventSender, Entity<MessageList>, &mut VisualTestContext) {
+    let (sender, view, cx) = showing_channel(cx);
+
+    for n in 0..MAX_MESSAGES_PER_CHANNEL as u128 {
+        delivered(
+            cx,
+            &sender,
+            DomainEvent::MessageReceived(stored(n, "a body long enough to be a row", n as i64)),
+        );
+    }
+    view.update_in(cx, |list, _window, cx| {
+        list.show_channel(CHANNEL, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(cx, |list, _| list.item_count()),
+        MAX_MESSAGES_PER_CHANNEL,
+        "the fixture must be exactly at the cap: one more arrival evicts, and not \
+         one fewer"
+    );
+    (sender, view, cx)
+}
+
+/// A window host whose only added behaviour is to *notice* a key.
+///
+/// **A propagation claim cannot be observed from inside the view that would make
+/// it.** `Window::dispatch_key_down_up_event` walks the bubble path leaf-first
+/// and returns the moment a handler clears `cx.propagate_event`, so "did the list
+/// keep this `enter`" is answerable only by a listener **above** the list on the
+/// same dispatch path. In production that listener is `Shell`; here it is this,
+/// and nothing else about the wiring changes: the host composes the production
+/// [`MessageList`] unchanged, exactly as `app.rs` composes it.
+///
+/// **It records the key and stops nothing.** A host that swallowed keys would
+/// make the test below pass for the wrong reason — the assertion is that the key
+/// *arrived*, so the host has to be somewhere keys can arrive.
+struct KeyCountingHost {
+    /// The production list, composed rather than stubbed.
+    list: Entity<MessageList>,
+    /// Every key that reached this ancestor, in order.
+    ///
+    /// Bounded by the number of keystrokes the test sends, which is the only
+    /// thing that ever writes to it — `AGENTS.md` §7.1's unbounded-growth ban is
+    /// about production state.
+    seen: Vec<String>,
+}
+
+impl KeyCountingHost {
+    /// Builds the host around a connected list showing [`CHANNEL`], which is
+    /// what [`showing_channel`] builds minus the window.
+    fn new(cx: &mut Context<Self>) -> Self {
+        let list = cx.new(MessageList::new);
+        list.update(cx, |list, cx| {
+            list.set_colors(Colors::default(), cx);
+            list.show_channel(CHANNEL, cx);
+        });
+        Self {
+            list,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Records the key. Deliberately does not call `cx.stop_propagation`.
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.seen.push(event.keystroke.key.clone());
+        cx.notify();
+    }
+}
+
+impl Render for KeyCountingHost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            // An id, because that is what a `Shell` has and what registers the
+            // listener on this element's dispatch node.
+            .id("key-counting-host")
+            .size_full()
+            .child(self.list.clone())
+            .on_key_down(cx.listener(Self::on_key_down))
+    }
+}
+
+/// The keys that reached the host above the list.
+fn keys_that_reached_the_host(
+    cx: &VisualTestContext,
+    host: &Entity<KeyCountingHost>,
+) -> Vec<String> {
+    host.read_with(cx, |host, _| host.seen.clone())
+}
+
+/// The list takes focus, and only because it is asked to.
+///
+/// **The first half is the assertion; the second is the reason the whole section
+/// needs it.** `MessageList` was not `Focusable` before work unit 3E, so there
+/// was no handle to focus and every keystroke in this file would have gone to a
+/// dispatch node with no listener on it — passing for the wrong reason, silently,
+/// which is the failure mode `tests/app_shell.rs`'s module docs name for the
+/// character keys.
+///
+/// **And the cursor is asserted empty before the keystroke**, so the tests that
+/// follow cannot pass by reading a selection the harness happened to leave behind.
+#[gpui::test]
+fn the_list_takes_focus_and_starts_with_no_cursor(cx: &mut TestAppContext) {
+    let (_sender, view, cx) = showing_channel(cx);
+
+    view.update_in(cx, |list, window, cx| {
+        assert!(
+            !list.focus_handle(cx).is_focused(window),
+            "nothing in this fixture focuses the list: app::open focuses the \
+             composer, and 3E deliberately did not change that. So a false here \
+             is the precondition for every keystroke below meaning anything"
+        );
+    });
+    assert_eq!(
+        cursor(cx, &view),
+        None,
+        "a list nobody has pressed a key in has no cursor"
+    );
+
+    focus_list(cx, &view);
+
+    view.update_in(cx, |list, window, cx| {
+        assert!(
+            list.focus_handle(cx).is_focused(window),
+            "AGENTS.md 5.2 requires the feature to work from the keyboard alone. A \
+             handle a caller can focus but from which no listener runs would be the \
+             silent version of this failure, and `track_focus` on this element is \
+             what makes it a working one"
+        );
+    });
+}
+
+/// The arrows move the cursor, and only along the axis they name.
+///
+/// **Every step is asserted as an identity and in order, because the interesting
+/// failures are all "the cursor moved to *a* row".** A handler that clamped to
+/// the wrong end, stepped by two, or wrapped would pass a single
+/// `assert!(selected().is_some())`. So the sequence below walks the whole
+/// channel and past both ends:
+///
+/// ```text
+/// (nothing) --up--> oldest --down--> middle --down--> newest --down--> newest
+/// ```
+///
+/// **The first press lands on an end chosen by the direction**, and the fixture
+/// states which end rather than leaving it to the implementation: a user who has
+/// just focused the log and pressed `up` is reaching for the oldest message, and
+/// one who pressed `down` is reaching for the newest. That is also the only
+/// reason `down`-first is a meaningful assertion at all.
+///
+/// **Nothing about a message's content is consulted**, so the fixture's bodies are
+/// all identical and the identities being selected are unambiguous: `cid(0)`,
+/// `cid(1)`, `cid(2)` in arrival order.
+#[gpui::test]
+fn the_arrow_keys_move_the_cursor_and_clamp_at_both_ends(cx: &mut TestAppContext) {
+    let (sender, view, cx) = showing_channel(cx);
+    for n in 1..=3_u128 {
+        delivered(
+            cx,
+            &sender,
+            DomainEvent::MessageReceived(stored(n, "a body long enough to be a row", n as i64)),
+        );
+    }
+    view.update_in(cx, |list, _window, cx| {
+        list.show_channel(CHANNEL, cx);
+    });
+    cx.run_until_parked();
+    focus_list(cx, &view);
+
+    cx.simulate_keystrokes("up");
+    assert_eq!(
+        cursor(cx, &view),
+        Some(cid(1)),
+        "`up` with no cursor selects the oldest row, which is what a reader \
+         reaching back through history wants"
+    );
+
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        cursor(cx, &view),
+        Some(cid(2)),
+        "`down` steps one row towards the tail, not to the end"
+    );
+
+    cx.simulate_keystrokes("down up");
+    assert_eq!(
+        cursor(cx, &view),
+        Some(cid(2)),
+        "`down` then `up` returns to the row it left, which is the property that \
+         makes a step of one meaningful rather than a jump to an end"
+    );
+
+    cx.simulate_keystrokes("up up");
+    assert_eq!(
+        cursor(cx, &view),
+        Some(cid(1)),
+        "stepping back past the second row lands on the head"
+    );
+
+    // And both ends clamp rather than wrap or refuse, because a chat log's history
+    // is bounded and the ends are real rows.
+    cx.simulate_keystrokes("up up up");
+    assert_eq!(
+        cursor(cx, &view),
+        Some(cid(1)),
+        "`up` on the oldest row stays there: a cursor that wrapped to the newest \
+         message would make the channel's history unreachable from the keyboard"
+    );
+    cx.simulate_keystrokes("down down down down");
+    assert_eq!(
+        cursor(cx, &view),
+        Some(cid(3)),
+        "`down` past the newest row stays on the newest, for the same reason"
+    );
+
+    // The axis is asserted, not assumed: `up` must not move the cursor up when the
+    // composer holds the key, and nothing here is a modifier.
+    cx.simulate_keystrokes("up");
+    assert_eq!(
+        cursor(cx, &view),
+        Some(cid(2)),
+        "one press, one row: a handler that stepped to an end would pass the \
+         clamped assertions above and fail this one"
+    );
+}
+
+/// A cursor that moves off screen is not a cursor, so the log scrolls to it —
+/// **and does not scroll when it does not need to**.
+///
+/// **This is the assertion that makes [`ListState::scroll_to`] a decision rather
+/// than a convenience, and it has two halves because `scroll_to` has two
+/// behaviours.** The alternative was `scroll_to_reveal_item`, the framework's own
+/// "make this item visible", and reading it at the pinned rev is why this test
+/// looks the way it does:
+///
+/// - It does **not** call `stop_following`. Its `logical_scroll_top` would be
+///   re-anchored to the end sentinel on the next layout, so against a
+///   tail-following list — which is what a chat log opens on — the cursor the user
+///   just placed is undone by the frame that draws it. `ListState::scroll_to`
+///   **does** suspend following whenever the target is below the end.
+/// - It is unconditional, so using it on every arrow keypress would drag the log
+///   back to the top of the cursor row each time. `scroll_to` here is gated on
+///   the row actually being off screen.
+///
+/// **The fixture starts at the tail rather than in history**, because that is the
+/// state a user is in when they first reach the log, and it is the state where the
+/// `stop_following` half is load-bearing. From the end sentinel **every** row
+/// below it answers `item_is_above_viewport == Some(true)` without any bounds
+/// being measured, so a single `up` — which selects the oldest row — must scroll
+/// the whole channel and suspend following.
+///
+/// **The second half needs a row that is definitely on screen**, and index 1 after
+/// scrolling to index 0 is: whatever the measured row heights turn out to be, the
+/// second row of a list whose top is at the viewport top cannot be below it. So
+/// "the scroll did not move" is asserted without depending on a pixel count the
+/// harness cannot see.
+///
+/// **A cursor on the *newest* row leaves tail-following on, and that is correct**
+/// rather than a leak: `List` re-engages following whenever
+/// `is_scrolled_to_end()` is true, and the end of a chat log is where following
+/// belongs. This test therefore asserts on the oldest row, where the two
+/// behaviours differ, instead of on the newest where the framework's rule and the
+/// cursor's requirement agree.
+///
+/// **`40` messages, not three**, because with three rows everything fits and every
+/// index is visible — the same reason `tests/app_shell.rs` has its own
+/// `ENOUGH_TO_OVERFLOW`.
+#[gpui::test]
+fn the_cursor_is_brought_into_view_and_takes_the_scroll_with_it(cx: &mut TestAppContext) {
+    const ENOUGH_TO_OVERFLOW: u128 = 40;
+
+    let (sender, view, cx) = showing_channel(cx);
+    for n in 0..ENOUGH_TO_OVERFLOW {
+        delivered(
+            cx,
+            &sender,
+            DomainEvent::MessageReceived(stored(n, "a body long enough to be a row", n as i64)),
+        );
+    }
+    view.update_in(cx, |list, _window, cx| {
+        list.show_channel(CHANNEL, cx);
+    });
+    cx.run_until_parked();
+
+    // A chat log opens on the newest message, and the fixture must start there:
+    // the whole claim is that reaching the log with the keyboard works from the
+    // state a user is actually in.
+    assert!(
+        view.read_with(cx, |list, _| list.is_following_tail()),
+        "a chat log opens on the newest message, so the cursor starts at the other \
+         end of the channel and has to travel"
+    );
+    let at_tail = view.read_with(cx, |list, _| list.list_state().logical_scroll_top().item_ix);
+    assert!(
+        at_tail > 0,
+        "the scroll must really be at the tail and not already at the head, or \
+         nothing below proves the cursor moved it"
+    );
+
+    focus_list(cx, &view);
+    // One `up`: with no cursor it selects the oldest row, which is a full
+    // screenful of scrolling away from here.
+    cx.simulate_keystrokes("up");
+    assert_eq!(
+        cursor(cx, &view),
+        Some(cid(0)),
+        "the oldest message is the row `up` reaches for first"
+    );
+    assert!(
+        !view.read_with(cx, |list, _| list.is_following_tail()),
+        "moving the cursor to the oldest row must suspend tail-following. If \
+         following stayed on, the next layout re-anchors the scroll to the end \
+         sentinel and the cursor the user just placed is off screen again -- which \
+         is the failure a `scroll_to_reveal_item` implementation has, because that \
+         API does not call `stop_following`"
+    );
+    assert_eq!(
+        view.read_with(cx, |list, _| list.list_state().logical_scroll_top().item_ix),
+        0,
+        "and the log must have scrolled to the cursor. A cursor recorded but never \
+         revealed is not a cursor the user can see"
+    );
+
+    // And the other half of [`ListState::scroll_to`]: a step that is already in
+    // view must NOT move the log.
+    cx.simulate_keystrokes("down");
+    assert_eq!(cursor(cx, &view), Some(cid(1)), "one press, one row");
+    assert_eq!(
+        view.read_with(cx, |list, _| list.list_state().logical_scroll_top().item_ix),
+        0,
+        "and the scroll must stay where it is: row 1 is on screen already, so \
+         scrolling to it would yank the log out from under the reader on every \
+         arrow key"
+    );
+}
+
+/// `enter` on a failed send puts it back in flight — **by keyboard, through the
+/// real dispatch path**.
+///
+/// **This is the test that is the reason work unit 3E exists, and it is driven
+/// through `simulate_keystrokes` for one reason: every earlier test in this file
+/// calls a gesture directly, which cannot tell "the key was dispatched" from "the
+/// method was called".** `cx.simulate_keystrokes` builds a `KeyDownEvent`,
+/// `Window::dispatch_keystroke` resolves the dispatch path from the window's
+/// focus, and the walk runs this list's own `on_key_down` — so this test fails
+/// if the handle is not tracked, if the handler is not registered on this
+/// element, or if the activation is wired to anything but the retry. A direct
+/// call to `retry_failed_send` passes in all three broken worlds.
+///
+/// **The same four assertions as the click test, and deliberately the same
+/// ones.** 3D proved the *click* reaches `Pending`; this proves the *key* does,
+/// through the same door. So: the state moved, the row is already showing it
+/// (which means the gesture asked for its own frame), no row was added or
+/// removed, and it is the same `Entity`. **And it still does not transmit** —
+/// `Pending` is the honest end state until the outbox exists, which is the limit
+/// 3D recorded and this unit does not move.
+#[gpui::test]
+fn enter_on_a_failed_send_retries_it_in_place_through_the_keyboard(cx: &mut TestAppContext) {
+    let (sender, view, cx) = showing_channel(cx);
+    let send_id = failed_send(cx, &view, &sender, 7);
+    let row_before = view
+        .read_with(cx, |list, _| list.retained_row(&send_id))
+        .expect("the failed row must be in the cache")
+        .entity_id();
+
+    focus_list(cx, &view);
+    // `up` with no cursor selects the oldest row, and the failed send is the only
+    // row there is — so the fixture cannot put the cursor somewhere else by
+    // accident.
+    cx.simulate_keystrokes("up");
+    assert_eq!(
+        cursor(cx, &view),
+        Some(send_id),
+        "the failed row must be the selected one, or `enter` below is pressing \
+         nothing"
+    );
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        delivery_in_state(cx, send_id),
+        Some(DeliveryState::Pending),
+        "enter must put a failed send back in flight. Nothing above this client \
+         transmits it -- `retry_send` does not send and the outbox is Phase 3 -- so \
+         `Pending` is the honest end state and `sending...` is the honest badge"
+    );
+    assert_eq!(
+        delivery_in_row(cx, &view, send_id),
+        Some(Some(DeliveryState::Pending)),
+        "and the row must already be showing it when the keystroke returns, which \
+         it can only be if the gesture asked for its own frame"
+    );
+    assert_eq!(
+        view.read_with(cx, |list, _| list.item_count()),
+        1,
+        "the same row, in place: a retry that added or removed a row would be a \
+         different message, not the same one in flight again"
+    );
+    assert_eq!(
+        view.read_with(cx, |list, _| {
+            list.retained_row(&send_id).map(|row| row.entity_id())
+        }),
+        Some(row_before),
+        "and the same entity -- the identity is keyed on `client_msg_id`, and the \
+         keyboard path must not mint a new one any more than the click path does"
+    );
+    assert!(
+        cx.debug_bounds(RETRY_BADGE_SELECTOR).is_none(),
+        "a pending send has nothing to retry, so the control must be gone"
+    );
+}
+
+/// `space` is the same gesture as `enter`, and it is asserted rather than assumed.
+///
+/// **The pair is a convention, and a convention nothing checks is a comment.**
+/// `enter` is frequently absent or taken on an on-screen keyboard, which is the
+/// population `AGENTS.md` §5.2's keyboard-only requirement is about, so `space`
+/// carries the same load. The assertion is the same four as `enter`'s, minus the
+/// frame-timing one that this harness cannot observe for the second activation.
+#[gpui::test]
+fn space_retries_the_selected_failed_send_too(cx: &mut TestAppContext) {
+    let (sender, view, cx) = showing_channel(cx);
+    let send_id = failed_send(cx, &view, &sender, 7);
+
+    focus_list(cx, &view);
+    cx.simulate_keystrokes("up space");
+
+    assert_eq!(
+        delivery_in_state(cx, send_id),
+        Some(DeliveryState::Pending),
+        "`space` is the listbox convention's second activation key and it must \
+         reach the same door `enter` does"
+    );
+    assert_eq!(
+        view.read_with(cx, |list, _| list.selected()),
+        Some(send_id),
+        "and it must not have moved the cursor: activating a row is not selecting a \
+         different one"
+    );
+}
+
+/// `enter` on a row with nothing to do is a no-op **and does not stop
+/// propagation**.
+///
+/// **Two claims, and the second is the one this test exists for.** The first —
+/// a `Pending` send stays `Pending` — is what a caller sees. The second is a
+/// contract with everything *above* the list, and it is the failure mode
+/// `AGENTS.md` §5.2's focus order is written to prevent: `enter` synthesises a
+/// `key_char` of `"\n"` (`gpui/src/platform/keystroke.rs`), so a list that
+/// swallowed `enter` on a row with nothing to do would leave a newline in
+/// whatever text input a future focus arrangement put inside it.
+///
+/// **Today nothing would observe that** — the composer is a *sibling* and
+/// registers its input handler only while it holds focus — which is exactly why
+/// the assertion cannot be made through the composer and needs the ancestor below.
+/// **So the claim is stated against a host that merely records keys**, and the
+/// recorded key is the whole of the evidence: present means the list let it
+/// through, absent means it swallowed a key it had no business holding.
+#[gpui::test]
+fn enter_on_a_row_with_nothing_to_do_is_a_no_op_that_lets_the_key_through(cx: &mut TestAppContext) {
+    let sender = installed(cx);
+    let (host, cx) = cx.add_window_view(|_, cx| KeyCountingHost::new(cx));
+    connected(cx, &sender);
+
+    // An optimistic send that has not been refused: there is nothing to retry, so
+    // this is the row a stray `enter` must not act on and must not swallow.
+    let send_id = cid(7);
+    let view = host.read_with(cx, |host, _| host.list.clone());
+    let sent = view.update_in(cx, |list, _window, cx| {
+        list.begin_send("hello team", send_id, at(1), cx)
+    });
+    assert!(sent, "the optimistic row must be on screen");
+    cx.run_until_parked();
+
+    // First with the cursor *on* the row, so the "no-op" is about a real
+    // selection rather than about the absence of one.
+    focus_list(cx, &view);
+    cx.simulate_keystrokes("up enter");
+    assert_eq!(
+        delivery_in_state(cx, send_id),
+        Some(DeliveryState::Pending),
+        "a send that has not been refused must not be forced back into flight by a \
+         keypress: `actions::retry_send` refuses it, and the row is already correct"
+    );
+    assert_eq!(
+        keys_that_reached_the_host(cx, &host),
+        vec!["enter".to_owned()],
+        "`up` is the list's own gesture and is claimed -- it does NOT reach the \
+         ancestor. `enter` on a row with nothing to do is NOT the list's, and does: a \
+         swallowed `enter` is a newline lost to a text field the moment focus can \
+         reach this list from one"
+    );
+
+    // And the same with nothing selected at all, which is the state a user is in
+    // the instant before pressing anything.
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        delivery_in_state(cx, send_id),
+        Some(DeliveryState::Pending),
+        "no cursor means nothing to activate"
+    );
+    assert_eq!(
+        keys_that_reached_the_host(cx, &host),
+        vec!["enter".to_owned(), "enter".to_owned()],
+        "and `enter` on an empty selection propagates for the same reason"
+    );
+    assert_eq!(
+        view.read_with(cx, |list, _| list.item_count()),
+        1,
+        "no row was added or removed by either press"
+    );
+}
+
+/// The cursor survives the eviction of *other* rows, and clears when its own goes.
+///
+/// **The two halves are one test because they are one rule, and a rule with only
+/// one half is wrong in a direction nobody would notice.** A cursor is cleared
+/// when *its* row leaves the list and at no other time. A list that cleared on
+/// every arrival would make the cursor unusable in a busy channel — and
+/// `MAX_MESSAGES_PER_CHANNEL` is 10 000, so "a busy channel" is not a hypothetical.
+/// A list that never cleared would let `enter` retry a send for a message the
+/// state has thrown away.
+///
+/// **The scenario that separates them is a head eviction, and it is chosen for
+/// the reason `MessageList::reanchor` exists.** Eviction drops the *oldest* row,
+/// which shifts every index below it down by one — so the cursor's **index** is
+/// stale the moment it happens, and only its **identity** survives. That is why
+/// [`MessageList::selected`] holds a `client_msg_id`; this is the test that makes
+/// the reason checkable rather than asserted.
+///
+/// **One `10_001`-arrival fixture, because there is no cheaper door.** Eviction is
+/// the state's, applied by a drain; a mock would prove that a field gets assigned
+/// `None`, which is not the claim. See [`filled_to_the_cap`].
+#[gpui::test]
+fn the_cursor_survives_the_eviction_of_other_rows_and_clears_when_its_own_goes(
+    cx: &mut TestAppContext,
+) {
+    let (sender, view, cx) = filled_to_the_cap(cx);
+    focus_list(cx, &view);
+
+    // --- Its own row goes. -------------------------------------------------
+    cx.simulate_keystrokes("up");
+    let head = cursor(cx, &view).expect("`up` must select a row");
+    assert_eq!(
+        head,
+        cid(0),
+        "the fixture is at the cap and `up` selects the oldest row, which is the \
+         one the next arrival evicts"
+    );
+
+    delivered(
+        cx,
+        &sender,
+        DomainEvent::MessageReceived(stored(
+            MAX_MESSAGES_PER_CHANNEL as u128,
+            "one more than the cap",
+            MAX_MESSAGES_PER_CHANNEL as i64,
+        )),
+    );
+    view.update_in(cx, |_list, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(cx, |list, _| list.item_count()),
+        MAX_MESSAGES_PER_CHANNEL,
+        "the arrival must really have evicted, or the assertion below proves nothing"
+    );
+    assert_eq!(
+        cx.read(|app| bridge::try_read(app, |state| state.position_of(CHANNEL, &head)).flatten()),
+        None,
+        "the selected row must really be gone from the state"
+    );
+    assert_eq!(
+        cursor(cx, &view),
+        None,
+        "a cursor naming a row the list no longer shows is not a cursor: `enter` on \
+         it would act on a message this client has forgotten"
+    );
+
+    // --- Other rows go. ----------------------------------------------------
+    // Re-select, this time somewhere eviction will not reach, and note the
+    // identity rather than an index: the whole point is that the index is about
+    // to become wrong.
+    cx.simulate_keystrokes("down");
+    let survivor = cursor(cx, &view).expect("`down` must select a row");
+    assert_eq!(
+        survivor,
+        cid(MAX_MESSAGES_PER_CHANNEL as u128),
+        "with no cursor, `down` selects the newest row -- the furthest one from \
+         the eviction"
+    );
+
+    delivered(
+        cx,
+        &sender,
+        DomainEvent::MessageReceived(stored(
+            MAX_MESSAGES_PER_CHANNEL as u128 + 1,
+            "and one more",
+            MAX_MESSAGES_PER_CHANNEL as i64 + 1,
+        )),
+    );
+    view.update_in(cx, |_list, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    assert_eq!(
+        cursor(cx, &view),
+        Some(survivor),
+        "evicting the HEAD shifts every index below it, and the cursor must not \
+         care: an index-keyed cursor would silently point at a different message \
+         one arrival after it was placed"
+    );
+}
+
+/// The cursor is cleared when the channel changes, and a row shows it.
+///
+/// **Clearing rather than carrying across is the decision
+/// [`MessageList::show_channel`] documents, and the fixture is built to make the
+/// alternative tempting.** `client_msg_id` is *global*, so the row the cursor was
+/// on survives the switch as a retained row: a cursor carried across would still
+/// resolve, still activate, and would put a send from a channel the user is no
+/// longer looking at back in flight. That is a real behaviour and a wrong one, so
+/// it is asserted rather than left to a reader.
+///
+/// **The second half is what "an invisible selection is not a selection" means
+/// here.** Asserted on the row's own spec, and on the colour
+/// [`MessageRow::selection_rule_color`] returns — which is the very call
+/// [`Render::render`] makes when it draws the rule, so the test is about the
+/// frame and not about a copy of the rule. `accent` and not `danger`, because the
+/// rule answers "where is the cursor" and `danger` is the failed-send state.
+///
+/// **On what this cannot show, stated rather than implied.** Phase 0's finding 3
+/// rules out screenshot comparison on Windows, so no assertion here looks at a
+/// pixel. What *is* pinned is everything the pixel depends on: the flag reached
+/// the row, the row is the only one carrying it, and the row chose `accent`. The
+/// height-neutrality that keeps a cursor move from reflowing the log is a property
+/// of `render` — `border_l_2` unconditionally, colour conditionally — and is
+/// documented on [`MessageRow::selection_rule_color`] rather than asserted.
+#[gpui::test]
+fn the_cursor_is_cleared_by_a_channel_change_and_the_row_shows_it(cx: &mut TestAppContext) {
+    let (sender, view, cx) = showing_channel(cx);
+    delivered(
+        cx,
+        &sender,
+        DomainEvent::MessageReceived(stored(1, "in the first channel", 1)),
+    );
+    delivered(
+        cx,
+        &sender,
+        DomainEvent::MessageReceived(stored_in(OTHER, 2, "in the second channel", 2)),
+    );
+    view.update_in(cx, |list, _window, cx| {
+        list.show_channel(CHANNEL, cx);
+    });
+    cx.run_until_parked();
+
+    focus_list(cx, &view);
+    cx.simulate_keystrokes("down");
+    let chosen = cursor(cx, &view).expect("`down` must select the only row");
+    assert_eq!(
+        chosen,
+        cid(1),
+        "the fixture must select the first channel's row"
+    );
+
+    // The row is showing it, and it is the only one.
+    assert_eq!(
+        row_draws_the_cursor(cx, &view, chosen),
+        Some(true),
+        "the selected row must draw itself as selected -- an invisible selection is \
+         not a selection, and the flag is the whole of how a row can show one"
+    );
+    let palette = Colors::default();
+    let rule = view.read_with(cx, |list, app| {
+        list.retained_row(&chosen)
+            .map(|row| row.read_with(app, |row, _| row.selection_rule_color()))
+    });
+    assert_eq!(
+        rule,
+        Some(palette.accent),
+        "the selection rule is drawn in `accent`, the palette's interactive colour. \
+         `danger` is the failed-send state, and a cursor rule in it would claim the \
+         selected row had failed -- which on most rows is a lie"
+    );
+
+    // And the second channel has no message on screen, so there is nothing to
+    // select there; the assertion is that the cursor did not survive the switch.
+    view.update_in(cx, |list, _window, cx| {
+        list.show_channel(OTHER, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(cx, |list, _| list.channel().map(str::to_owned)),
+        Some(OTHER.to_owned()),
+        "the list must really have switched, or the assertion below is vacuous"
+    );
+    assert_eq!(
+        cursor(cx, &view),
+        None,
+        "a cursor does not survive a channel switch. The id is global and the row \
+         survives as a retained row, so a carried cursor would still resolve and \
+         `enter` would retry a send in a channel the user is no longer looking at"
+    );
+}
+
+/// A selection change alone is a change, or the row never redraws.
+///
+/// **No window and no list, and that is the point of the predicate being on
+/// [`RowSpec`].** The rule "a cursor move must reach the row" can only be observed
+/// through the frame otherwise, and `MessageList::differs_from`'s callers are the
+/// remeasure path as well as the redraw — so a spec that failed to compare
+/// `is_selected` would leave the previous row's cursor still drawn and no test
+/// would say so.
+///
+/// **The other direction is asserted because it is the tempting mistake.** A
+/// comparison that returned `true` for every pair would also "redraw the row", and
+/// would remeasure every visible row on every frame — which is the cost
+/// `a_row_is_redrawn_only_when_its_spec_changed` exists to keep bounded.
+#[test]
+fn a_selection_change_alone_is_enough_to_need_a_redraw() {
+    let unselected = spec_for(1, "hello");
+
+    let mut selected = unselected.clone();
+    selected.is_selected = true;
+
+    assert!(
+        selected.differs_from(&unselected),
+        "moving the cursor onto a row must report a change, or `MessageRow::set` \
+         returns false and the row keeps drawing the cursor it no longer has -- and \
+         `RowSpec::differs_from`'s own documentation says an invisible selection is \
+         not a selection"
+    );
+    assert!(
+        !unselected.differs_from(&unselected.clone()),
+        "and a row that did not move must not report a change: every visible row \
+         compared against itself on every frame is the remeasure storm this method \
+         exists to avoid"
     );
 }

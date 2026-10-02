@@ -57,6 +57,50 @@
 //! [`MessageList::render`] — before the list lays out for that frame, and
 //! outside every borrow of its state.
 //!
+//! # Step 6 — the keyboard, and why the cursor lives on the list
+//!
+//! Work unit 3D shipped a retry affordance that was **pointer-only** and recorded
+//! that as a defect; `AGENTS.md` §5.2 requires keyboard-only operation. This
+//! section is the other half of that fix, and its placement in the module docs is
+//! the point: the keyboard is not a feature of the list element, it is a fourth
+//! thing the list owns alongside its `ListState`, its row cache and its seam.
+//!
+//! **The design rests on four properties of the pinned `gpui`, each read rather
+//! than assumed**, and they are the reason the cursor is one `client_msg_id` on
+//! this view rather than a `FocusHandle` per row:
+//!
+//! | Property | Where |
+//! |---|---|
+//! | a key's dispatch path runs **from the focused node upwards**, so a view that holds the focus hears its own `on_key_down` first | `window.rs`, `dispatch_key_event` |
+//! | `tab_stops` is **rebuilt every painted frame**, so an unpainted element has no tab stop | `window.rs` (`tab_stops.clear()`), `div.rs` (insert during paint) |
+//! | `focus_next` / `focus_prev` read the **already-rendered** frame | `window.rs`, `focus_next` |
+//! | the dispatch walk **returns the instant a handler stops propagation** | `window.rs`, `dispatch_key_down_up_event` |
+//!
+//! **A row cannot host the handle, and the second row of that table is why.** A
+//! handle's tab stop exists only on frames where its element is painted, so a row
+//! scrolled out of the overdraw would take a window's focus with it; and
+//! [`RowCache`] evicts at [`MAX_RETAINED_ROWS`], which would leave a window
+//! focused on a released handle — a dangling focus, not a lost keystroke. **This
+//! view is never evicted and is painted on every frame the window exists**, so a
+//! `client_msg_id` here has neither failure mode. See [`MessageList::focus_handle`]
+//! for how the keyboard reaches this handle, and for the one thing this unit does
+//! *not* do.
+//!
+//! **Four keys, and the count is the listbox convention rather than a shortfall.**
+//! `up`/`down` move the cursor and `enter`/`space` act on it. Every other key
+//! propagates, and [`MessageList::on_key_down`] says why that asymmetry — a
+//! propagating `enter` synthesises a `"\n"` — is the whole of `AGENTS.md` §5.2's
+//! focus-order rule rather than a detail.
+//!
+//! **`escape` is deliberately among the propagating keys, and that is what makes
+//! the chain terminate.** The log is *entered* by the shell handing focus here, so
+//! an `escape` arriving after that has already done its job; claiming it here would
+//! either swallow a key 3D established this handler must never swallow, or start a
+//! cycle back up the ladder. Letting it propagate reaches
+//! [`crate::app::Shell::on_key_down`], which re-asserts this handle — a no-op,
+//! because [`Window::focus`] returns early when the handle already holds focus —
+//! and re-snaps the log to the newest message.
+//!
 //! # What this file deliberately does not do
 //!
 //! No delegate trait (ADR-006: *"a trait over a single call site is indirection
@@ -66,14 +110,41 @@
 //! `set_scroll_handler` hook Phase 3's paged history needs is not wired either,
 //! because nothing calls it yet and a registered handler nobody triggers is
 //! indistinguishable from no handler at all.
+//!
+//! # The `Escape` ladder, and the `Tab` gap it does not close
+//!
+//! **The log is reachable by key in the shipped client, and the route is `Escape`
+//! twice.** `InputBar`'s `Escape` hands focus to the shell's root handle;
+//! `Shell::on_key_down`'s hands it to [`MessageList::focus_handle`]. That is the
+//! whole chain, it is tested end to end in `tests/app_shell.rs`, and it is **not
+//! `Tab`** — a keyboard purist expects `Tab` to move between panes and
+//! `Shift+Tab` to move back, and this client has neither.
+//!
+//! **The cost is a real gap rather than a stylistic note, and it is stated here
+//! because the ladder is one-way.** Nothing in the crate binds a key to the
+//! composer's handle *from here*, so a keyboard user who presses `Escape` twice
+//! can reach the log, move the cursor and retry a send, and **cannot get back to
+//! the field with a key**. That is not a regression — before the ladder the log
+//! had no key route at all, and one `Escape` already stranded the keyboard on the
+//! shell root — and it is not what a `Tab` binding would leave either, since
+//! `Tab` reaches the log by traversal and returns by traversal. **`AGENTS.md` §5.2
+//! is therefore not satisfied in full by what is here**, and no part of this file
+//! says it is.
+//!
+//! | Missing | Why it is not here |
+//! |---|---|
+//! | a `Tab` → [`Window::focus_next`] binding | `focus_next` has **no caller anywhere in `gpui` at this rev** outside its own tests, and this crate has no keymap. Adding a traversal binding is a gesture and a product decision, not a detail of this unit. The decision not to reverse is 3B's: `app::open` keeps focus on the composer, because a client that opens on the log is a client that cannot be typed into. **The `Escape` ladder is this unit's own answer to reachability, and `tab_index(0)` is deliberately absent on the handle** — with no traversal, it would declare an intent nothing implements. |
+//! | a key that returns from the log to the composer | It would make `Escape` a three-way toggle, so pressing it repeatedly walks the three views forever — the focus loop this change exists to avoid — and it would need a second owner of `escape`. The missing piece is the `Tab` binding above, not a fourth rung. |
+//! | multi-select, `Shift`+arrows, `Home`/`End` | `AGENTS.md` §5.2 asks for a focus *order*, and a single cursor is what it describes. The rest is scope this unit does not have to invent, and a second cursor is a second thing every assertion above would have to be restated for. |
 
 use std::cmp::Ordering;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    div, list, prelude::*, px, AnyElement, Context, Empty, Entity, FollowMode, IntoElement,
-    ListAlignment, ListSizingBehavior, ListState, Render, Window,
+    div, list, prelude::*, px, AnyElement, App, Context, Empty, Entity, FocusHandle, Focusable,
+    FollowMode, IntoElement, KeyDownEvent, ListAlignment, ListSizingBehavior, ListState, Render,
+    Window,
 };
 use uuid::Uuid;
 
@@ -92,6 +163,31 @@ use crate::ui::Colors;
 /// and it is in pixels because that is what the list's own API takes — a row
 /// count would assume the height this whole design refuses to assume.
 const OVERDRAW_PX: f32 = 512.0;
+
+/// How far `up` moves the keyboard cursor, in rows. Negative because
+/// [`MessageList::move_selection`] takes a signed step.
+const STEP_BACK: isize = -1;
+
+/// How far `down` moves the keyboard cursor, in rows.
+const STEP_FORWARD: isize = 1;
+
+/// The key [`MessageList::on_key_down`] moves the cursor towards older messages
+/// on, as `gpui`'s keystroke parser spells it.
+const MOVE_BACK_KEY: &str = "up";
+
+/// The key [`MessageList::on_key_down`] moves the cursor towards newer messages
+/// on. See [`MOVE_BACK_KEY`].
+const MOVE_FORWARD_KEY: &str = "down";
+
+/// The keys [`MessageList::on_key_down`] activates the selected row with.
+///
+/// **A pair, and the listbox convention is why both are here.** `enter` is what
+/// a keyboard user presses for "act on this", and `space` is what the same
+/// convention offers to anyone using an on-screen keyboard, where `enter` is
+/// frequently absent or taken. `gpui`'s keystroke parser spells them exactly so
+/// (`gpui/src/platform/keystroke.rs:249`), which is what makes the pair
+/// writable as an `|` arm rather than two arms that could drift apart.
+const ACTIVATE_KEYS: [&str; 2] = ["enter", "space"];
 
 /// The chat log, virtualized.
 pub struct MessageList {
@@ -131,6 +227,81 @@ pub struct MessageList {
     /// would be a second borrow of the list's `RefCell`. This is drained by
     /// [`MessageList::flush_remeasures`] before the next layout.
     pending_remeasure: Vec<usize>,
+    /// The `client_msg_id` of the row the keyboard cursor is on, or `None`.
+    ///
+    /// # An identity, not an index, and the eviction is why
+    ///
+    /// `AGENTS.md` §7.1's history bound evicts the channel's **oldest** row at
+    /// the cap (work unit 3C), which shifts every index below it down by one. An
+    /// index would therefore point at a *different message* one arrival later —
+    /// a cursor that silently walks away from the row the user chose, and an
+    /// `enter` that retries somebody else's send. A `client_msg_id` survives
+    /// that, and it is already the key [`RowCache`] and [`RowSpec`] use, so this
+    /// is the third place that identity appears rather than a new notion of it.
+    ///
+    /// **The index is derived on every keystroke and never stored.** A `down` is
+    /// one O(1) `position_of` probe plus one slice index, which is not
+    /// `AGENTS.md` §2.3's O(n) in the frame loop; holding an index as well as
+    /// an id would buy nothing and give two fields that can disagree.
+    ///
+    /// **`None` is a real state, not an initialisation artefact**: it is what the
+    /// list shows when nothing is selected, and it is what
+    /// [`MessageList::activate_selection`] refuses on. See
+    /// [`MessageList::drop_stale_selection`] for the two events that clear it.
+    selected: Option<Uuid>,
+    /// This list's own focus handle — **the keyboard's whole way in.**
+    ///
+    /// # One handle, on this view, and not one per row
+    ///
+    /// **A row cannot host a focus handle, and work unit 3D measured why.** Three
+    /// independent facts, each read in the pinned `gpui`:
+    ///
+    /// - The dispatch path for a key runs *from the focused node upwards*
+    ///   (`window.rs` builds it with `dispatch_path(focus_node_id_in_rendered_frame(window.focus))`),
+    ///   so a view that holds the focus receives its own `on_key_down` as the
+    ///   first node of its own path. One handle on the ancestor covers every row.
+    /// - The tab-stop registry is rebuilt **every painted frame**: `window.rs`
+    ///   clears `tab_stops` before each frame and `div.rs` inserts into it during
+    ///   paint. A handle's tab stop exists only on frames where its element is
+    ///   painted, so a row scrolled out of the overdraw loses it — and takes a
+    ///   window's focus with it, because `focus_next` reads the *rendered* frame.
+    /// - `RowCache::evict` drops rows at [`MAX_RETAINED_ROWS`], and a window left
+    ///   focused on a released row's handle is a dangling focus rather than a
+    ///   lost keystroke.
+    ///
+    /// A `client_msg_id` on the list has none of those failure modes: this view
+    /// is never evicted, and it is painted on every frame the window exists.
+    ///
+    /// # How the keyboard gets here, and what that is not
+    ///
+    /// **The log is reachable by key, and the route is `Escape` twice — not
+    /// `Tab`.** `Shell::on_key_down` is the middle rung: the composer's `Escape`
+    /// hands focus to the shell's own root handle, and the shell's `Escape` hands
+    /// it to this one. That is a real keyboard route, it is asserted end to end in
+    /// `tests/app_shell.rs` (`escape_chains_from_the_composer_to_the_log_and_its_retry`),
+    /// and it is **not** what a keyboard purist expects.
+    ///
+    /// **What is still absent is `Tab`.** `TabStopMap` marks a handle reachable by
+    /// traversal only when something binds `Tab` to [`Window::focus_next`], and
+    /// **nothing in this crate or in `gpui` at the pinned rev does** — `focus_next`
+    /// has no caller outside `gpui`'s own tests, and this crate has no keymap. So
+    /// the log is reachable by an explicit gesture and **not** by traversal, which
+    /// is a real gap: a keyboard user cannot come *back* from the log, because
+    /// nothing binds a key to the composer's handle either. That gap is
+    /// pre-existing — before the `Escape` ladder the log had no key route at all —
+    /// and closing it is a `Tab` binding, which is a gesture and a product
+    /// decision this work unit records rather than picks (ADR-006, 3E).
+    ///
+    /// **`tab_index` is deliberately not set on this handle.** It would be inert:
+    /// nothing calls [`Window::focus_next`], and the tab-stop registry is rebuilt
+    /// every painted frame, so a `tab_index` on a handle no traversal reads is a
+    /// declaration of an intent nothing implements — worse than the absence it
+    /// would look like it fills.
+    ///
+    /// **The alternative was not "move focus on open".** `app::open` focuses the
+    /// composer, and a client that opens on a log is a client that cannot be typed
+    /// into; that decision is not this work unit's to reverse.
+    focus_handle: FocusHandle,
 }
 
 /// The parts of a message the row needs, read in one pass.
@@ -181,6 +352,8 @@ impl MessageList {
             head: None,
             anchor: None,
             pending_remeasure: Vec::new(),
+            selected: None,
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -260,6 +433,18 @@ impl MessageList {
         self.rows.get(client_msg_id)
     }
 
+    /// The `client_msg_id` the keyboard cursor is on, or `None`.
+    ///
+    /// **Exposed as an identity rather than an index, and the test asks for the
+    /// identity for the reason [`MessageList::selected`] documents:** an index
+    /// would be a number this view happens to be holding, and a test asserting on
+    /// one could not tell "the cursor is on the row I chose" from "the cursor is
+    /// on whichever row now sits at that number" — which is precisely the defect
+    /// a `client_msg_id` was chosen to prevent.
+    pub fn selected(&self) -> Option<Uuid> {
+        self.selected
+    }
+
     /// Shows a channel: the selection gesture, then a recount.
     ///
     /// **Two things happen here and they are deliberately one call.** The
@@ -300,6 +485,17 @@ impl MessageList {
         // position to carry over.
         self.head = None;
         self.anchor = None;
+        // **The cursor is cleared here and not carried across, and that is the
+        // decision rather than an omission.** A `client_msg_id` is global, so the
+        // row the cursor was on survives the switch as a *retained row* — which
+        // means carrying the cursor forward would leave it pointing at a message
+        // the list is not showing, and an `enter` would put a send from another
+        // channel back in flight. `tests/ui_message_list.rs`
+        // (`the_cursor_is_cleared_when_the_channel_changes`) asserts it, and
+        // `the_cursor_survives_the_eviction_of_other_rows` asserts the half that
+        // must *not* clear, because a rule that clears too eagerly is as wrong as
+        // one that clears too late.
+        self.selected = None;
         self.list.reset(self.count);
         // A gesture that changes what is on screen has to ask for a frame.
         // `reset` changes the list's state, not GPUI's: nothing else in this
@@ -364,6 +560,15 @@ impl MessageList {
     /// for another one, forever — a redraw loop that also means
     /// `run_until_parked` never parks. Scheduling is the caller's, `bridge.rs`
     /// §6's decision about `drain` applied to the frame that follows it.
+    ///
+    /// **The keyboard cursor is reconciled here too, and here is the only place
+    /// it can be.** A row leaves this list two ways — the channel changes
+    /// ([`MessageList::show_channel`], which clears the cursor in the same breath)
+    /// and `MAX_MESSAGES_PER_CHANNEL` evicts the oldest row — and eviction is
+    /// applied by the *state*, on a drain, with no callback to a view. The list
+    /// therefore learns about it the same way it learns about every other change
+    /// to the state: by reading the state. See
+    /// [`MessageList::drop_stale_selection`].
     pub fn sync(&mut self, cx: &mut Context<Self>) -> usize {
         self.flush_remeasures();
 
@@ -380,6 +585,7 @@ impl MessageList {
         }
         self.count = count;
         self.reanchor(&channel, cx);
+        self.drop_stale_selection(channel.as_deref(), cx);
         count
     }
 
@@ -441,6 +647,54 @@ impl MessageList {
         self.anchor = at_top;
     }
 
+    /// Clears the keyboard cursor if the row it names is no longer in the list.
+    ///
+    /// # Why "no longer in the list" is the question, and not "did the count move"
+    ///
+    /// `MAX_MESSAGES_PER_CHANNEL` evicts the **head**, so a channel that is over
+    /// the cap evicts on *every* arrival and its message count does not change at
+    /// all. A rule keyed on the count would therefore clear the cursor constantly
+    /// and a rule that never cleared it would let `enter` retry a send for a
+    /// message the state has thrown away. **The rule is the only one that is
+    /// right: the cursor names a row, and the cursor lives exactly as long as that
+    /// row is held.**
+    ///
+    /// **Eviction of *other* rows leaves it alone, and that is the half worth
+    /// stating.** A head eviction shifts every index below it down by one, so the
+    /// cursor's index is stale the moment it happens — which is exactly why
+    /// [`MessageList::selected`] holds a `client_msg_id`. `position_of` re-derives
+    /// the index on the next keystroke and the user has not moved.
+    ///
+    /// **One `try_read` and one O(1) hash probe on the frames that have a cursor,
+    /// and none at all on the frames that do not.** The early return on
+    /// `self.selected == None` is the whole of that: with no cursor there is
+    /// nothing to check and this is not on the frame path.
+    ///
+    /// **No `cx.notify()`, for the same reason [`MessageList::sync`] does not
+    /// notify.** Whatever evicted the row already asked for a frame — an arrival
+    /// goes through the drain, and the drain's caller schedules. The frame now
+    /// running will draw the cursor's absence.
+    fn drop_stale_selection(&mut self, channel: Option<&str>, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected else {
+            return;
+        };
+
+        // No channel, or no state, means there is nothing the cursor could be
+        // naming — and `AGENTS.md` 2.1 forbids the `unwrap` that would
+        // distinguish "no state" from "no such row" by crashing.
+        let held = match channel {
+            Some(channel) => {
+                bridge::try_read(cx, |state| state.position_of(channel, &selected).is_some())
+                    .unwrap_or(false)
+            }
+            None => false,
+        };
+
+        if !held {
+            self.selected = None;
+        }
+    }
+
     /// Stops the list snapping to the newest message.
     ///
     /// `pause_following_tail` rather than `FollowMode::Normal`, and the
@@ -463,6 +717,239 @@ impl MessageList {
     /// Whether the list is currently snapping to the newest message.
     pub fn is_following_tail(&self) -> bool {
         self.list.is_following_tail()
+    }
+
+    /// Handles this list's four keys and leaves every other key alone.
+    ///
+    /// **A view that holds the focus receives its own `on_key_down`, and that is
+    /// what makes one handler enough for every row.** GPUI builds a key's
+    /// dispatch path from the focused node *upwards*
+    /// (`window.rs`: `focus_node_id_in_rendered_frame(window.focus)` then
+    /// `dispatch_tree.dispatch_path(node_id)`, walked capture-first and then
+    /// bubble-first), so the focused node is the first thing the walk reaches. A
+    /// list-level handle therefore hears every key aimed at any row, which is the
+    /// whole reason [`MessageList::selected`] is a `client_msg_id` rather than
+    /// per-row state.
+    ///
+    /// | Key | What it does | Stops propagation |
+    /// |---|---|---|
+    /// | [`MOVE_BACK_KEY`] | cursor one row towards the head | yes |
+    /// | [`MOVE_FORWARD_KEY`] | cursor one row towards the tail | yes |
+    /// | [`ACTIVATE_KEYS`] | retries the selected row, if it is a failed send | **only if it did something** |
+    /// | `escape` | nothing here — it propagates to [`crate::app::Shell::on_key_down`] | no |
+    ///
+    /// # Why `escape` is in that table and claims nothing
+    ///
+    /// **The chain that brings focus here is the shell's, and a key that arrives
+    /// after it has arrived has nothing left to do.** The log is entered *by* the
+    /// shell handing focus to [`MessageList::focus_handle`], so the `escape` that
+    /// got the user here was consumed by the rung above. There are exactly two
+    /// things this handler could do with the next one, and both are wrong:
+    ///
+    /// - **Swallow it.** 3D's rule, restated by the activation keys below: a
+    ///   handler must not claim a key it does not own, because a swallowed
+    ///   `escape` is a key the shell's own gesture can never see.
+    /// - **Send it back up the ladder.** That is the cycle the module docs reject
+    ///   — three views, `escape` a toggle, and a user pressing it repeatedly walks
+    ///   them forever.
+    ///
+    /// **Propagating is the third option and it is the one that terminates.** The
+    /// key reaches [`crate::app::Shell::on_key_down`], which re-snaps the log and
+    /// re-asserts this handle; [`Window::focus`] returns early when the handle
+    /// already holds the focus (`gpui/src/window.rs:2303`), so the second press
+    /// changes nothing and no handler in the crate ever moves focus back up.
+    ///
+    /// # Why the arrows stop propagation and the activation keys do not always
+    ///
+    /// **The arrows own their keys unconditionally.** They are a list gesture and
+    /// nothing above this list has an arrow binding, so propagating would only
+    /// invite a future ancestor to answer them too. `up` and `down` synthesise no
+    /// `key_char` (`with_simulated_ime` answers `None` for a non-printable key),
+    /// so stopping here costs no character.
+    ///
+    /// **The activation keys stop propagation only when they changed something,
+    /// and that asymmetry is the whole of `AGENTS.md` §5.2's focus-order rule.**
+    /// `Window::dispatch_keystroke` begins with `keystroke.with_simulated_ime()`,
+    /// and that synthesises `key_char` for `"enter"` and `"space"`
+    /// (`gpui/src/platform/keystroke.rs:249-251`) — so a propagating `enter`
+    /// leaves a `"\n"` in whatever text input is focused. Today nothing is: the
+    /// composer is a *sibling* of this list and registers its input handler only
+    /// while it holds focus, so with the list focused there is no handler to
+    /// forward to. **That is exactly why the rule is written for the future
+    /// rather than for today.** A row with nothing to do — no cursor, or a row
+    /// whose send is not failed — is not an error and not a claim on the key, so
+    /// it propagates; if focus ever reaches this list from the composer, a
+    /// swallowed `enter` there would be a composer that cannot send.
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+
+        let step = match key {
+            MOVE_BACK_KEY => Some(STEP_BACK),
+            MOVE_FORWARD_KEY => Some(STEP_FORWARD),
+            _ => None,
+        };
+        if let Some(step) = step {
+            // The arrows are this list's gesture and nothing above it has an arrow
+            // binding, so propagating would only invite a future ancestor to answer
+            // them too. `up` and `down` synthesise no `key_char`
+            // (`with_simulated_ime` answers `None` for a non-printable key), so
+            // stopping here costs no character.
+            cx.stop_propagation();
+            self.move_selection(step, cx);
+            return;
+        }
+
+        // `escape` is not in either match above, and that is deliberate rather than
+        // an omission: it belongs to the rung above, and the table in this method's
+        // documentation says why claiming it here would either swallow the shell's
+        // gesture or start a cycle. It propagates, exactly as a character does.
+        //
+        // The activation keys claim the key only when they did something, and that
+        // asymmetry is the whole of `AGENTS.md` §5.2's focus-order rule -- see the
+        // section above. `&&` short-circuits, so a key that is neither an arrow nor
+        // an activation key reaches neither this call nor `stop_propagation` and
+        // propagates.
+        if ACTIVATE_KEYS.contains(&key) && self.activate_selection(cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Moves the keyboard cursor `step` rows, and reveals it.
+    ///
+    /// **The first press lands on an end, and which end is chosen by the
+    /// direction rather than by a rule of its own.** With no cursor, `down`
+    /// selects the newest message and `up` selects the oldest — the two rows a
+    /// user who has just arrived at the log and pressed an arrow is reaching for.
+    /// Every press after that steps, clamped at both ends: a chat log's history is
+    /// bounded and the ends are real, so `up` on the oldest row stays there
+    /// rather than wrapping or refusing.
+    ///
+    /// **Two probes, both O(1), and neither is a frame-path cost.** The cursor's
+    /// index is `AppState::position_of`, a hash lookup in the channel's index map
+    /// rather than a scan of its messages; the destination's identity is one slice
+    /// index. They happen on a keypress, not per row per frame, so
+    /// `AGENTS.md` §2.3 is not in question — and the alternative, storing an index
+    /// beside [`MessageList::selected`], would be a second field that goes stale
+    /// on the very next head eviction.
+    fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let selected = self.selected;
+
+        // One lease of the state for the whole question: where the cursor is, how
+        // many rows there are, and what the row it lands on is called. A message
+        // cannot arrive between them.
+        let moved = bridge::try_read(cx, |state| {
+            let held = state.messages(&channel);
+            let count = held.len();
+            if count == 0 {
+                return None;
+            }
+
+            let at = selected.and_then(|id| state.position_of(&channel, &id));
+            let next = match at {
+                None if step < 0 => 0,
+                None => count - 1,
+                Some(at) => at.saturating_add_signed(step).min(count - 1),
+            };
+
+            Some(held.get(next).map(|message| message.client_msg_id))
+        })
+        .flatten()
+        .flatten();
+
+        if let Some(client_msg_id) = moved {
+            self.select(client_msg_id, cx);
+        }
+    }
+
+    /// Puts the keyboard cursor on `client_msg_id`, and brings it into view.
+    ///
+    /// **One frame for one gesture, asked here rather than by the caller.** The
+    /// cursor is drawn by rows the list renders, and a cursor that moved without a
+    /// repaint would be a cursor that does not move — the same argument
+    /// [`MessageList::retry_failed_send`] makes for the badge.
+    ///
+    /// **The scroll follows the cursor, and it is `scroll_to` rather than
+    /// `scroll_to_reveal_item`, and the difference is load-bearing.** A cursor
+    /// that moves off screen is not a cursor, so the list has to scroll — but a
+    /// chat log opens tail-following, and `List`'s own "make this item visible"
+    /// does **not** call `stop_following`. Its `logical_scroll_top` would be
+    /// re-anchored to the end sentinel on the next layout
+    /// (`gpui/src/elements/list.rs:1211-1218`) and the cursor the user just moved
+    /// would be undone by the frame that drew it. `ListState::scroll_to` *does*
+    /// suspend following whenever the target is below the end, which is the
+    /// behaviour this gesture wants: moving the cursor up through history and
+    /// having it stay where it was put.
+    ///
+    /// **It only scrolls when the row is actually off screen**, and that is what
+    /// keeps `down` from yanking the log on every press. `List` answers
+    /// `item_is_above_viewport` / `item_is_below_viewport` from real bounds, and
+    /// `None` — not enough layout yet — is treated as "off screen", because a row
+    /// whose position is unknown cannot honestly be called visible. Note that a
+    /// tail-following list answers `above == true` for *every* row below the end
+    /// sentinel, so the first cursor move out of a fresh log suspends following
+    /// exactly once, which is the intent.
+    ///
+    /// **A cursor on the newest row leaves following *on*, and that is the
+    /// framework agreeing with us rather than overriding us.** `List` re-engages
+    /// following on any layout where `is_scrolled_to_end()` is true, and the newest
+    /// row is the end — so placing the cursor there and re-engaging is the same
+    /// scroll position. The interesting case, where the two rules disagree, is a
+    /// row in history, and that is where `stop_following` above earns its keep.
+    /// `tests/ui_message_list.rs`
+    /// (`the_cursor_is_brought_into_view_and_takes_the_scroll_with_it`) asserts on
+    /// the *oldest* row for exactly that reason.
+    fn select(&mut self, client_msg_id: Uuid, cx: &mut Context<Self>) {
+        let revealed = bridge::try_read(cx, |state| {
+            let channel = self.channel.as_deref()?;
+            let at = state.position_of(channel, &client_msg_id)?;
+            let off_screen = self.list.item_is_above_viewport(at) != Some(false)
+                || self.list.item_is_below_viewport(at) != Some(false);
+            Some((at, off_screen))
+        })
+        .flatten();
+
+        if let Some((at, true)) = revealed {
+            self.list.scroll_to(gpui::ListOffset {
+                item_ix: at,
+                offset_in_item: px(0.),
+            });
+        }
+
+        self.selected = Some(client_msg_id);
+        cx.notify();
+    }
+
+    /// Retries the selected row, and reports whether this gesture moved the send.
+    ///
+    /// **The same door the click opens.** [`MessageList::retry_failed_send`] is
+    /// called here, not a second time in some keyboard-flavoured shape, so there
+    /// is exactly one definition of "put a failed send back in flight" and the
+    /// two activations cannot disagree about what it does.
+    ///
+    /// **And it still does not transmit.** `retry_send` moves
+    /// [`DeliveryState::Failed`] to [`DeliveryState::Pending`] and stops, because
+    /// there is no socket on this side of the seam; the outbox that would carry a
+    /// `Pending` send is `PLAN.md` §7's Phase 3 work. A user who presses `enter`
+    /// on a failed row therefore watches the badge change from `failed: …` to
+    /// `sending…` and it stays there — exactly as a click does, and for exactly
+    /// the same reason. **The keyboard path does not fix that and must not imply
+    /// otherwise**, which is why this method has no keyboard-shaped prose about
+    /// resending anything.
+    ///
+    /// **`false` for everything a retry must not do**, and the list cannot tell
+    /// those cases apart: no cursor, no state, no such row, and — the one that
+    /// matters — a send that is no longer failed because the server's ACK landed
+    /// between the frame that drew the cursor and the keypress. The row is already
+    /// right in that case, and `false` is what keeps a propagating `enter` from
+    /// being swallowed by a gesture that did nothing.
+    fn activate_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(client_msg_id) = self.selected else {
+            return false;
+        };
+        self.retry_failed_send(client_msg_id, cx)
     }
 
     /// Sends a message as this client, optimistically.
@@ -690,6 +1177,12 @@ impl MessageList {
             delivery: meta.delivery,
             failure_detail: meta.failure_detail,
             reactions: meta.reactions,
+            // One comparison, and it is the identity the cursor already holds.
+            // A `bool` rather than the cursor itself, so the row receives the
+            // answer and not the question — the row's invariant says it holds no
+            // state about the message, and this keeps that true while letting the
+            // row *show* where the cursor is.
+            is_selected: self.selected == Some(client_msg_id),
         })
     }
 
@@ -744,6 +1237,12 @@ impl MessageList {
     }
 }
 
+impl Focusable for MessageList {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for MessageList {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Before the frame's layout, and outside every borrow of the list's
@@ -762,6 +1261,16 @@ impl Render for MessageList {
             // Explicit, per AGENTS.md 7.3.
             .bg(self.colors.background)
             .text_color(self.colors.text)
+            // **On this container's own element, and it has to be here rather
+            // than anywhere in the tree.** `track_focus` is what registers the
+            // handle against *this* node in the rendered frame's dispatch tree,
+            // and the dispatch path of a keypress starts at the focused node —
+            // so a handle this element does not track is a handle that can be
+            // focused and from which no listener will ever run. That is the same
+            // silent failure `InputBar::focus_handle` documents, and it is the
+            // reason a listbox handle is a container's rather than a leaf's.
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
             .child(
                 list(
                     self.list.clone(),
