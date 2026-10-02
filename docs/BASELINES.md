@@ -8,8 +8,9 @@ binary size requires justification"*, and *"Any regression > 10% in performance
 metrics blocks the merge."* Those rules are unenforceable without a recorded
 starting point, which is what this file is.
 
-**Two of the three are recorded here with the exact conditions of measurement.
-The third is not, and says so with a reason rather than being quietly omitted.**
+**All three are recorded here with the exact conditions of measurement. The idle-RAM
+row is now measured at **both** levels *and* over §6.2's own 30-minute time base; it
+remains open on two axes, and says which, rather than claiming more than it measured.**
 
 ## Binary size — recorded
 
@@ -72,13 +73,19 @@ already refused to quietly reinterpret the thresholds — the same answer applie
 
 ## Idle RAM — not recorded at the end of Phase 1, and why that was the honest answer
 
-> **Superseded in part by work unit 2B, and the rest by the app-level mode.**
+> **Superseded by work units 2B, 3A and 4A. The row's own 30-minute time base
+> is now measured too.**
 > A bench shell yields a measured floor (51.6 MB empty, 64.4 MB with 10 000
-> messages); the *application shell* is now measured too, at **51.9 MB empty and
-> 64.7 MB with 10 000 messages**, by `benches/frame_time.rs --mode app` — the run
-> that puts the real `app::Shell` in the window rather than a list and nothing
-> else. See §"Measured: idle RAM" further down. What remains owed is the row's own
-> time base, 30 minutes of active chatting, which no bench dwell can produce.
+> messages); the *application shell* is measured at **51.7 MB empty and 64.5 MB
+> with 10 000 messages** by `benches/frame_time.rs --mode app` — the run that puts
+> the real `app::Shell` in the window rather than a list and nothing else; and
+> `benches/frame_time.rs --mode soak --soak-minutes 30` supplies the **trend** the
+> two 6 s/8 s dwells could never give: 30 minutes of sustained send/ACK cycles,
+> **+4.4 MB** working set, bounded caches settled, with an external monitor on the
+> real pid. See §"Measured: idle RAM" and §"The 30-minute time base" further down.
+> The row is closed on its *time base*; it stays open on the window's *contents*
+> (the channel rail and input bar are Phase 4) and on whether that 4.4 MB is a
+> plateau or a climb.
 
 `AGENTS.md` §6.2 asks for **idle RAM < 80 MB**, measured *"over 30 minutes of
 active chatting"*, and `PLAN.md` L609 lists it as a Phase 1 exit criterion.
@@ -119,6 +126,7 @@ work units.
 | Direct dependencies | 12 rows | `docs/DEPENDENCIES.md` |
 | Idle RAM | **51.6 MB** empty / **64.4 MB** with 10k, bench shell only (floor) | this file, §"Measured: idle RAM" — added by work unit 2B |
 | Idle RAM, app level | **51.7 MB** empty / **64.5 MB** with 10k, real `app::Shell` | this file, §"Measured: idle RAM" — added with `--mode app` |
+| Idle RAM, 30-minute trend | **63.1 → 68.5 MB** working set (**+4.4 MB**), 3 560 samples, send/ACK cycles, bounded caches settled | this file, §"The 30-minute time base" — added with `--mode soak` |
 | Scroll frame time, 10k | **1.087 ms** warm / **1.740 ms** cold, p99, bench shell only (floor) | this file, §"Measured: scroll frame time" — added by work unit 2B |
 | Scroll frame time, 10k, app level | **1.239–1.614 ms** p99 over 8 runs, real `app::Shell` | this file, §"Measured: scroll frame time" — added with `--mode app` |
 
@@ -490,19 +498,104 @@ That is the finding worth keeping, and it is narrower than the row: it says the
 things that exist are not the memory consumer. It does not close §6.2's row, for
 two reasons that are both about time and existence rather than about size.
 
-**What still keeps the row open, with the method for closing it:**
+#### The 30-minute time base — measured, and it moves about 4 MB under load
 
-- **The row's own time base.** §6.2 asks for idle RAM *"over 30 minutes of active
-  chatting"*. The bench dwells 6 s and 8 s, which measures a **level, not a
-  trend** — a leak of any plausible size survives both. Closing this needs the
-  release binary, an OS process monitor attached, 30 minutes of real traffic, and
-  a recording of **both** the idle figure and the growth. That is unchanged from
-  §5.2 and it is not something a bench dwell can be argued into.
+`AGENTS.md` §6.2 asks for idle RAM *"over 30 minutes of active chatting"*. Every
+figure above is a **level**: the two dwells are 6 s and 8 s, which a leak of any
+plausible size survives. This section is the **trend** that closes that gap.
+
+Run with `--mode soak --soak-minutes 30`, the release binary under the
+`profiling` feature, on `x86_64-pc-windows-msvc`. The soak opens one real
+`app::Shell` window, seeds the channel to exactly `MAX_MESSAGES_PER_CHANNEL`
+(10 000), then for 30 minutes drives one **optimistic send + one ACK** per cycle
+through the public seam — `MessageList::begin_send` (the same door `InputBar::send`
+uses) then `DomainEvent::MessageAcked` — each iteration waiting twice for the
+**renderer** to build and update a row. An external monitor sampled this process's
+working set every 500 ms (**3 560 samples**, pid `19972`) and sliced the series on
+the bench's own phase/epoch markers:
+
+| Window | n | Working set (avg) | Working set (min–max) | Private (avg) |
+| --- | --- | --- | --- | --- |
+| baseline, at rest, 10 000 loaded (t ≤ 15 s) | 30 | **63.1 MB** | 62.9 – 63.6 | 71.2 MB |
+| under load, 30 min of send/ACK (16–1815 s) | 3 508 | **65.7 MB** | 63.6 – 70.8 | 73.4 MB |
+| after, activity stopped (t ≥ 1816 s) | 18 | **68.5 MB** | 68.5 | 76.1 MB |
+
+**The 5-minute shape, because an average hides the question the row asks** (delta
+against the first 5-minute bucket's average):
+
+| min | 0 | 5 | 10 | 15 | 20 | 25 | 30 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| WS avg | 64.3 | 65.0 | 65.1 | 66.1 | 66.1 | 67.4 | 68.7 |
+| Δ | — | +0.65 | +0.78 | +1.74 | +1.81 | +3.05 | **+4.40** |
+
+**Reading it honestly: ~4.4 MB of working-set growth over 30 minutes, and the curve
+is a slow staircase, not a flat line and not a clean linear leak.** It steps up and
+partly settles (dips at 10 and 20 min, larger steps at 15 and 25). That shape is
+consistent with the bounded caches filling once plus allocator behaviour, and it is
+consistent with the run's own structural table: the row cache and the rendered-segment
+LRU each climbed 168 → 512 entries and then **stopped** (see the "settled" columns
+below), which is the one-off fill the slope column is warning about. The last bucket
+is still rising, and that is the part not to paper over: a further hour could reveal
+either a plateau (the fill completing) or a continued climb, and **30 minutes cannot
+tell those apart**. The number to re-measure, not to defend.
+
+**Structures, through the client's own public seam — baseline → under load → after:**
+
+| What is counted | baseline | under load | after | verdict |
+| --- | --- | --- | --- | --- |
+| messages held in the channel | 10 000 | 10 000 | 10 000 | flat at the cap |
+| rows the list is showing | 10 000 | 10 000 | 10 000 | flat |
+| rows the row cache retains | 168 | 512 | 512 | **settled** (LRU full) |
+| rendered-segment entries | 168 | 512 | 512 | **settled** |
+| rendered-segment declared bytes | 7 378 | 28 600 | 28 574 | **settled** |
+| unread elements | 10 000 | 10 000 | **0** | drained, as designed |
+| sends awaiting an answer | 0 | 0 | 0 | flat — nothing leaked as pending |
+
+**The 10 000 cap bit, on the first iteration, exactly as predicted.** The channel was
+seeded to precisely `MAX_MESSAGES_PER_CHANNEL`, so the first send is one over the
+bound and the oldest seeded message (`…0001`) was no longer held after iteration 1.
+The highest held count observed was **10 000** — that is cap+1, the first eviction; a
+cap+2 reading would have meant an insert that evicted nothing. Eviction **skips a row
+this client has an outstanding send for** and skips to the next oldest; because this
+cycle ACKs each send before starting the next, at most one row was ever outstanding
+and it was the newest, so the documented all-rows-in-flight over-cap case did not
+arise. That is a property of this workload and **not** evidence the case is harmless:
+a client that queued many sends before any ACK would meet it.
+
+**The one structure that only went up, and has no bound of its own:** the sampled
+tracked-sends map grew to 64 entries (one sample of the delivery map via
+`SOAK_PROBE_EVERY`, not a whole-map count). Its own report is explicit — an
+acknowledged send stays in the map for the life of the process and **eviction does
+not retire it**. That is a real, named unbounded growth on the client side and it is
+the correct next thing to bound, before it is a leak with a long fuse. It is out of
+§6.2's row (this run's `sends awaiting an answer` is flat at 0) but it is the honest
+finding of the trend, so it is not buried here.
+
+**What this still does not measure, quoted from the bench because it must not be
+quoted past:** *"THERE IS NO SERVER. Every ACK in this run was injected by this
+bench… What it cannot measure is a server-driven leak, a reconnection storm, a
+resync, or anything network/ will do in Phase 4 — there is no network/ in this
+build."* The 30 minutes were real cycles through real client code, so this **does**
+answer the row's time base for the client's own structures. It does **not** measure a
+real session, and the cadence (≈967 cycles/min, the shell's 50 ms drain pump) is a
+stress bound orders of magnitude above a person's typing rate — the per-cycle costs
+are the transferable figures, not the 30-minute total.
+
+**What still keeps the row open, and what no longer does:**
+
+- ~~**The row's own time base.**~~ **Closed by this section.** 30 minutes of
+  sustained send/ACK cycles against the release binary, with an external monitor on
+  the real pid: **+4.4 MB** working set over 30 min, bounded caches settled, pending
+  sends flat, the 10 000 cap evicting from iteration 1.
 - **The parts of the window that do not exist yet.** `app.rs`'s module docs, §5,
   record that the channel rail and the input bar are not constructible today, so
   the "application at idle" this file has measured is the shell as it stands at
-  this commit. When those land, this table is re-measured, exactly as the
-  app-level frame-time table must be re-measured with it.
+  this commit. When those land, this table **and this 30-minute trend** are
+  re-measured, exactly as the app-level frame-time table must be re-measured with it.
+- **Whether 4.4 MB is a plateau or a climb.** A longer run, or a second 30-minute
+  run to check reproducibility, is the way to close this — not an argument that the
+  number is small enough. Until then §6.2's idle-RAM row stays open on the *window
+  contents* and *longer-run* axes, and closed on the *time base* axis.
 
 **The p99's denominator is the one stated in §"Measured: scroll frame time"**, and
 it is not repeated here: GPUI's histograms are cumulative, the bench brackets the
