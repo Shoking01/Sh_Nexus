@@ -53,7 +53,7 @@
 //!
 //! What 1C-2b added: the budget itself ([`LruCache::with_budget`],
 //! [`LruCache::budget`], [`LruCache::set_budget`]), the loop that evicts until
-//! the total is under it ([`LruCache::trim_to_bounds`]), the refusal of an
+//! the total is under it (`LruCache::trim_to_bounds`), the refusal of an
 //! entry too large to ever fit ([`InsertOutcome`]), an eviction counter to make
 //! the trim bound measurable ([`LruCache::evictions`]), and the thread-safety
 //! decision of section 13.
@@ -781,15 +781,15 @@ pub struct InsertOutcome<V> {
 ///
 /// # What it guarantees
 ///
-/// - **[`len`] never exceeds [`capacity`](Self::capacity)**, and reaches it
+/// - **[`len`](Self::len) never exceeds [`capacity`](Self::capacity)**, and reaches it
 ///   exactly once enough distinct keys have been inserted.
-/// - **[`total_cost`] never exceeds [`budget`](Self::budget)** when a budget is
+/// - **[`total_cost`](Self::total_cost) never exceeds [`budget`](Self::budget)** when a budget is
 ///   set, after every operation *including* a
 ///   [`set_budget`](Self::set_budget) that lowers it.
 /// - An entry that is read, replaced or re-inserted becomes the **most recently
 ///   used**. An entry that is merely *looked for and not found* changes nobody's
 ///   recency; see the module docs, section 6.
-/// - **[`total_cost`] is always the sum of the declared costs of the live
+/// - **[`total_cost`](Self::total_cost) is always the sum of the declared costs of the live
 ///   entries** -- across insertions, replacements, removals and evictions.
 /// - An entry costing more than the whole budget is **refused**, not admitted and
 ///   not evicted; see the module docs, section 12.

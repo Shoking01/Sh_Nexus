@@ -326,7 +326,7 @@ pub const THEME_KEYS: [&str; 7] = [
 ///
 /// A newtype rather than a `String` so that **no unvalidated colour can exist**:
 /// the only ways to obtain one are [`Color::from_hex`], which enforces
-/// [`COLOR_HEX_FORMAT`], and [`Color::from_rgb`], which needs no validation
+/// [`Color::COLOR_HEX_FORMAT`], and [`Color::from_rgb`], which needs no validation
 /// because every triple of `u8` is a colour.
 ///
 /// # Example
@@ -358,7 +358,8 @@ impl Color {
     /// Parses [`Color::COLOR_HEX_FORMAT`], or returns `None`.
     ///
     /// Both cases of hex digit are accepted, because a text editor's colour
-    /// picker produces either; [`Display`] emits the lower-case canonical form.
+    /// picker produces either; [`Display`](std::fmt::Display) emits the lower-case
+    /// canonical form.
     ///
     /// The `is_ascii_hexdigit` pass before the radix parse is **not
     /// redundant**: `u8::from_str_radix` accepts a leading `+` or `-`, so
@@ -620,7 +621,7 @@ impl Theme {
 /// map would need a "missing key means use this default" rule, and a
 /// half-applied theme has no symptom. With fields, a missing key is a
 /// [`ThemeError::MissingKey`] naming it, and adding a key is a compile error in
-/// [`palette_from`] and in [`COLOR_KEYS`] together.
+/// `palette_from` and in [`COLOR_KEYS`] together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     /// The window background, behind everything.
@@ -658,7 +659,7 @@ impl Palette {
     ///
     /// **The validator never calls this, and that is the point of it existing.**
     /// Validation has to *fail* on a key it does not recognise, so it reads named
-    /// fields through [`palette_from`] and a lookup returning `None` would be
+    /// fields through `palette_from` and a lookup returning `None` would be
     /// swallowed somewhere. This accessor is for the other direction: a settings
     /// screen, a diagnostic dump, or a caller that received a key from a
     /// configuration UI and needs to resolve it without a `match` over thirteen

@@ -8,7 +8,7 @@
 //! | root component | [`Shell`]'s `Render` impl |
 //! | global state | [`open`], through [`bridge::install`] |
 //! | theme provider | [`theme_colors`], handed to the list and the composer at construction |
-//! | key handling | [`Shell::on_key_down`] for the `Escape` ladder, and [`InputBar::on_key_down`] for the field's two keys |
+//! | key handling | `Shell::on_key_down` for the `Escape` ladder, and `InputBar::on_key_down` for the field's two keys |
 //!
 //! **The list is short because every obligation that could have been written as
 //! a fifth thing here has a named owner somewhere else**, and duplicating an
@@ -104,7 +104,7 @@
 //! # 5. What this file deliberately does not contain
 //!
 //! `PLAN.md` §6 asks for *"App shell: sidebar + chat area + input bar"*, and the
-//! input bar now exists — [`views::input_bar::InputBar`], composed in
+//! input bar now exists — [`crate::ui::views::input_bar::InputBar`], composed in
 //! [`Render`] and focused by [`open`]. **It is a separate view rather than a
 //! section of this file, and the reason is the one `bridge.rs` §5 argues
 //! generally: a second place to do something is the audit trail, and a composer

@@ -34,7 +34,7 @@
 //! `RowSpec` is constructible from nothing but plain data.
 //!
 //! **A second field arrived in work unit 3D, and it is a handle to the *view*,
-//! not to the state.** [`MessageRow::owner`] is a
+//! not to the state.** `MessageRow::owner` is a
 //! `WeakEntity<MessageList>`: the list that owns this row, so a control the row
 //! draws has somewhere to dispatch to. It holds no application state, names no
 //! state type, and would survive every check above unchanged. The invariant it
@@ -141,7 +141,7 @@ pub struct RowSpec {
     ///
     /// **A flag in the spec rather than state in the row, and the reason is the
     /// same one the whole file's contract rests on.** The selection lives on
-    /// [`MessageList`](super::message_list::MessageList) as a `client_msg_id`,
+    /// [`MessageList`] as a `client_msg_id`,
     /// because the list is never evicted and a row is; storing it here would make
     /// a row that is scrolled out and back disagree with the list about which
     /// row is current. It arrives the way `delivery` does — as data the frame
@@ -172,7 +172,7 @@ impl RowSpec {
     /// would not be told to redraw, and an invisible selection is not a
     /// selection. Including it means a cursor move also routes the two affected
     /// rows through [`MessageRow::set`]'s `true`, which
-    /// [`MessageList`](super::message_list::MessageList) turns into one
+    /// [`MessageList`] turns into one
     /// coalesced `remeasure_items` over the visible range. **That remeasure
     /// changes nothing, and it is deliberately so:** the selection rule is a
     /// constant-width border whose *colour* changes
@@ -259,7 +259,7 @@ impl MessageRow {
     ///
     /// **No `Context` is taken, and that is still true:** a row has no state of
     /// its own beyond its spec and the handle back to its owner, so there is
-    /// nothing to register and nothing to focus. See [`MessageRow::owner`] for why
+    /// nothing to register and nothing to focus. See `MessageRow::owner` for why
     /// the handle exists, and for why it is not the state the sentence above rules
     /// out.
     ///
@@ -498,7 +498,7 @@ impl MessageRow {
     /// and this is the file that shows what that costs: the row holds a
     /// [`RowSpec::is_selected`] flag and draws it, and every question about *where
     /// the cursor is* — the keys, the tab order, the focus handle, the eviction —
-    /// belongs to [`MessageList`](super::message_list::MessageList). The row stays
+    /// belongs to [`MessageList`]. The row stays
     /// a function of its spec.
     fn delivery_badge(&self) -> Option<AnyElement> {
         let colors = self.colors;
@@ -636,7 +636,7 @@ impl Render for MessageRow {
 ///
 /// See the module docs for why this is a map of entities rather than a map of
 /// specs. The cache is owned by
-/// [`MessageList`](super::message_list::MessageList), which is the only caller,
+/// [`MessageList`], which is the only caller,
 /// and is public so that the recycling rule can be tested without a window.
 pub struct RowCache {
     /// The live rows, by the identity that survives an ACK.

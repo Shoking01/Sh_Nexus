@@ -8,9 +8,9 @@
 //! non-UI thread while §3.2 forbids `network/` from importing GPUI, and the
 //! obvious way to satisfy the first -- call `cx.update_global` from the
 //! WebSocket task -- is precisely the one §3.2 prohibits. `PLAN.md` §4
-//! resolves it with a named owner: `network/` emits plain [`DomainEvent`] values
-//! and `state/bridge.rs` is the only module that calls `cx.update_global`, always
-//! on the main thread.
+//! resolves it with a named owner: `network/` emits plain
+//! [`crate::core::models::DomainEvent`] values and `state/bridge.rs` is the only
+//! module that calls `cx.update_global`, always on the main thread.
 //!
 //! `crates/sh_nexus/tests/layer_boundary.rs` asserts the GPUI prohibition by
 //! scanning this directory's source, so the rule is a test failure rather than a

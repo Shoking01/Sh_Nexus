@@ -155,7 +155,7 @@
 //! **Images are not links, and a message's Markdown never causes a fetch.**
 //! `![alt](url)` is a network request to a host the *message author* chose, with
 //! this client's IP address attached, from inside a chat window. That is a
-//! read receipt. Attachments belong in [`Message::attachments`], which the
+//! read receipt. Attachments belong in [`crate::core::models::message::Message::attachments`], which the
 //! network boundary validates (`network/mapping.rs`); an image source has no
 //! business in attacker-controlled Markdown. So an image contributes its **alt
 //! text** and nothing else, and its target is counted as one this client will
@@ -308,8 +308,8 @@ pub const MAX_TARGET_BYTES: usize = 2_048;
 /// need one variant per combination and would grow a variant for every style
 /// added. See the module docs, §2.
 ///
-/// [`Event`](pulldown_cmark::Event) is linked in the docs only to name the
-/// crate's type; this module does not re-export it.
+/// [`Event`] is linked in the docs only to name the crate's type; this module
+/// does not re-export it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Style(u8);
 
@@ -479,7 +479,7 @@ impl From<HeadingLevel> for Heading {
 
 /// One run of text with a single, uniform style.
 ///
-/// A run is a **maximal** stretch of one style: [`Builder::push_text`] merges an
+/// A run is a **maximal** stretch of one style: `Builder::push_text` merges an
 /// adjacent same-style run into its predecessor, so a paragraph of ordinary
 /// prose is one `TextSpan` rather than one per line, and two different spellings
 /// of the same emphasis produce the same tree.

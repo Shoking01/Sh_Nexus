@@ -60,7 +60,7 @@
 //! **The basis of the invariant is ownership, not a type.** `PLAN.md` §4 makes
 //! `state/bridge.rs` the only module permitted to call `cx.update_global` or
 //! `cx.update`, and `AGENTS.md` §7.3 requires both to happen on the main
-//! thread. `network/` emits plain [`DomainEvent`] values
+//! thread. `network/` emits plain [`crate::core::models::events::DomainEvent`] values
 //! (`crate::core::models::events::DomainEvent`) and never imports `gpui`. So
 //! every path from a socket to this state goes through the main thread by
 //! construction of the layers above it.
@@ -123,8 +123,8 @@
 //! > 2. its channel is **not the selected channel** at the moment it is applied;
 //! > 3. its author is **not this session's user** — `self_user_id`.
 //!
-//! **And it is cleared to zero by [`state::actions::select_channel`]**, which is
-//! what `AGENTS.md` §8.1's Channel Switch Flow means by *"unread badge
+//! **And it is cleared to zero by [`crate::state::actions::select_channel`]**,
+//! which is what `AGENTS.md` §8.1's Channel Switch Flow means by *"unread badge
 //! clears"*.
 //!
 //! **Why (2) is evaluated at arrival and not "was it ever read".** The counter
@@ -294,9 +294,9 @@ pub const MAX_TYPING_CHANNELS: usize = 64;
 ///
 /// # What is evicted, and through which door
 ///
-/// The **oldest** row, by the order [`ChannelMessages`] already maintains
+/// The **oldest** row, by the order `ChannelMessages` already maintains
 /// (`core::ordering::compare`, ascending, so the head is the oldest), and
-/// through [`remove_message`](AppState::remove_message) rather than past it.
+/// through `remove_message` rather than past it.
 /// That is not a style preference: `remove_message` is the only thing that
 /// retires `message_index` and the unread set's element, so an eviction that
 /// reached into `ChannelMessages` directly would leave a counted message with
@@ -801,7 +801,7 @@ impl AppState {
     ///
     /// Separate from [`channel`](Self::channel) because a *message* can be held
     /// for a channel that is not in the list — see
-    /// [`set_channels`](Self::set_channels) — and a caller that needs "can the
+    /// `set_channels` — and a caller that needs "can the
     /// user select this" needs the distinction.
     pub fn has_channel(&self, channel_id: &str) -> bool {
         self.channels.contains_key(channel_id)
