@@ -1,0 +1,45 @@
+# Server dependencies, justified per `AGENTS.md` §7.2.
+#
+# The full five-criterion audit is in the workspace `Cargo.toml`, under the
+# "PHASE 3 -- sh_nexus_server's dependencies" heading. This file deliberately
+# names no version of its own: it declares which audited crates this member uses,
+# so the audit lives in exactly one place and cannot drift between manifests.
+#
+# `sh_nexus_wire` is deliberately NOT in this list. The protocol already exists as
+# a workspace member and is the single source of truth for the contract
+# (`PLAN.md`); the server consumes it rather than redefining frames, which is what
+# keeps the client's `network/mapping.rs` and the server from drifting.
+
+[package]
+name = "sh_nexus_server"
+version = "0.1.0"
+description = "Sh_Nexus server - the self-hosted per-team instance described in ADR-010"
+license = "MIT"
+publish = false
+edition = "2021"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+rusqlite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Already audited above and used by `sh_nexus_wire`; named here because a
+# workspace member states its own dependencies rather than inheriting another
+# crate's.
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# The protocol contract. This is the reason the server is a workspace member
+# rather than a separate repository: both sides compile against the same frame
+# types, so they cannot disagree about the wire.
+sh_nexus_wire = { path = "../sh_nexus_wire" }
+
+[dev-dependencies]
+# Integration tests drive a real server over a real socket, so they need to spin
+# one up rather than mock it -- `AGENTS.md` §8.1's Real-time Flow asks for two
+# clients exchanging messages, and a mock cannot answer whether the server does.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
