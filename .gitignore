@@ -1,6 +1,15 @@
 # Cargo build artifacts.
 /target
 
+# Per-machine Cargo configuration.
+#
+# `.cargo/config.toml` holds whatever THIS machine needs in order to work here,
+# and it is deliberately not committed: a linker choice or a `-j` default is a
+# property of the developer's hardware, not of the project, and committing one
+# would silently impose it on everyone else. `Cargo.lock` is the opposite case
+# and stays committed -- see below.
+.cargo/
+
 # `Cargo.lock` is intentionally COMMITTED.
 #
 # This workspace produces binaries (a client, and a server crate later), so the
