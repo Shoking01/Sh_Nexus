@@ -126,7 +126,7 @@ work units.
 | Direct dependencies | 12 rows | `docs/DEPENDENCIES.md` |
 | Idle RAM | **51.6 MB** empty / **64.4 MB** with 10k, bench shell only (floor) | this file, §"Measured: idle RAM" — added by work unit 2B |
 | Idle RAM, app level | **51.7 MB** empty / **64.5 MB** with 10k, real `app::Shell` | this file, §"Measured: idle RAM" — added with `--mode app` |
-| Idle RAM, 30-minute trend | **63.1 → 68.5 MB** working set (**+4.4 MB**), 3 560 samples, send/ACK cycles, bounded caches settled | this file, §"The 30-minute time base" — added with `--mode soak` |
+| Idle RAM, 30-minute trend | **63.1 → 68.5 MB** working set (**+4.4 MB**), 3 560 samples, send/ACK cycles, bounded caches settled — **measured pre-fix** | this file, §"The 30-minute time base" — added with `--mode soak` |
 | Scroll frame time, 10k | **1.087 ms** warm / **1.740 ms** cold, p99, bench shell only (floor) | this file, §"Measured: scroll frame time" — added by work unit 2B |
 | Scroll frame time, 10k, app level | **1.239–1.614 ms** p99 over 8 runs, real `app::Shell` | this file, §"Measured: scroll frame time" — added with `--mode app` |
 
@@ -608,12 +608,41 @@ than inverted, on its own written instruction.
 after it.** The 64-entry probe sample, the +4.4 MB trend, the 63.1 → 68.5 MB
 working-set windows and the 3 560 samples are provenance: they measured the client
 *with* the leak, which is the only reason the leak was known rather than argued
-about. **Whether the fix removes part of that +4.4 MB is not established, and this
-section does not claim it.** That question is owed a re-measurement — another
-`--mode soak --soak-minutes 30` on the fixed build — and until that run exists the
-right statement about the slope is the one already made above it: 30 minutes
-cannot distinguish a plateau from a climb, and the number is to re-measure, not to
-defend.
+about.
+
+#### Re-measured on the fixed build — the fix holds, and the RAM figure is void
+
+A second `--mode soak --soak-minutes 30` was run on the fixed build, same release
+configuration, same `--features profiling`, `rustc 1.99.0`, Windows/MSVC.
+**28 823 iterations in 1800.0 s, 57 724 frames, 960.7 cycles/min.**
+
+| | pre-fix | post-fix |
+|---|---|---|
+| `sampled sends still tracked` — under load | 64 | **64** |
+| `sampled sends still tracked` — **after** | **64** | **0** |
+| messages held in the channel | 10 000 | 10 000 |
+| sends awaiting an answer | 0 | 0 |
+
+**The fix is measured, by the bench's own probe, and it holds under load.** The
+`after` column is the whole finding: pre-fix the 64 sampled entries outlived the
+run, post-fix they are gone once the activity stops. The `under load` figure is
+unchanged at 64, which is correct — those are the entries for sends whose rows are
+still on screen, and they are only retired as eviction reaches them.
+
+**The working-set number from this run is NOT reported, because the measurement is
+void.** An external sampler reported the process falling from 64.8 MB to 13.9 MB at
+t≈290 s and staying there for the remaining 26 minutes. That is not a leak and not
+a cache returning: **private (committed) memory did not move at all** across the
+step (72.69 MB → 72.69 MB), while working set collapsed. That is the signature of
+Windows trimming an idle process's working set under memory pressure — the pages
+are still committed, they were just paged out. The bench itself kept running
+untroubled (4 837 cycles at t=300 s, channel at 10 000), and the pre-fix run on the
+same machine showed no such step.
+
+So the honest statement is: **the +4.4 MB question is still open, and this run does
+not answer it.** The structural figure that is answerable was answered, and it
+answered yes. Anyone re-measuring the working set should watch for a mid-run step
+and check private memory alongside it, or that run will record a phantom drop.
 
 **What this still does not measure, quoted from the bench because it must not be
 quoted past:** *"THERE IS NO SERVER. Every ACK in this run was injected by this
