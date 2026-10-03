@@ -2037,10 +2037,18 @@ fn print_soak_report(soak: &Soak<'_>) -> Result<(), String> {
         "sampled sends still tracked", soak.baseline.tracked, soak.peak.tracked, soak.after.tracked
     );
     println!("   the row above is a sample of this run's own sends, not a count of the whole");
-    println!("   delivery map: see SOAK_PROBE_EVERY. It is the one figure here that can");
-    println!("   only go up, and it is the one place a client's own bookkeeping grows");
-    println!("   without a bound of its own -- an acknowledged send stays in the map for");
-    println!("   the life of the process, and eviction does not retire it.");
+    println!("   delivery map: see SOAK_PROBE_EVERY. It RISES under load and FALLS BACK after,");
+    println!("   and that shape is the point: evict_one_over_cap retires an ACKNOWLEDGED send's");
+    println!("   entry together with the row it evicts, so the map's bound is structural --");
+    println!("   entries can never outnumber held rows plus sends still in flight.");
+    println!("   A run where `after` is 0 and `under load` was 64 is that fix holding under a");
+    println!("   real load. A run where `after` equals `under load` is the LEAK SHAPE: the entry");
+    println!("   is outliving its row, and that is the regression this row exists to catch.");
+    println!("   A Pending or Failed send is NOT retired by eviction and is not supposed to be --");
+    println!(
+        "   the user is still looking at that row and can still retry it. discard_failed_send"
+    );
+    println!("   is its retirement path, so a failed send can also never accumulate here.");
     println!("   HOW TO READ THE THREE COLUMNS: `after` == `under load` means the structure");
     println!("   settled; `after` < `under load` means it came back down, which is what a");
     println!("   cache does; `after` > `under load` is the leak shape. The slope column is");
