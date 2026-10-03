@@ -81,11 +81,14 @@ already refused to quietly reinterpret the thresholds — the same answer applie
 > the real `app::Shell` in the window rather than a list and nothing else; and
 > `benches/frame_time.rs --mode soak --soak-minutes 30` supplies the **trend** the
 > two 6 s/8 s dwells could never give: 30 minutes of sustained send/ACK cycles,
-> **+4.4 MB** working set, bounded caches settled, with an external monitor on the
-> real pid. See §"Measured: idle RAM" and §"The 30-minute time base" further down.
+> bounded caches settled, with an external monitor on the real pid. Measured on
+> **committed** memory — the metric that survives a Windows working-set trim, which
+> one of the two runs hit and which working set would have recorded as a −37 MB
+> improvement — at **+4.93 MB before the delivery-map fix and +2.70 MB after it**.
+> See §"Measured: idle RAM" and §"The 30-minute time base" further down.
 > The row is closed on its *time base*; it stays open on the window's *contents*
-> (the channel rail and input bar are Phase 4) and on whether that 4.4 MB is a
-> plateau or a climb.
+> (the channel rail and input bar are Phase 4) and on whether the post-fix 2.70 MB
+> is a plateau or a climb.
 
 `AGENTS.md` §6.2 asks for **idle RAM < 80 MB**, measured *"over 30 minutes of
 active chatting"*, and `PLAN.md` L609 lists it as a Phase 1 exit criterion.
@@ -126,7 +129,7 @@ work units.
 | Direct dependencies | 12 rows | `docs/DEPENDENCIES.md` |
 | Idle RAM | **51.6 MB** empty / **64.4 MB** with 10k, bench shell only (floor) | this file, §"Measured: idle RAM" — added by work unit 2B |
 | Idle RAM, app level | **51.7 MB** empty / **64.5 MB** with 10k, real `app::Shell` | this file, §"Measured: idle RAM" — added with `--mode app` |
-| Idle RAM, 30-minute trend | **63.1 → 68.5 MB** working set (**+4.4 MB**), 3 560 samples, send/ACK cycles, bounded caches settled — **measured pre-fix** | this file, §"The 30-minute time base" — added with `--mode soak` |
+| Idle RAM, 30-minute trend | **+4.93 MB** committed, pre-fix → **+2.70 MB** post-fix (45% less), 3 563 samples, send/ACK cycles, bounded caches settled | this file, §"The 30-minute time base" — added with `--mode soak` |
 | Scroll frame time, 10k | **1.087 ms** warm / **1.740 ms** cold, p99, bench shell only (floor) | this file, §"Measured: scroll frame time" — added by work unit 2B |
 | Scroll frame time, 10k, app level | **1.239–1.614 ms** p99 over 8 runs, real `app::Shell` | this file, §"Measured: scroll frame time" — added with `--mode app` |
 
@@ -537,7 +540,15 @@ LRU each climbed 168 → 512 entries and then **stopped** (see the "settled" col
 below), which is the one-off fill the slope column is warning about. The last bucket
 is still rising, and that is the part not to paper over: a further hour could reveal
 either a plateau (the fill completing) or a continued climb, and **30 minutes cannot
-tell those apart**. The number to re-measure, not to defend.
+tell those apart**.
+
+**But read the numbers above as provenance, not as the comparison.** They are working
+set, and it was only after the second run that this machine's Windows was seen to trim
+an idle process's resident set mid-flight — which working set records as a large
+improvement and which never touched committed memory. Re-analysed on **committed**
+memory, a trim-immune metric, this same run grew **+4.93 MB** over 30 minutes. Both
+runs are re-read on that metric in §"Re-measured on the fixed build" below, which is
+where the comparison against the fixed build belongs.
 
 **Structures, through the client's own public seam — baseline → under load → after:**
 
@@ -629,20 +640,53 @@ run, post-fix they are gone once the activity stops. The `under load` figure is
 unchanged at 64, which is correct — those are the entries for sends whose rows are
 still on screen, and they are only retired as eviction reaches them.
 
-**The working-set number from this run is NOT reported, because the measurement is
-void.** An external sampler reported the process falling from 64.8 MB to 13.9 MB at
-t≈290 s and staying there for the remaining 26 minutes. That is not a leak and not
-a cache returning: **private (committed) memory did not move at all** across the
-step (72.69 MB → 72.69 MB), while working set collapsed. That is the signature of
-Windows trimming an idle process's working set under memory pressure — the pages
-are still committed, they were just paged out. The bench itself kept running
-untroubled (4 837 cycles at t=300 s, channel at 10 000), and the pre-fix run on the
-same machine showed no such step.
+**The working-set number from this run is not comparable to the pre-fix one, and the
+reason is worth recording because it invalidates a metric this file had been using.**
+An external sampler saw the process fall from 64.8 MB to 13.9 MB at t≈290 s and stay
+there for the remaining 26 minutes. That is not a cache returning, and reporting it as
+one would have been a −37 MB "improvement" that did not happen.
 
-So the honest statement is: **the +4.4 MB question is still open, and this run does
-not answer it.** The structural figure that is answerable was answered, and it
-answered yes. Anyone re-measuring the working set should watch for a mid-run step
-and check private memory alongside it, or that run will record a phantom drop.
+**Private (committed) memory did not move across the step: 72.64 MB → 72.56 MB, a
+change of 0.08 MB, while working set fell 50.7 MB in a single tick.** The bench itself
+was untroubled (4 837 cycles at t=300 s, channel at 10 000) and the pre-fix run on the
+same machine showed no such step. That asymmetry is the signature of **Windows trimming
+an idle process's working set under memory pressure**: the pages are still committed,
+they were paged out of the resident set.
+
+So **committed memory is the metric for this row, and working set is not.** It is
+trim-immune, it is what "how much memory does this client hold" actually means, and both
+runs recorded it. Re-analysing the two series on that metric answers the question the
+earlier revision of this file had to leave open:
+
+| | baseline (commit) | after (commit) | growth |
+|---|---|---|---|
+| pre-fix, leak present | 71.18 MB | 76.11 MB | **+4.93 MB** |
+| post-fix, leak retired | 71.20 MB | 73.90 MB | **+2.70 MB** |
+
+The two baselines agree to 0.02 MB, so the comparison is like-for-like. **The fix
+removed roughly half the growth: −2.23 MB, a 45% reduction.**
+
+**The shape of each curve is the stronger evidence, and it separates a leak from a
+one-off fill.** Per-5-minute step in committed memory:
+
+| min | 0 | 5 | 10 | 15 | 20 | 25 | 30 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| pre-fix step | — | +0.39 | +0.11 | +0.91 | +0.07 | +1.23 | **+1.51** |
+| post-fix step | — | +0.56 | +0.07 | +0.08 | **−0.02** | +0.84 | +0.34 |
+
+Pre-fix the steps **accelerate** — each 5-minute step is larger than the last, which is
+what a leak does. Post-fix they are flat, then briefly negative at minute 20, and the
+only large step left (+0.84, minute 25) coincides with the row cache and segment LRU
+filling to their bounds. **There is no acceleration, and that is the finding.**
+
+**What this does NOT close, stated plainly.** The post-fix residue is +2.70 MB, not zero.
+Part of it is the caches filling once and staying filled, which is bounded behaviour and
+was already reported as settled. But the final bucket still steps +0.34 MB, and **30
+minutes cannot distinguish a plateau completing from a slow climb continuing.** The
+structure that provably had no bound — the delivery map — provably no longer grows;
+whether something else does is still open, and a longer run is how it would be closed.
+Re-measuring this row means sampling **committed** memory, and recording working set
+alongside it as a check for a trim rather than as the figure.
 
 **What this still does not measure, quoted from the bench because it must not be
 quoted past:** *"THERE IS NO SERVER. Every ACK in this run was injected by this
@@ -658,18 +702,24 @@ are the transferable figures, not the 30-minute total.
 
 - ~~**The row's own time base.**~~ **Closed by this section.** 30 minutes of
   sustained send/ACK cycles against the release binary, with an external monitor on
-  the real pid: **+4.4 MB** working set over 30 min, bounded caches settled, pending
-  sends flat, the 10 000 cap evicting from iteration 1. **Those words do not cover
-  the delivery map**, which this section reports growing without bound and which the
-  probe measured still leaking — so "pending sends flat" above is not evidence the
-  map was flat.
-- **The delivery map's post-fix slope.** The bound is structural now and is asserted
-  in `crates/sh_nexus/tests/state_actions.rs`, so the leak is closed as a matter of
-  design rather than of measurement. What is **not** established is that the +4.4 MB
-  trend above included it or shrinks without it: every figure in this section was
-  taken on the leaking build. Closing this axis means re-running
-  `--mode soak --soak-minutes 30` and re-reading the probe sample, not re-reading
-  this table.
+  the real pid: bounded caches settled, pending sends flat, the 10 000 cap evicting
+  from iteration 1. Measured on committed memory — **+4.93 MB pre-fix, +2.70 MB
+  post-fix** — and it is committed rather than working set because this machine's
+  Windows trimmed one run's resident set mid-flight, which working set recorded as a
+  −37 MB improvement and committed memory did not.
+- ~~**The delivery map's post-fix slope.**~~ **Closed by measurement, not only by
+  design.** The structural bound is asserted in
+  `crates/sh_nexus/tests/state_actions.rs`, and the second soak run confirms it under
+  load: the probe's `after` column went **64 → 0**, and the per-5-minute commit steps
+  stopped accelerating (+0.91, +1.23, +1.51 pre-fix against +0.08, −0.02, +0.34
+  post-fix). Growth fell by 2.23 MB, 45%. What that run could **not** report was a
+  working-set figure, and the reason is recorded above rather than glossed.
+- **Whether the post-fix +2.70 MB is a plateau or a climb.** The only unbounded
+  structure this project knew of no longer grows, and the caches' fill is bounded
+  behaviour, but the last 5-minute bucket still steps +0.34 MB. Thirty minutes cannot
+  tell a completing plateau from a continuing climb. Closing this axis means a **longer**
+  run — `--mode soak --soak-minutes 120` — read on committed memory. It does not mean
+  re-reading this table.
 - **The parts of the window that do not exist yet.** `app.rs`'s module docs, §5,
   record that the channel rail and the input bar are not constructible today, so
   the "application at idle" this file has measured is the shell as it stands at
