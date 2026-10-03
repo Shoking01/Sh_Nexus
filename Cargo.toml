@@ -204,6 +204,39 @@ rstest = "0.27"
 #   Criterion 6: no C dependencies. Pure Rust.
 axum = { version = "0.8", features = ["ws"] }
 
+# tokio-tungstenite 0.29.0 | MIT OR Apache-2.0 | actively maintained |
+#   crates.io, hundreds of thousands of downloads per month | no C, no build
+#   script, no proc-macros.
+#
+#   Criterion 1: `AGENTS.md` 3.1 names `network/websocket.rs` as the client's
+#   transport module and 7.4 requires "timeouts on everything: connect (5s),
+#   read (30s keepalive -> ping)" plus explicit rejection of an unknown major
+#   version -- neither of which is expressible without a WebSocket
+#   implementation. `std` has none, and hand-rolling RFC 6455 is the exact case
+#   the criterion exists to exclude. This is the client half of ADR-002: the
+#   *protocol* is already shared through `sh_nexus_wire`, and this is the
+#   *transport* each side speaks it over.
+#
+#   NO NEW DOWNLOAD, and this is the strongest claim in this file. At the time of
+#   this entry `Cargo.lock` already held tokio-tungstenite 0.29.0 and tungstenite
+#   0.29.0, because `axum`'s `ws` feature above depends on them -- the server
+#   drives tungstenite through axum's WebSocket wrapper. Naming it here converts
+#   an already-compiled transitive dependency into a declared one, on the same
+#   reasoning already recorded for `chrono/clock` and `uuid/v4` below and for
+#   `tokio` itself above: a declaration that says nothing while the build depends
+#   on someone else's feature set is not a declaration. Criterion 5 is therefore
+#   "no new compile units", not "small".
+#
+#   Feature choice: defaults (`connect`, `handshake`) and nothing else. Every TLS
+#   feature is deliberately OFF. `native-tls` and `rustls-tls-*` would each pull a
+#   trust store and a TLS stack into the client, and `AGENTS.md` 7.4's "TLS
+#   certificate validation must never be disabled in release builds" is a rule
+#   about a stack this client does not have yet -- ADR-010's next PR adds auth
+#   over TLS and audits the root store with it. `url` is off for the same reason
+#   as `pulldown-cmark/html`: it exists to serve a helper this client does not
+#   call. `tokio/net` arrives through `connect`.
+tokio-tungstenite = { version = "0.29" }
+
 # tokio 1.53.2 | MIT | the runtime GPUI already uses.
 #   Criterion 1: `AGENTS.md` 7.2/2.3 mandate tokio for async, and gpui's tree
 #   already depends on it, so this names a dependency the workspace already

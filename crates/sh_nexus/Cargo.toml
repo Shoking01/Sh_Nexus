@@ -116,6 +116,59 @@ smallvec = { workspace = true }
 # is rejected until somebody adds it to the list and says why.
 pulldown-cmark = { workspace = true }
 
+# tokio-tungstenite: `AGENTS.md` 3.1's `network/websocket.rs`, and 7.4's
+# transport rules (5s connect, 30s read keepalive, explicit rejection of an
+# unknown major version). The audit -- version, license, maintenance, download
+# volume, and the "no new compile units" argument -- is in the root manifest,
+# including the note that tokio-tungstenite 0.29.0 was ALREADY in `Cargo.lock`
+# through the server's `axum` `ws` feature. Defaults only: every TLS feature is
+# off, deliberately, because a trust store and a TLS stack are ADR-010's next
+# PR and shipping one without the other's audit is worse than shipping neither.
+tokio-tungstenite = { workspace = true }
+
+# tokio: named here rather than left to arrive through gpui and
+# tokio-tungstenite, because `network/ws.rs` calls `tokio::time::{interval,
+# timeout, sleep}`, `tokio::sync::{mpsc, Notify}` and `tokio::runtime::Builder` by
+# name. The workspace entry already carries `rt-multi-thread`, `macros`, `net`,
+# `sync` and `signal`; the three features added here are the ones this crate's
+# own code names and the workspace entry did not.
+#
+#   `time`   -- the keepalive interval, the 5s connect timeout and the backoff
+#               sleep. Every one of `AGENTS.md` 7.4's "timeouts on everything"
+#               is this feature.
+#   `rt`     -- `Builder::new_current_thread` for the one runtime the transport
+#               thread owns. Implied by `rt-multi-thread` and declared anyway, for
+#               the reason the `uuid/v4` and `chrono/clock` entries above give:
+#               relying on another crate's feature set is the fragility those
+#               comments were written to describe.
+#   `io-util` -- nothing in `src/` names it. It is listed as NOT added, here, so
+#               that the absence is recorded rather than inferred: if a future
+#               work unit needs it, this is the comment it has to argue against.
+tokio = { workspace = true, features = ["time", "rt"] }
+
+# futures-util: `tokio-tungstenite` 0.29 exposes reading and writing ONLY
+# through `futures_core::Stream` and `Sink`, and re-exports neither extension
+# trait -- unlike `axum::extract::ws::WebSocket`, whose `recv`/`send` are inherent
+# and which is why `sh_nexus_server` needs no futures dependency at all (see that
+# crate's `src/ws.rs`, "How a connection is served"). So `StreamExt::next` and
+# `SinkExt::send` are the two function names `network/ws.rs` needs, and they live
+# in this crate.
+#
+#   Criterion 1: there is no std equivalent -- `std::future` has no `Stream`, and
+#   a hand-written adapter would be a new module whose entire content is a poll
+#   loop someone would have to review. Criterion 5: NO NEW COMPILE UNITS --
+#   `futures-util` 0.3.34 is already in `Cargo.lock` through gpui's tree and is
+#   already a dependency of tokio-tungstenite itself, so this is the third
+#   declaration of a crate this workspace has always compiled.
+#
+#   Feature choice: `default-features = false` with `std`. The defaults add
+#   `async-await` and `async-await-macro`, which exist for `.await` inside
+#   combinator chains; `StreamExt::next` and `SinkExt::send` are plain functions
+#   in the base crate. Nothing in `src/` uses the `async-await` syntax on a
+#   combinator, and leaving it on would be an undeclared dependency on a
+#   proc-macro crate.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
 [dev-dependencies]
 # proptest: `AGENTS.md` 4.4 mandates it. Its property tests here cover the
 # properties the hand-written cases cannot: that no wire value at all reaches
