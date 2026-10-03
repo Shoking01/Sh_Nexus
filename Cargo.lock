@@ -5051,6 +5051,7 @@ name = "sh_nexus"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures-util",
  "gpui",
  "gpui_platform",
  "proptest 1.11.0",
@@ -5060,6 +5061,8 @@ dependencies = [
  "sh_nexus_wire",
  "smallvec",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
  "uuid",
 ]
 
