@@ -679,14 +679,59 @@ what a leak does. Post-fix they are flat, then briefly negative at minute 20, an
 only large step left (+0.84, minute 25) coincides with the row cache and segment LRU
 filling to their bounds. **There is no acceleration, and that is the finding.**
 
-**What this does NOT close, stated plainly.** The post-fix residue is +2.70 MB, not zero.
-Part of it is the caches filling once and staying filled, which is bounded behaviour and
-was already reported as settled. But the final bucket still steps +0.34 MB, and **30
-minutes cannot distinguish a plateau completing from a slow climb continuing.** The
-structure that provably had no bound — the delivery map — provably no longer grows;
-whether something else does is still open, and a longer run is how it would be closed.
-Re-measuring this row means sampling **committed** memory, and recording working set
-alongside it as a check for a trim rather than as the figure.
+#### The plateau: a 120-minute run, which confirms it and then stopped itself
+
+Thirty minutes could not separate a completing plateau from a continuing climb, so this
+axis was closed with `--mode soak --soak-minutes 120` on the fixed build, sampled on
+**committed** memory every 500 ms alongside working set.
+
+**The run stopped itself at ~76 minutes of the 120 requested**, and the way it stopped
+is part of the result rather than a footnote to it. From the bench's stderr, verbatim:
+
+> `cycle 73691: the row for 37242411-… never drew Acked in 600 x 5ms of patience --
+> 60 of the shell's 50ms drain ticks. Only a frame builds or updates a row, so this is a
+> renderer that stopped drawing rather than an event that was slow, and every figure
+> after this point would be a measurement of a stalled client`
+
+`SOAK_DRAWN_POLLS` is 600 polls × 5 ms, and its own documentation says why it refuses to
+continue: *"the alternative, carrying on, would report a stalled client as a quiet one."*
+**A bench that kept going here would have published a cleaner-looking, meaningless
+number.** So there is no 120-minute figure in this file, and the trend below stops where
+the client stopped being a client.
+
+**Committed memory, per 10 minutes, up to that abort:**
+
+| min | 0 | 10 | 20 | 30 | 40 | 50 | 60 | 70 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| commit (MB) | 72.78 | 73.09 | 73.75 | 74.84 | 75.29 | 75.30 | 75.29 | 75.19 |
+| step | — | +0.31 | +0.66 | +1.09 | +0.45 | **+0.01** | **−0.01** | **−0.11** |
+
+**The axis is closed: it is a plateau, and the plateau is measured.** From minute 40 the
+committed figure holds at **75.28 – 75.30 MB for 35 consecutive minutes** — a spread of
+0.02 MB — while the process performed **73 444 send/ACK cycles** at ~966 cycles/min, over
+a thousand units of client work per minute. The steps at minutes 50, 60 and 70 are
++0.01, −0.01 and −0.11 MB, i.e. noise around zero rather than a climb.
+
+That is the distinction 30 minutes could not make, now made by a number rather than an
+argument: growth that continues would show a positive per-10-minute step at minute 70,
+and it does not. **The +2.70 MB residue is the caches filling once and staying filled**,
+which is bounded behaviour and was already reported as settled.
+
+The bench's own probe is flat for the whole run — `sampled sends tracked 0` from minute
+10 to the abort — so the delivery map contributed nothing to the plateau.
+
+**This run also confirms the working-set diagnosis a second time, independently.** It was
+trimmed again, at t=230 s, and again the two metrics diverged at the moment of the
+collapse: working set 64.8 → **13.8 MB** while committed went 72.62 → **72.70 MB**, a
+change of **0.08 MB**. Two runs, two trims, the same signature. Working set on this
+machine is unusable as a growth figure and committed memory is reliable; that is now
+recorded as a property of the measurement environment rather than a one-off surprise.
+
+**What still does not close, and is not closed by pretending.** This run has no server,
+so it says nothing about `network/`. And the renderer stall at cycle 73 691 is itself
+**unexplained**: the memory was flat and the cycle count was steady, so nothing here
+identifies a cause. It is recorded as an open question with a repro condition (cycle
+~73 700 on a 120-minute soak, post-fix, `rustc 1.99.0`) rather than guessed at.
 
 **What this still does not measure, quoted from the bench because it must not be
 quoted past:** *"THERE IS NO SERVER. Every ACK in this run was injected by this
@@ -714,12 +759,20 @@ are the transferable figures, not the 30-minute total.
   stopped accelerating (+0.91, +1.23, +1.51 pre-fix against +0.08, −0.02, +0.34
   post-fix). Growth fell by 2.23 MB, 45%. What that run could **not** report was a
   working-set figure, and the reason is recorded above rather than glossed.
-- **Whether the post-fix +2.70 MB is a plateau or a climb.** The only unbounded
-  structure this project knew of no longer grows, and the caches' fill is bounded
-  behaviour, but the last 5-minute bucket still steps +0.34 MB. Thirty minutes cannot
-  tell a completing plateau from a continuing climb. Closing this axis means a **longer**
-  run — `--mode soak --soak-minutes 120` — read on committed memory. It does not mean
-  re-reading this table.
+- ~~**Whether the post-fix residue is a plateau or a climb.**~~ **Closed by a
+  120-minute run, which is a plateau.** Committed memory held at **75.28 – 75.30 MB
+  for 35 consecutive minutes** while the process performed 73 444 send/ACK cycles,
+  with per-10-minute steps of +0.01, −0.01 and −0.11 MB. Growth that continued would
+  show a positive step at minute 70; it does not. The residue is the caches filling
+  once. See §"The plateau" above.
+- **The renderer stall at cycle 73 691 — an open question, not a finding.** The
+  120-minute run stopped itself because one row stopped being drawn for 60 drain
+  ticks, with committed memory flat and the cycle count steady. Nothing in the
+  recorded evidence identifies a cause, so none is asserted. Repro condition:
+  `--mode soak --soak-minutes 120`, post-fix, `rustc 1.99.0`, around cycle 73 700.
+  Until it is explained, a soak that stops this way should be read as *the bench
+  refusing to publish*, which is the correct behaviour, rather than as a defect in
+  either the client or the bench.
 - **The parts of the window that do not exist yet.** `app.rs`'s module docs, §5,
   record that the channel rail and the input bar are not constructible today, so
   the "application at idle" this file has measured is the shell as it stands at
