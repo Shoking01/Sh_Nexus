@@ -22,9 +22,13 @@ Rust **stable**, no nightly features and no `RUSTC_BOOTSTRAP`. The pinned worksp
 measured with **rustc 1.98.1** (`48a229cea`, 2026-09-01); all figures quoted in this README come
 from that toolchain.
 
+The toolchain is now **1.99.0** (raised 2026-10-02 and re-verified clean), so every figure below
+is one minor version behind the compiler rather than measured on it. The measurements have not
+been retaken on 1.99.0, and this line is here so that gap is stated instead of assumed.
+
 ```powershell
 rustup update stable
-rustc --version   # expect 1.98.1 or newer
+rustc --version   # expect 1.99.0 or newer
 ```
 
 ### Windows toolchain

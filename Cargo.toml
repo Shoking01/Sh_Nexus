@@ -167,7 +167,7 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 # ---------------------------------------------------------------------------
 # rstest 0.27.0 | MIT OR Apache-2.0 | maintained (0.27.0 published
 #   2026-09-06) | 28,006,626 downloads in the last 90 days | MSRV 1.85.0
-#   against our 1.98.1 | crate size 57,880 bytes.
+#   against our 1.99.0 | crate size 57,880 bytes.
 #   Criterion 1: `AGENTS.md` 4.3 names `rstest` or `test-case` as THE tool for
 #   parameterized tests. That is the constitution answering the question, not a
 #   preference, so criterion 1 is satisfied by citing it. Criterion 5: exactly
@@ -184,7 +184,7 @@ rstest = "0.27"
 # ---------------------------------------------------------------------------
 # pulldown-cmark 0.13.4 | MIT | actively maintained (0.13.4 released
 #   2026-05-20) | 48,413,256 downloads in the last 90 days | MSRV 1.71.1
-#   against our 1.98.1 | crate size 155,043 bytes.
+#   against our 1.99.0 | crate size 155,043 bytes.
 #
 #   Criterion 1 -- "verify no solution exists with current dependencies or the
 #   std library". Nothing else in this tree parses CommonMark: `AGENTS.md` 4.2

@@ -1075,7 +1075,10 @@ The §7.2 audit, for the record:
 | 4. Compile-time impact | **One new compile unit**: `rstest_macros`, a proc-macro crate. The other two runtime dependencies (`futures-timer`, `futures-util`) are optional and stay off - this project has no async tests. Crate size 57,880 bytes. |
 | 5. Justification comment | Present above the declaration in the root `Cargo.toml`. |
 
-MSRV is 1.85.0; the toolchain is 1.98.1.
+MSRV is 1.85.0; the toolchain is 1.99.0 (raised from 1.98.1 on 2026-10-02 and
+re-verified: `cargo check`, clippy `--all-targets --all-features -D warnings`,
+`cargo fmt --check` and 1048 tests, all clean, with no new compiler warnings).
+The MSRV floor is a separate claim from the toolchain and did not move.
 
 #### Consequences
 
