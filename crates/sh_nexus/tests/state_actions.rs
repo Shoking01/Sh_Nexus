@@ -2759,6 +2759,276 @@ fn a_channel_whose_every_row_is_a_send_in_flight_is_allowed_over_the_cap() {
     assert_internally_consistent(&state, &BTreeSet::new(), 0);
 }
 
+/// An acknowledged send's delivery entry is retired along with the row eviction
+/// took, so the delivery map cannot outgrow the history.
+///
+/// **This is the bound `AGENTS.md` §7.1 asks for, and it is the one structure
+/// that had none.** The delivery map gains an entry per send; until this was fixed
+/// the only retirement path was `discard_failed_send`, which applies only to a
+/// *failed* send, so an acknowledged send's entry lived for the life of the
+/// process. `evict_one_over_cap` now retires it, which is what makes the bound
+/// structural rather than a new constant: an entry either names a held row or a
+/// send still in flight.
+///
+/// **The arrangement puts the acknowledged send at the HEAD, because that is the
+/// only place the bound is load-bearing.** Eviction takes the oldest *candidate*,
+/// and any row this client is not waiting on qualifies — so an acknowledged send
+/// is ordinary history and is an ordinary eviction candidate. A send parked at the
+/// tail would survive the whole burst and prove nothing, and a send at the head of
+/// a channel that is not yet at the cap would never be reached. `at(0)` before the
+/// arriving history puts it at index 0, and the identity is out of the arrivals'
+/// range so the ACK reconciles onto the optimistic row rather than onto a message
+/// the server also knows about — the reason `cid(1)` would silently break this.
+#[test]
+fn an_acknowledged_sends_delivery_entry_is_retired_with_the_row_it_is_evicted_with() {
+    let mut state = loaded();
+
+    const CLEAR_OF_THE_ARRIVALS: u128 = 1_000_000;
+    let send = cid(CLEAR_OF_THE_ARRIVALS);
+    assert!(matches!(
+        begin_send(
+            &mut state,
+            "c_0",
+            "the oldest row in the channel",
+            send,
+            at(0)
+        ),
+        SendOutcome::Pending { .. }
+    ));
+    fire(
+        &mut state,
+        DomainEvent::MessageAcked {
+            client_msg_id: send,
+            message: stored(
+                "m_send",
+                CLEAR_OF_THE_ARRIVALS,
+                "c_0",
+                "u_me",
+                "the oldest row in the channel",
+                0,
+            ),
+        },
+    );
+    assert_eq!(
+        state.delivery(&send),
+        Some(DeliveryState::Acked),
+        "the fixture must be acknowledged before anything is evicted, or this \
+         measures nothing"
+    );
+
+    for n in 1..(MAX_MESSAGES_PER_CHANNEL + 1) as u128 {
+        fire(
+            &mut state,
+            DomainEvent::MessageReceived(stored(
+                &format!("m_{n}"),
+                n,
+                "c_0",
+                "u_ada",
+                "body",
+                n as i64,
+            )),
+        );
+    }
+
+    assert_eq!(
+        state.message_count("c_0"),
+        MAX_MESSAGES_PER_CHANNEL,
+        "and the cap still holds: the retirement is not a substitute for the \
+         bound, it rides on it"
+    );
+    assert!(
+        state.message("c_0", &send).is_none(),
+        "the acknowledged row was the oldest candidate and eviction took it -- \
+         which is correct, an acknowledged row is ordinary history"
+    );
+    assert_eq!(
+        state.delivery(&send),
+        None,
+        "AND ITS DELIVERY ENTRY WENT WITH IT. This is the bound: without it the \
+         map grew by one entry per acknowledged send for the life of the process, \
+         which AGENTS.md 7.1 forbids, and which a 30-minute --mode soak measured \
+         (docs/BASELINES.md). A 'send an ack and stop' test cannot find it -- the \
+         entry is only ever visible once eviction reaches the row"
+    );
+}
+
+/// A failed send's delivery entry survives eviction, because the user still needs
+/// to retry it.
+///
+/// **The negative guard on the fix above, and it protects the row as much as the
+/// entry.** A `Failed` send is not outstanding *visibly* — nothing about it is
+/// animating — but `has_outstanding_send` treats it as such, so it is never an
+/// eviction candidate; and `AGENTS.md` §7.5's "failures are never silently
+/// dropped" is what the user reads as "my message is still here, and I can press
+/// retry". A retirement that ignored the delivery state would keep the row and
+/// take the entry, and the next `retry_send` would answer `NotHeld` for a send the
+/// user can still see.
+///
+/// **The discard afterwards is the assertion that makes it a real one.** Asserting
+/// only that `delivery(..)` still answers `Failed` would pass for an entry that
+/// survived but no longer names anything; `discard_failed_send` reaching
+/// `Applied` proves the entry is still intact *and* still wired to a row the user
+/// can act on — which is the whole reason it was kept.
+#[test]
+fn a_failed_sends_delivery_entry_survives_eviction() {
+    let mut state = loaded();
+
+    const CLEAR_OF_THE_ARRIVALS: u128 = 1_000_000;
+    let send = cid(CLEAR_OF_THE_ARRIVALS);
+    assert!(matches!(
+        begin_send(
+            &mut state,
+            "c_0",
+            "the server refused this one",
+            send,
+            at(0)
+        ),
+        SendOutcome::Pending { .. }
+    ));
+    fire(
+        &mut state,
+        DomainEvent::MessageSendFailed {
+            client_msg_id: send,
+            code: "rejected".to_owned(),
+            detail: "the server refused this one".to_owned(),
+        },
+    );
+    assert_eq!(state.delivery(&send), Some(DeliveryState::Failed));
+
+    for n in 1..(MAX_MESSAGES_PER_CHANNEL + 1) as u128 {
+        fire(
+            &mut state,
+            DomainEvent::MessageReceived(stored(
+                &format!("m_{n}"),
+                n,
+                "c_0",
+                "u_ada",
+                "body",
+                n as i64,
+            )),
+        );
+    }
+
+    assert_eq!(
+        state.message_count("c_0"),
+        MAX_MESSAGES_PER_CHANNEL,
+        "the cap holds and eviction skipped the failed send to reach the next \
+         oldest, so it is not a suspension of the bound"
+    );
+    assert!(
+        state.message("c_0", &send).is_some(),
+        "the failed row is still on screen, which is the visible half of \
+         AGENTS.md 7.5's 'failures are never silently dropped'"
+    );
+    assert_eq!(
+        state.delivery(&send),
+        Some(DeliveryState::Failed),
+        "and so is its delivery entry: retirement at eviction is guarded on the \
+         state being Acked precisely so the send the user still has to retry keeps \
+         its bookkeeping"
+    );
+    assert_eq!(
+        discard_failed_send(&mut state, send),
+        ApplyOutcome::Applied,
+        "which is what makes the entry more than a stale row: discard_failed_send \
+         is still the retirement path for a failed send, and it needs an intact \
+         entry naming a held row to act on. A retirement that had ignored the \
+         delivery state would answer NotHeld here"
+    );
+    assert_eq!(
+        state.delivery(&send),
+        None,
+        "and only then does the entry go"
+    );
+}
+
+/// A row the server moves between channels keeps its delivery entry, which is the
+/// regression a `remove_message`-level retirement would have caused.
+///
+/// **The most valuable of the three, because it is the one that guards the fix's
+/// placement rather than its existence.** `remove_message` has four callers and
+/// only one of them discards the row: `merge_into_held` and the channel-mismatch
+/// arm of `ingest_by_identity` both remove a row and re-insert the *same*
+/// `client_msg_id` into another channel, then call `retarget_outgoing`. A
+/// retirement written inside `remove_message` — the obvious place, and the place
+/// that would have satisfied the test above on its first draft — would therefore
+/// delete the entry of a send that is still on screen in its new channel: the row
+/// moves, its bookkeeping does not, and `retry_send` on a *failed* send that the
+/// server moved would answer `NotHeld`.
+///
+/// **The channel-mismatch arm is used because it is the cleaner of the two merges,
+/// and the reason it is reachable is worth naming.** `ingest_by_identity` only
+/// looks for the identity *in the channel the incoming message names*, so
+/// delivering the same `client_msg_id` under `c_1` while it is held in `c_0` is
+/// what selects the move. `begin_send` in `c_0` and an ACK whose stored copy also
+/// names `c_0` put the send in the state a moved send is actually in — tracked,
+/// and `Acked` — which is the state whose entry a misplaced retirement loses.
+#[test]
+fn a_row_the_server_moves_between_channels_keeps_its_delivery_entry() {
+    let mut state = loaded();
+
+    const CLEAR_OF_THE_ARRIVALS: u128 = 1_000_000;
+    let send = cid(CLEAR_OF_THE_ARRIVALS);
+    assert!(matches!(
+        begin_send(&mut state, "c_0", "the server disagrees", send, at(0)),
+        SendOutcome::Pending { .. }
+    ));
+    fire(
+        &mut state,
+        DomainEvent::MessageAcked {
+            client_msg_id: send,
+            message: stored(
+                "m_send",
+                CLEAR_OF_THE_ARRIVALS,
+                "c_0",
+                "u_me",
+                "the server disagrees",
+                0,
+            ),
+        },
+    );
+    assert_eq!(state.delivery(&send), Some(DeliveryState::Acked));
+
+    // The same identity, arriving under a different channel, one second later.
+    fire(
+        &mut state,
+        DomainEvent::MessageReceived(stored(
+            "m_send",
+            CLEAR_OF_THE_ARRIVALS,
+            "c_1",
+            "u_me",
+            "the server disagrees",
+            1,
+        )),
+    );
+
+    assert!(
+        state.message("c_1", &send).is_some(),
+        "the move is the premise: the server is the authority on which channel a \
+         message lives, so the row follows it rather than being duplicated"
+    );
+    assert!(
+        state.message("c_0", &send).is_none(),
+        "and exactly one copy exists -- two rows for one client_msg_id is the \
+         reshuffle bug core/ordering.rs 1 is about"
+    );
+    assert_eq!(
+        state.channel_holding(&send),
+        Some("c_1"),
+        "so the identity resolves to its new channel"
+    );
+    assert_eq!(
+        state.delivery(&send),
+        Some(DeliveryState::Acked),
+        "AND ITS DELIVERY ENTRY SURVIVED THE MOVE. This is the assertion that \
+         pins WHERE the retirement lives: it is in evict_one_over_cap, after a \
+         removal that genuinely discards the row, and not in remove_message, \
+         which two merge paths call on a row they are about to re-insert. Written \
+         inside remove_message, this fails with delivery(..) == None while the row \
+         sits on screen in c_1"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 9. The rendered-segment cache
 // ---------------------------------------------------------------------------

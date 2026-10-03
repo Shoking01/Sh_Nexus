@@ -562,14 +562,58 @@ and it was the newest, so the documented all-rows-in-flight over-cap case did no
 arise. That is a property of this workload and **not** evidence the case is harmless:
 a client that queued many sends before any ACK would meet it.
 
-**The one structure that only went up, and has no bound of its own:** the sampled
+**The one structure that only went up, and had no bound of its own:** the sampled
 tracked-sends map grew to 64 entries (one sample of the delivery map via
 `SOAK_PROBE_EVERY`, not a whole-map count). Its own report is explicit — an
-acknowledged send stays in the map for the life of the process and **eviction does
-not retire it**. That is a real, named unbounded growth on the client side and it is
-the correct next thing to bound, before it is a leak with a long fuse. It is out of
-§6.2's row (this run's `sends awaiting an answer` is flat at 0) but it is the honest
-finding of the trend, so it is not buried here.
+acknowledged send stayed in the map for the life of the process and **eviction did
+not retire it**. That was a real, named unbounded growth on the client side, out of
+§6.2's row (this run's `sends awaiting an answer` is flat at 0), and it was the
+honest finding of the trend rather than something to bury here.
+
+**That growth is now closed, and the bound is structural rather than a new number.**
+`AppState::evict_one_over_cap` retires the delivery entry of an `Acked` send along
+with the row it evicts, which is the only place in the client that does.
+Previously the sole retirement path was `AppState::clear_outgoing`, reachable only
+from `actions::discard_failed_send`, which applies only to a **failed** send — so
+an acknowledged send's entry was inserted once and never removed, and the map grew
+by one entry per send for the life of the process. **No cap was added and no
+threshold chosen**: an entry now either names a row that is held or a send the
+client is genuinely still waiting on, so the map cannot outnumber held rows plus
+in-flight sends. The bound moves with the client's own work instead of with the
+length of the session.
+
+**`Pending` and `Failed` sends deliberately keep their entry, and the reason is the
+user rather than the map.** Eviction skips such a row anyway — that is what
+`has_outstanding_send` is for, and `a_send_in_flight_is_never_the_row_that_is_evicted`
+in `crates/sh_nexus/tests/state_actions.rs` is the assertion — but the retirement is
+guarded on the state being `Acked` anyway, so the two facts are not silently
+coupled. `AGENTS.md` §7.5's *"failures are never silently dropped"* means the
+failed row stays on screen for retry, and `discard_failed_send` remains its
+retirement path.
+
+**Where the retirement could *not* go is the load-bearing part of the fix.**
+`AppState::remove_message` has four callers and only one of them discards the row:
+`merge_into_held` and the channel-mismatch arm of `ingest_by_identity` both remove
+a row in order to **re-insert the same `client_msg_id` in another channel**, then
+call `retarget_outgoing`. A retirement inside `remove_message` — the obvious place —
+would therefore delete the entry of a send still on screen in its new channel, which
+is a worse defect than the leak it fixed.
+`a_row_the_server_moves_between_channels_keeps_its_delivery_entry` pins that, and it
+lives in `tests/state_actions.rs` beside the cap tests. A defect-pinning
+characterisation test for the leak, `soak_cycle.rs`'s
+`an_acknowledged_send_outlives_the_row_it_was_evicted_with`, was **deleted** rather
+than inverted, on its own written instruction.
+
+**Every figure in this section predates the fix, and none of them may be read as
+after it.** The 64-entry probe sample, the +4.4 MB trend, the 63.1 → 68.5 MB
+working-set windows and the 3 560 samples are provenance: they measured the client
+*with* the leak, which is the only reason the leak was known rather than argued
+about. **Whether the fix removes part of that +4.4 MB is not established, and this
+section does not claim it.** That question is owed a re-measurement — another
+`--mode soak --soak-minutes 30` on the fixed build — and until that run exists the
+right statement about the slope is the one already made above it: 30 minutes
+cannot distinguish a plateau from a climb, and the number is to re-measure, not to
+defend.
 
 **What this still does not measure, quoted from the bench because it must not be
 quoted past:** *"THERE IS NO SERVER. Every ACK in this run was injected by this
@@ -586,7 +630,17 @@ are the transferable figures, not the 30-minute total.
 - ~~**The row's own time base.**~~ **Closed by this section.** 30 minutes of
   sustained send/ACK cycles against the release binary, with an external monitor on
   the real pid: **+4.4 MB** working set over 30 min, bounded caches settled, pending
-  sends flat, the 10 000 cap evicting from iteration 1.
+  sends flat, the 10 000 cap evicting from iteration 1. **Those words do not cover
+  the delivery map**, which this section reports growing without bound and which the
+  probe measured still leaking — so "pending sends flat" above is not evidence the
+  map was flat.
+- **The delivery map's post-fix slope.** The bound is structural now and is asserted
+  in `crates/sh_nexus/tests/state_actions.rs`, so the leak is closed as a matter of
+  design rather than of measurement. What is **not** established is that the +4.4 MB
+  trend above included it or shrinks without it: every figure in this section was
+  taken on the leaking build. Closing this axis means re-running
+  `--mode soak --soak-minutes 30` and re-reading the probe sample, not re-reading
+  this table.
 - **The parts of the window that do not exist yet.** `app.rs`'s module docs, §5,
   record that the channel rail and the input bar are not constructible today, so
   the "application at idle" this file has measured is the shell as it stands at

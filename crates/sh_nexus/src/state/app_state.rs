@@ -1282,6 +1282,44 @@ impl AppState {
     /// "no deep clones in hot paths" is why `remove_message` takes the row back
     /// by value — a caller that wanted it back gets it by value, and this caller
     /// wants it gone.
+    ///
+    /// **And the eviction retires the send's delivery entry, which is the only
+    /// place in the application that does.** Before it did,
+    /// [`clear_outgoing`](Self::clear_outgoing) was reachable only from
+    /// [`discard_failed_send`](crate::state::actions::discard_failed_send), which
+    /// applies only to a *failed* send — so an acknowledged send's entry was
+    /// inserted once and never removed, the map grew by one entry per send for the
+    /// life of the process, and `AGENTS.md` §7.1's bound on the growth of
+    /// in-memory state did not hold. A thirty-minute `--mode soak` measured it
+    /// still holding sends from its first minute; `docs/BASELINES.md` §"The
+    /// 30-minute time base" records that run and, since this line, that the figure
+    /// predates the fix.
+    ///
+    /// **Here and not inside [`remove_message`](Self::remove_message), because
+    /// that method has three other callers and two of them are *moves*.** The merge
+    /// paths in `state/actions.rs` — `merge_into_held`, and the channel-mismatch arm
+    /// of `ingest_by_identity` — remove a row and re-insert the *same*
+    /// `client_msg_id` into another channel, then call
+    /// [`retarget_outgoing`](Self::retarget_outgoing). A retirement inside
+    /// `remove_message` would therefore drop the delivery entry of a send that is
+    /// still on screen in its new channel, which is a worse bug than the leak it
+    /// fixed: the row would survive and its bookkeeping would not. So the
+    /// retirement is placed here, after the removal has actually succeeded and on
+    /// the one path where the row is genuinely gone.
+    ///
+    /// **Only an `Acked` send is retired, and deliberately.** A `Pending` or
+    /// `Failed` row cannot reach this point at all —
+    /// [`has_outstanding_send`](Self::has_outstanding_send) is what excluded it from
+    /// candidacy — and the guard is written anyway so the two facts are not
+    /// silently coupled: if a future change ever made such a row a candidate, this
+    /// must not take the user's retry away with it. Those sends keep their entry,
+    /// and `discard_failed_send` remains their retirement path.
+    ///
+    /// **What this buys is a structural bound rather than a number.** An entry
+    /// either names a row that is held or a send this client is genuinely waiting
+    /// on, so the map can never outnumber held rows plus in-flight sends. There is
+    /// no cap to choose and no threshold to tune, and the bound moves when the
+    /// client's own work does rather than with the length of the session.
     pub(crate) fn evict_one_over_cap(&mut self, channel_id: &str, before: usize) -> Option<usize> {
         if self.message_count(channel_id) <= MAX_MESSAGES_PER_CHANNEL {
             return None;
@@ -1290,7 +1328,18 @@ impl AppState {
         // The identity is copied out before the second borrow, so the removal is
         // a plain `&mut self` call rather than a re-entrant one.
         let client_msg_id = self.messages.get(channel_id)?.messages[at].client_msg_id;
+        // Read before the removal, because the removal is what makes the answer
+        // unreachable: `delivery` is the map this call is about to retire from.
+        let delivery_of_evicted = self.delivery(&client_msg_id);
         self.remove_message(channel_id, &client_msg_id)?;
+        if delivery_of_evicted == Some(DeliveryState::Acked) {
+            // The same door `discard_failed_send` uses, because it already retires
+            // from *both* maps and this call must not grow a second removal to
+            // disagree with it. An `Acked` send has no `failures` entry —
+            // `set_delivery` removed it when the state left `Failed` — so this is
+            // consistent rather than merely harmless.
+            self.clear_outgoing(&client_msg_id);
+        }
         Some(at)
     }
 

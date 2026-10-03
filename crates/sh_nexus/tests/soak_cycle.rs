@@ -19,9 +19,30 @@
 //! | **The retained row's spec is a renderer signal, not a state signal** | [`the_row_the_soak_waits_on_only_changes_when_a_frame_draws`] | runtime, **negative** |
 //! | A send that pushes the channel over the bound is not the row eviction takes, and the cap holds | [`a_send_past_the_cap_keeps_its_own_row_and_holds_the_bound`] | runtime, full history |
 //! | The cycle can be repeated without the channel growing | [`repeated_cycles_hold_the_bound_and_reconcile_in_place`] | runtime, repeated |
-//! | An acknowledged send stays in the delivery map after its row is evicted | [`an_acknowledged_send_outlives_the_row_it_was_evicted_with`] | runtime, **characterisation** |
 //!
-//! # The two tests that could pass for the wrong reason
+//! # What is not pinned here, and where it is pinned instead
+//!
+//! **The delivery map's bound is a property of `state/`, not of the cycle, so its
+//! tests live in `tests/state_actions.rs`.** That map grew by one entry per
+//! acknowledged send with no retirement path — `clear_outgoing` was reachable
+//! only from `discard_failed_send`, which applies only to a *failed* send — and
+//! `evict_one_over_cap` now retires an `Acked` send's entry along with the row it
+//! evicts. A characterisation test for the leak was deleted from this file rather
+//! than inverted, on its own instruction: a test that fails when a bug is fixed
+//! is a canary, and its failure message said to delete it and record the fix in
+//! `docs/BASELINES.md`. Three tests now hold the fixed behaviour in
+//! `tests/state_actions.rs`, where the cap and the send-in-flight guard are
+//! already tested:
+//!
+//! - `an_acknowledged_sends_delivery_entry_is_retired_with_the_row_it_is_evicted_with`
+//! - `a_failed_sends_delivery_entry_survives_eviction`
+//! - `a_row_the_server_moves_between_channels_keeps_its_delivery_entry`
+//!
+//! **The two merge paths are why the fix could not live in `remove_message`,**
+//! which this file's deletion is a standing reminder of: two of its four callers
+//! remove a row only to re-insert the same `client_msg_id` in another channel.
+//!
+//! # The test that could pass for the wrong reason
 //!
 //! **`the_row_the_soak_waits_on_only_changes_when_a_frame_draws` is a negative
 //! test, and that is the whole point of it.** The bench waits for the retained
@@ -30,17 +51,6 @@
 //! still pass — one step earlier — and every figure it published would be a
 //! measurement of a client that never drew. Nothing else in the suite would
 //! catch it, because the soak looks identical when it is not.
-//!
-//! **And `an_acknowledged_send_outlives_the_row_it_was_evicted_with` pins a
-//! defect, not a property.** `AGENTS.md` §7.1 forbids unbounded growth of
-//! in-memory state, and the delivery map grows by one entry per send with no
-//! retirement path: nothing removes an entry except `discard_failed_send`, which
-//! only ever applies to a *failed* send. Work unit 4A's soak measured that map
-//! still holding sends from its first minute after half an hour of acknowledged
-//! ones. This test makes the behaviour visible in `cargo test` rather than only
-//! in a report somebody might misread, and **it is written to be deleted rather
-//! than inverted the day the leak is fixed** — a test that fails when a bug is
-//! fixed is a canary, and its failure message says so.
 //!
 //! # Test placement
 //!
@@ -571,100 +581,4 @@ fn repeated_cycles_hold_the_bound_and_reconcile_in_place(cx: &mut TestAppContext
              soak's held-history row makes over thirty minutes"
         );
     }
-}
-
-/// An acknowledged send outlives the row it was evicted with.
-///
-/// **A characterisation, and the failure message says so.** `AGENTS.md` §7.1
-/// forbids unbounded growth of in-memory state; the delivery map grows by one
-/// entry per acknowledged send and nothing retires it — `clear_outgoing` is
-/// reachable only from `discard_failed_send`, which applies only to a *failed*
-/// send, and eviction goes through `remove_message`, which does not touch it. So
-/// a client that has sent a million messages holds a million identities forever,
-/// and the thirty-minute soak measures exactly that.
-///
-/// **This test exists so the behaviour is visible in `cargo test` and not only in
-/// a report.** It is written to be *deleted* the day the leak is fixed rather
-/// than inverted: a test that fails when a bug is fixed is a canary, and the
-/// message below is the canary's.
-#[gpui::test]
-fn an_acknowledged_send_outlives_the_row_it_was_evicted_with(cx: &mut TestAppContext) {
-    let (shell, cx) = shell(cx);
-    connected(cx, &shell);
-    filled_to_the_cap(cx, &shell);
-
-    // A history longer than the cap, so the send below is certainly evicted.
-    const OVER: usize = 8;
-    for n in 0..OVER as u128 {
-        queued(
-            cx,
-            &shell,
-            DomainEvent::MessageReceived(stored(
-                MAX_MESSAGES_PER_CHANNEL as u128 + n,
-                "one row past the bound",
-                after_the_history(n),
-            )),
-        );
-    }
-    tick(cx);
-    assert_eq!(
-        held(cx, &shell),
-        MAX_MESSAGES_PER_CHANNEL,
-        "the eight arrivals past the cap each evicted one, so the channel is still at \
-         the bound and its head has moved on by eight"
-    );
-
-    const CLEAR_OF_THE_HISTORY: u128 = 1_000_000;
-    let send = cid(CLEAR_OF_THE_HISTORY);
-    begin_send(
-        cx,
-        &shell,
-        send,
-        "about to be evicted",
-        after_the_history(0),
-    );
-    acked(
-        cx,
-        &shell,
-        send,
-        "about to be evicted",
-        after_the_history(0),
-    );
-
-    // Enough arrivals to push this send, wherever it is, off the end: the cap
-    // evicts one row per insert, so the send is gone after `MAX_MESSAGES_PER_CHANNEL`
-    // more of them. Batched, because a burst larger than
-    // `bridge::MAX_PENDING_EVENTS` is refused by the inbox -- which is the bound
-    // doing its job, and the reason the fill fixture above batches too.
-    let over = MAX_MESSAGES_PER_CHANNEL;
-    for batch in (0..over).step_by(bridge::MAX_PENDING_EVENTS) {
-        for n in batch..(batch + bridge::MAX_PENDING_EVENTS).min(over) {
-            queued(
-                cx,
-                &shell,
-                DomainEvent::MessageReceived(stored(
-                    2_000_000 + n as u128,
-                    "a row behind the send",
-                    after_the_history(1_000 + n as u128),
-                )),
-            );
-        }
-        tick(cx);
-    }
-
-    assert!(
-        !holds_message(cx, &shell, &send),
-        "the send's row has been evicted -- which is correct: an acknowledged row is \
-         ordinary history"
-    );
-    assert_eq!(
-        delivery_in_state(cx, &shell, &send),
-        Some(DeliveryState::Acked),
-        "AND ITS DELIVERY ENTRY SURVIVED THE EVICTION. This is a FINDING, not a \
-         property, and it is the reading --mode soak measured over thirty minutes: the \
-         delivery map grows by one entry per acknowledged send with no retirement \
-         path, which AGENTS.md 7.1 forbids. When the leak is fixed this assertion \
-         FAILS; delete the test then rather than inverting it, and record the fix in \
-         docs/BASELINES.md"
-    );
 }
