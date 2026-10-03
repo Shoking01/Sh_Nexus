@@ -33,6 +33,8 @@ ADR-005.
 | [ADR-006](#adr-006--row-estimator-for-the-virtualized-message-list) | Row estimator for the virtualized message list | **Proposed** |
 | [ADR-007](#adr-007--deferring-the-from-error-payloads-in-shnexuserror) | Deferring the `#[from]` error payloads in `ShNexusError` | **Accepted (with a dated obligation)** |
 | [ADR-008](#adr-008--adopting-rstest-for-parameterized-tests) | Adopting `rstest` for parameterized tests | **Accepted** |
+| [ADR-009](#adr-009--one-main-thread-by-construction-rather-than-by-lock) | One main thread, by construction rather than by lock | **Accepted** |
+| [ADR-010](#adr-010--self-hosted-per-team-instances-with-sqlite) | Self-hosted per-team instances, with SQLite | **Accepted** |
 
 ---
 
@@ -1255,4 +1257,116 @@ wrong reason, and the `no_run` twin proves the only difference is the thread.
   and **not attempted here**, because it means making `AppState::new`
   crate-private and reworking a file 1E-1 owns. Named as the next step rather
   than half-done.
+
+---
+
+### ADR-010 - Self-hosted per-team instances, with SQLite
+
+**Status:** Accepted.
+
+#### Context
+
+**The product goal changed.** The original framing was a chat client talking to
+somebody else's server. It is now: **each team runs its own instance.** That inverts
+who operates the server, and every decision below follows from it.
+
+Two questions this ADR had to answer before any server code, because both are cheap
+now and expensive after the first migration:
+
+1. **What is the trust boundary?** In per-team self-hosting the operator is usually
+   also a user. The adversary is **outside**, not a colleague.
+2. **Is the deployment multi-user from the first commit?** For teams, yes. There is no
+   single-user product here to ship first.
+
+**What the project already had, verified rather than assumed.**
+
+- `PLAN.md`'s tree already carries `sh_nexus_server/` as a separate Axum crate, beside
+  `sh_nexus_wire/`. A self-hosted server is by definition a third party to the client
+  even when both are the same person, and that separation already exists.
+- `PLAN.md`'s REST surface already requires `Idempotency-Key` on
+  `POST /channels/:id/messages`. That is not an extra: a self-hosted server restarts,
+  and a blind retry duplicates a message.
+- `AGENTS.md` §7.4's versioned frames with explicit major-version rejection become the
+  **normal** case rather than the exception: every team upgrades on its own schedule,
+  so client/server skew is the steady state, not a failure.
+- `AGENTS.md` §7.5 forbids logging message content. Under a centralised service that
+  is a vendor promise. Here it is **verifiable by the team**, which opens the SQLite
+  file and reads it. That is a stronger property than any policy statement, and it is
+  the strongest argument the project has.
+
+#### Decision
+
+**SQLite, one file, one process, WAL mode.** A team is tens to hundreds of users, not
+millions, and the operational cost of that choice is roughly zero: the whole deployment
+is a binary and a database file, and **a backup is a file copy**. `PLAN.md` already
+assumed `db.rs` in the server.
+
+**Read state is per `(user, channel)` from the first migration.** This is the decision
+that is cheap now and expensive later, and it exists because the client's model cannot
+warn us. `AppState`'s unread set is `counted: BTreeSet<(String, Uuid)>`
+(`app_state.rs:709`) — **one global set with no user in it**. That is correct for a
+client, which only ever holds *this* user's unread. The server cannot: a global read
+flag means user B sees as read what user A read. So the server holds a per-user read
+cursor and the client keeps its single-user projection.
+
+**Message authorship is retained when a user is removed.** A removed account's messages
+stay in the channel with the author shown as a departed user. Teams want the audit
+trail, and deleting a person must not silently rewrite history.
+
+**Local accounts with `argon2`, and closed registration.** `PLAN.md` assumes
+`jsonwebtoken`, which stands. But open `POST /auth/register` on a self-hosted instance
+is a read-access hole: anyone who can reach the port can enrol and read the team's
+messages. An administrator creates accounts; the first account is created at startup or
+from an operator-supplied environment variable. **No OAuth, no SSO** — the trust
+boundary above does not justify a federation dependency.
+
+**Deleting a user is not implemented as a rewind.** Retention and account removal are
+separate operations, named separately, so neither implies the other.
+
+#### Consequences
+
+- The deployment story is the product story: a binary, a SQLite file, and a port. There
+  is no managed tier to build, and no telemetry to collect — which is a feature under
+  this ADR, not an omission.
+- **The first milestone is a real server, not a mock.** `PLAN.md`'s integration tests
+  (`AGENTS.md` §8.1: two clients, a send crossing the wire, the reconnect flow) were
+  never testable while `network/` held only `mapping.rs`. Building a disposable test
+  server and then a real one would be the same work twice.
+- The soak's standing limit applies with more force here, not less. It reports that it
+  cannot measure "a server-driven leak, a reconnection storm, a resync, or anything
+  `network/` will do" — and a self-hosted server is where those first become real. **The
+  30-minute plateau it measured was measured against an injected ACK**, and that caveat
+  stops being academic the moment this ADR is implemented.
+- Postgres is deferred, not rejected. Tens of users is the target; the migration is
+  real work and belongs to a team that has outgrown the file, not to this ADR.
+
+#### Alternatives considered
+
+- **A component library (`gpui-kit`, or a ProUI-style vendored kit)** — rejected
+  **before** aesthetics were even discussed, and the reason is structural rather than
+  taste. Both require `gpui` **from crates.io**; ADR-001 pins GPUI to a **git `rev`**
+  of Zed's monorepo. Cargo does not unify a crates.io package with a git dependency,
+  which this project already saw with two `proptest` copies, so their components would
+  take a `Context` type this client cannot pass and **would not compile**. Separately,
+  `gpui-kit` ships **WebAssembly** and `gpui-shell` ships **JavaScript extensions**,
+  and `AGENTS.md` §7.1 forbids all three in as many words.
+- **A centralised service** — rejected by the goal change, and it is the thing this
+  project's constraints are actually good at.
+- **Server-sent events instead of WebSocket** — rejected: §7.4 and `PLAN.md` already
+  specify a bidirectional frame protocol with `client_msg_id` dedup, and send presence
+  plus optimistic-ACK reconciliation needs the upstream direction.
+- **Rolling our own password hashing or token format** — rejected as the
+  roll-your-own-crypto failure mode. `argon2` and `jsonwebtoken` are named here for
+  that reason.
+
+#### What this ADR does NOT decide
+
+- **Where the server binds.** LAN-only and internet-facing have different mandatory
+  work (TLS, closed registration from the first commit, proxy assumptions). The threat
+  model above holds for both; the deployment guidance differs and is not settled here.
+- **Federation between separate instances.** Self-hosting plus inter-instance talk is a
+  distributed system. Out of scope, deliberately, and named so it is not attempted by
+  accident.
+- **Rate limiting and abuse controls** — a real need for an instance reachable from a
+  network, and a separate decision with its own context.
 
