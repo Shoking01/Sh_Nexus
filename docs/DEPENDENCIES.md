@@ -49,10 +49,65 @@ individually is not this file's job, and `gpui`'s own rev is what controls them.
 | 10 | `pulldown-cmark` | `0.13.4` | prod (client) | `§4.2` names markdown as a mandatory test target. `default-features = false` to drop the HTML renderer. | `§4.2` names the behaviour; no std equivalent | `MIT` | verified |
 | 11 | `proptest` | `1.11.0` | dev (both) | `§4.4` mandates property tests. `default-features = false`, `features = ["std"]`. | The constitution names it | `MIT OR Apache-2.0` | verified |
 | 12 | `rstest` | `0.27.0` | dev (both) | `§4.3` mandates it for parameterized tests. ADR-008. | The constitution names it | `MIT OR Apache-2.0` | verified |
+| 13 | `axum` | `0.8.9` | prod (**server**) | The HTTP and WebSocket server. `PLAN.md` ADR-002, `§7.4`. `features = ["ws"]`. | `std` has no HTTP or WebSocket server | `MIT` | verified |
+| 14 | `rusqlite` | `0.40.2` | prod (**server**) | SQLite bindings, no ORM. `features = ["bundled"]` — the workspace's one C dependency. | ADR-010 chose SQLite; an ORM would be 4 statements of overhead | `MIT` | verified |
+| 15 | `tracing-subscriber` | `0.3.23` | prod (**server**) | The `tracing` sink. `§7.5`'s level table is unimplementable on bare `tracing`. | `§7.1` bans `println!`; a level table needs a subscriber | `MIT OR Apache-2.0` | verified |
 
 `License` was read from **each crate's own manifest** via `cargo metadata`, not
 from a summary. Every one is MIT or Apache-2.0, both compatible with this
 project's `MIT`.
+
+## `sh_nexus_server`'s dependencies, measured
+
+The rows above are the *declarations*. This is what they cost, because `§7.2`
+criterion 5 asks for a compile-time and graph figure and not an opinion.
+
+**31 new packages in `Cargo.lock`**, all of them in rows 13-15 above and none of
+them already reachable through `gpui`:
+
+| Group | Packages |
+|---|---|
+| axum's HTTP stack | `axum`, `axum-core`, `hyper`, `hyper-util`, `http-body-util`, `httparse`, `httpdate`, `mime`, `tower`, `tower-layer`, `tower-service`, `matchit`, `matchers`, `sync_wrapper`, `socket2`, `mio`, `data-encoding`, `serde_path_to_error` |
+| WebSocket | `tungstenite`, `tokio-tungstenite`, `sha1` |
+| rusqlite's bundled SQLite | `rusqlite`, `libsqlite3-sys`, `vcpkg`, `sqlite-wasm-rs`, `hashlink`, `fallible-iterator`, `fallible-streaming-iterator`, `rsqlite-vfs` |
+| The new workspace member | `sh_nexus_server`, `tokio-macros` |
+
+`serde`, `serde_json`, `chrono`, `uuid`, `tokio`, `tracing` and `tracing-subscriber`
+were **already** in the graph through `gpui`, so naming them cost nothing new —
+which is exactly the argument the root `Cargo.toml` makes for them.
+
+**The client binary is untouched.** `cargo tree -p sh_nexus --edges normal` lists
+**289 unique crates** and contains **none** of `axum`, `axum-core`, `hyper`,
+`hyper-util`, `tower`, `tungstenite`, `tokio-tungstenite`, `rusqlite` or
+`libsqlite3-sys`. `tracing-subscriber` was already there before this milestone.
+The server is a separate binary; `§6.1`'s release-binary row for the client cannot
+move because of it.
+
+**The server binary is 4.03 MiB** (`target/release/sh_nexus_server.exe`, 4,229,120
+bytes). Its own resolved tree is **94 unique crates**. `§6.1`'s <30 MiB ceiling is
+met with room to spare, and the figure is recorded rather than left to be
+discovered, because the next milestone adds `argon2` and `jsonwebtoken` and both
+are new subtrees.
+
+### Three things the server needs that this milestone could not have
+
+Named here rather than left as an unexplained absence in
+`crates/sh_nexus_server/tests/support/mod.rs`, which says the same thing in more
+detail:
+
+1. **A WebSocket client.** `axum` is server-side only; it has no client, and
+   `tokio-tungstenite` is a *transitive* dependency of it, not one of ours. A test
+   that drives a real socket therefore needs either a declared
+   `tokio-tungstenite` dev-dependency or a hand-written RFC 6455 client. The
+   manifest is audited as it stands, so this milestone ships the ~150-line client
+   in `tests/support/`. **A §7.2 audit for `tokio-tungstenite` as a
+   dev-dependency is the change that deletes it.**
+2. **`tempfile`.** In `Cargo.lock` through `gpui`'s tree, not declared here, for
+   the same reason. `tests/support/mod.rs` rolls a `TempDir` in 40 lines.
+3. **`thiserror`.** Declared for `sh_nexus` and `sh_nexus_wire`; not declared for
+   the server, so `error.rs` writes nine `Display` arms by hand. The trade is
+   recorded in that module's docs: if the enum grows materially, the audit is a
+   small pull request.
 
 ## Two feature declarations that were wrong, and the reason it took this long to notice
 
@@ -105,6 +160,30 @@ dependency. `uuid/v4` adds a `getrandom` call **per generated id** — one per
 `PLAN.md`'s idempotent-send design is built on: a `client_msg_id` that exists
 before the server has seen the message is what makes the optimistic row and the
 later `ACK` the same row.
+
+**And the server side of the same trap, avoided rather than fixed.** When
+`sh_nexus_server` was written, its manifest said `chrono = { workspace = true }`
+and `uuid = { workspace = true }` — which is `["std","serde"]` and `["std"]`, with
+neither `clock` nor `v4`. Both features are declared on `sh_nexus`, so under
+`cargo build --workspace` **or** `cargo test --workspace` a `Utc::now()` or a
+`Uuid::new_v4()` in the server would have compiled and looked correct. Under
+`cargo build --release -p sh_nexus_server` — the deployment command — neither
+exists, and the build fails.
+
+So the server reads its clock from `std::time::SystemTime` and converts with
+chrono's pure arithmetic (`DateTime::from_timestamp_millis`, a `const fn` needing
+no feature), and mints a message id from `Uuid::from_u128` over the acceptance
+instant and a per-process counter. Both are documented at their call sites, and
+`cargo metadata` is the check:
+
+```
+sh_nexus_server  chrono features: ["std","serde"]   uuid features: ["std"] (default, no "v4")
+```
+
+The cost of that choice is stated at each site: the id is unique within an
+instance and monotonic in acceptance order rather than globally unique, and the
+timestamp conversion has a documented failure mode. Both are the right trade
+against a build that passes CI and fails for whoever deploys the server.
 
 ## §7.2.2 — maintenance signals, stated honestly
 

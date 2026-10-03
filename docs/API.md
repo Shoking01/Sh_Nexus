@@ -7,10 +7,11 @@ schema is `AGENTS.md`; this file records the schemas **as implemented**, and
 | Section | Status |
 |---|---|
 | [1. Theme files](#1-theme-files) | **implemented** — work unit 1D, `core/theme.rs` |
-| [2. Wire protocol and version negotiation](#2-wire-protocol-and-version-negotiation) | **not yet implemented** — `sh_nexus_wire` exists, the transport does not (`PLAN.md` Phase 4) |
+| [2. Wire protocol and version negotiation](#2-wire-protocol-and-version-negotiation) | **partly implemented** — the types and the version gate were always in `sh_nexus_wire`; the transport and the message path arrived with `sh_nexus_server`. §2.6 records exactly what is missing. |
 
-Nothing here is a promise about a format that does not exist yet. Section 2 is
-listed so its absence is visible rather than assumed.
+Nothing here is a promise about a format that does not exist yet. §2.6 lists what
+the server does not yet do, so its boundary is visible from the same page as its
+behaviour.
 
 ---
 
@@ -256,11 +257,160 @@ here — a version-1 schema change without a version bump is exactly what §1.6'
 
 ## 2. Wire protocol and version negotiation
 
-**Not implemented.** `sh_nexus_wire` holds the frame and DTO types and is
-`serde`-derived, but there is no transport, no envelope versioning and no
-handshake: `PLAN.md` §2 places all of that in Phase 4, and `src/network/` today
-holds only the DTO-to-domain mapping.
+The frames, DTOs and version gate are defined **once**, in `crates/sh_nexus_wire`,
+and both sides compile against them (ADR-002). Nothing in this section is
+re-specified here: `PLAN.md` §6 is the specification and
+`crates/sh_nexus_wire/src/frame.rs` is its implementation. What follows is the
+transport the frames now travel over, which `PLAN.md` §6 could not describe because
+it did not exist when it was written.
 
-There is nothing to document yet, and this section exists so that its absence is
-a recorded decision rather than an oversight. It is written when the transport
-lands.
+### 2.1 The endpoint
+
+One route, and it is the whole HTTP surface:
+
+```
+GET /ws HTTP/1.1
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: <base64 of 16 bytes>
+Sec-WebSocket-Version: 13
+```
+
+The upgrade response is axum's `101`. **No subprotocol is negotiated** and no
+`Sec-WebSocket-Protocol` is echoed, because every frame carries its own `v` and the
+version lives on the envelope rather than in a handshake header — which is the
+decision `sh_nexus_wire`'s frame module documents and the reason there is no
+negotiation step at all.
+
+The server's configuration is two environment variables, both optional:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SH_NEXUS_BIND` | `127.0.0.1:8484` | The socket address to bind, as `host:port`. A malformed value is refused at startup, naming the variable — never silently replaced by the default. |
+| `SH_NEXUS_DB` | `sh_nexus.db` | The SQLite file. The parent directory must already exist. |
+
+The bind default is **loopback**, not `0.0.0.0`. This milestone has no
+authentication, so an instance reachable from the network would be a readable one;
+an operator who wants it exposed says so explicitly. ADR-010 records the bind
+interface as a decision it does **not** make, which is why the startup log names
+the interface actually bound rather than the one that was configured.
+
+### 2.2 The message round trip
+
+This is the one path the server implements. Everything else is §2.6.
+
+```text
+client -> server   {"v":1,"type":"message.send","client_msg_id":"…","channel_id":"c_general","content":"hi"}
+server -> sender   {"v":1,"type":"message.ack","client_msg_id":"…","message":{…}}
+server -> others   {"v":1,"type":"message.new","message":{…}}
+```
+
+Three properties a client may rely on, each of which is enforced by the database
+rather than by the code around it:
+
+1. **A send is idempotent under `client_msg_id`.** A replay — after a reconnect,
+   from a retrying client — creates no second row and produces no second
+   `message.new`. The `message.ack` is sent again, carrying the row that already
+   existed, so a client that reconnects mid-send still reconciles.
+2. **The ack is the authority.** It carries the stored `WireMessage`, not the one
+   that was sent. The sender's own `message.new` is **not** echoed to it: the ack
+   already gave it the row, and the echo's only consumer would be the client's own
+   dedup. Every *other* connection receives the `message.new`.
+3. **`last_message_at` advances only for a new message.** It is the upper bound a
+   `resync` asks for, and a replay moving it would make a client that resumed from
+   it skip the message the replay was about.
+
+### 2.3 Refusals
+
+Every rejection is a `message.error` carrying a machine-readable `code` and a
+human-readable `detail`, and the connection **stays open** — `PLAN.md` §7 is
+explicit that failures are never silently dropped, and the client's boundary turns
+`message.error` into `DeliveryState::Failed` with the row still visible for retry.
+
+| `code` | `detail` | Cause |
+|---|---|---|
+| `blank_client_msg_id` | names the missing `client_msg_id` and that it cannot be deduplicated | the envelope's id is present but blank |
+| `blank_channel_id` | `channel_id must not be blank` | whitespace-only channel |
+| `empty_content` | `content must not be blank` | whitespace-only body |
+| `unknown_channel` | quotes the channel id | no such channel on this instance |
+| `storage_failure` | `the server could not store this message; please retry` | the server's fault, not the sender's |
+
+`code` is a `String` on the wire and not an enum, so a client too old to know a
+code can still read the frame that explains the failure. **No `detail` ever quotes
+message content** — `AGENTS.md` §7.5 forbids logging it, and a `detail` is shown to
+a user and lands in their client's log. A `channel_id` is the one value that is
+quoted, because it is server-issued bounded text and naming it is the whole
+diagnostic.
+
+A **bare `error` frame is not used for any of the above.** `error` is a statement
+about the connection; the client's boundary maps it to `ConnectionState::Rejected`,
+so using it for a blank field would tell a client its connection had been rejected
+over a typo.
+
+### 2.4 Version negotiation
+
+A peer whose `v` is not in `SUPPORTED_MAJOR_VERSIONS` gets, in this order:
+
+1. an `error` frame with `code: "unsupported_version"` and a `detail` naming both
+   the version it announced and the set this build speaks — and stating that
+   reconnecting will not resolve it, because a version mismatch is not transient;
+2. a close frame, code **1002** (protocol error).
+
+The rejection carries **this build's** `v`, never the peer's, so a client too old
+to read the frame can still decode it with the version it already has. The
+rejection's `detail` is `UnsupportedVersion::detail()` verbatim — the server does
+not write its own sentence, and `tests/version_negotiation.rs` asserts the exact
+string for that reason.
+
+Every *other* unreadable frame — malformed JSON, an unknown `type`, a server frame
+arriving on a client socket — is dropped with a `warn!` naming the error kind and
+the frame's size, and **the connection stays open**. That is
+`sh_nexus_wire`'s own compatibility policy: a frame this build cannot decode is a
+frame it cannot render, and within one major version the only such frames are
+advisory ones whose loss costs nothing.
+
+**The frame size ceiling is 65,536 bytes.** A larger frame ends the connection
+without a close frame, because `tungstenite` 0.29 refuses it with
+`Error::Capacity(MessageTooLong)` and terminates; RFC 6455 §7.4.1's 1009 is
+therefore **not** sent, and the peer observes an unclean close (an RST on Windows).
+This is a transport limit, not a content policy: a per-message length limit belongs
+to the milestone that has accounts to attribute one to.
+
+### 2.5 What the server stores
+
+SQLite, WAL, one file, schema version 1 in `PRAGMA user_version`.
+
+| Table | Exercised | Note |
+|---|---|---|
+| `users` | one seeded row | `u_unattributed`. `PLAN.md` §6's `message.send` carries no author and there is no authentication yet, so every message this milestone stores is attributed to a reserved row named `unattributed`. |
+| `channels` | one seeded row | `c_general`. A send naming any other channel is **refused**, not silently created — channel provisioning is the REST milestone's job. |
+| `messages` | the whole round trip | `client_msg_id` is globally `UNIQUE`, which is what makes dedupe a single lookup. |
+| `read_cursors` | **no** | ADR-010 requires per-`(user, channel)` read state "from the first migration". Deliberately unread here. |
+| `channel_members` | **no** | Membership is an authorization concern, which is the authentication milestone. |
+
+Opening a file whose `user_version` is above this build's, or that has tables but
+no version stamp, is **refused** rather than migrated. Both refusals are
+`AGENTS.md`'s "never destroy user data silently" with teeth, and both are tested.
+
+### 2.6 What is not implemented
+
+Named so its absence is a recorded decision rather than a discovery. All of these
+decode and are then **logged at `warn!` with the connection kept open**, which is
+`sh_nexus_wire`'s own prescription for a frame this end does not implement.
+
+| Missing | Consequence for a client |
+|---|---|
+| Authentication, registration, tokens | `message.send` has no author; every message is `u_unattributed`. |
+| REST, channel and user provisioning | Only `c_general` exists. |
+| Presence | No `presence.update` is ever sent. |
+| Typing | `typing.start`/`typing.stop` are accepted and discarded. No `typing.update` is ever sent. |
+| Reactions | `reaction.add` is accepted and discarded. No `reaction.update` is ever sent. |
+| `resync` | **A reconnecting client that asks to catch up is not sent what it missed.** This is the one gap in the list with teeth, and it is data-bearing. It deserves a frame that says so; that frame belongs to the milestone that implements resync, because inventing a code now would be a protocol decision taken before anything can send it. |
+
+### 2.7 Frame types the server does not send
+
+`message.ack`, `message.new` and `message.error`, plus the `error` frame of §2.4.
+`ServerFrame`'s remaining four variants — `reaction.update`, `typing.update`,
+`presence.update` and any future one — are defined in `sh_nexus_wire` and
+unreachable from this build, which is a property the type system holds rather than
+a convention.
