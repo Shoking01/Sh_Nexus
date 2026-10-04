@@ -140,6 +140,8 @@
 //! | [`try_apply_event`] | one event, applied through [`actions::apply_event`] |
 //! | [`try_select_channel`], [`try_begin_send`] | the two user gestures `AGENTS.md` §8.1's flows need |
 //! | [`try_retry_send`] | the third user gesture: a failed send's badge. **It does not transmit** |
+//! | [`try_send_message`] | one send, straight onto the wire |
+//! | [`try_flush_outbox`] | every send `PLAN.md` §7 queued, in enqueue order |
 //! | [`try_render_and_cache`], [`try_rendered`] | the parse on render, and the read that promotes it |
 //! | [`try_read`] | any read of the state |
 //!
@@ -164,11 +166,28 @@
 //! (`the_destructive_discard_has_no_ui_caller`) is what keeps it honest instead
 //! of leaving it to the next reader's judgement.
 //!
-//! # 6. What this file does not decide
+//! # 6. The outbox, and the one thing this seam must not do with it
 //!
-//! - **When to drain.** [`drain`] is synchronous and the caller owns the
-//!   schedule. A foreground task in a later work unit will call it; which loop
-//!   calls it decides what a burst costs, and that is not this file's call.
+//! [`try_flush_outbox`] is the whole of `PLAN.md` §7's outbox on this side of the
+//! boundary, and it exists because of a fact about the module above: `network/ws.rs`
+//! consumes an item off its outbound queue and **does not put it back** when
+//! `write_frame` fails. A transport queue is therefore backpressure between the
+//! enqueue and the write, and a send that met a dying socket there was destroyed.
+//!
+//! **The rule this file follows, stated once: this seam may push frames and it may
+//! report what happened, and it may never retire a queued send.** An entry leaves
+//! the outbox when the server acknowledges the send or refuses it terminally, and
+//! that is [`actions::acknowledge`] and [`actions::fail_send`] — decisions on the
+//! other side of this line, made on evidence from the server rather than on
+//! evidence about bytes leaving this process. **A door here that "clears" the
+//! queue would be the exact defect this unit removes, wearing a return type.**
+//!
+//! # 7. What this file does not decide
+//!
+//! - **When to drain, and when to flush.** [`drain`] is synchronous and the caller
+//!   owns the schedule; `Shell::apply_inbox` is what calls both, and why it calls
+//!   the flush on every tick rather than only on the transition to `Connected` is
+//!   that method's own note.
 //! - **What to do with a refusal.** Every entry point reports what happened and
 //!   changes nothing else. Rendering a refusal, reconnecting, dropping a
 //!   message: a view's decision and a worker's decision, not a seam's.
@@ -489,8 +508,13 @@ pub enum EnqueueOutcome {
     ///
     /// **Not a failure, and the distinction is the whole point.** `AppState`'s
     /// `can_send` already requires `ConnectionState::Connected`, so a user cannot
-    /// reach this by typing. An outbox is `PLAN.md` §7's Phase 3 work, and
-    /// `AGENTS.md` §7.1 forbids the unbounded growth one would need.
+    /// reach this by typing.
+    ///
+    /// **And a send composed while disconnected never reaches here at all** — it
+    /// is queued in `AppState` by [`actions::begin_send`] and driven by
+    /// [`try_flush_outbox`] when the connection returns. `PLAN.md` §7's outbox
+    /// exists so that this variant is about *this* door's socket rather than about
+    /// every send.
     NoTransport,
     /// The socket refused the frame synchronously — closed, or its queue full.
     ///
@@ -554,6 +578,133 @@ pub fn try_send_message(
         Ok(()) => EnqueueOutcome::Queued,
         Err(error) => EnqueueOutcome::Refused(format!("the socket refused the send: {error}")),
     }
+}
+
+/// What one [`try_flush_outbox`] put on the wire, and what it could not.
+///
+/// **Three counters and no identities, and that is deliberate twice over.** The
+/// counts are what an operator needs from a `warn!` — how much was driven, how
+/// much the socket turned away, how much is still sitting in the queue — and
+/// `AGENTS.md` §7.5 forbids logging **message content**, so this type carries no
+/// `client_msg_id` and no text even though it could: the caller that wants the
+/// identities asks [`try_read`] for them, and a reader that wanted them here
+/// would be one refactor away from a `Debug` on a message body.
+#[must_use = "a flush whose report goes unread cannot tell a refused frame from an empty queue"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlushReport {
+    driven: usize,
+    refused: usize,
+    held: usize,
+}
+
+impl FlushReport {
+    /// How many frames reached the transport's outbound queue.
+    ///
+    /// **Not "how many the server has".** A frame in that queue has left this
+    /// process and nothing more; the entry stays in `AppState`'s outbox until the
+    /// server acknowledges the send, which is the entire design of
+    /// [`actions::flush_outbox`].
+    pub fn driven(&self) -> usize {
+        self.driven
+    }
+
+    /// How many the transport refused synchronously — closed, or its own queue
+    /// full.
+    ///
+    /// **These stay queued and are driven again on the next flush.** A refusal is
+    /// a fact about *this* attempt, not a terminal answer, and rolling the rows
+    /// back to `Failed` here would defeat the mechanism: the socket's outbound
+    /// queue is backpressure, and this queue is the retry that survives it.
+    pub fn refused(&self) -> usize {
+        self.refused
+    }
+
+    /// How many were left in the outbox because there is no socket to drive them
+    /// into.
+    ///
+    /// **The offline shell's ordinary answer**, and worth distinguishing from
+    /// "nothing was queued": a client with no `SH_NEXUS_URL` holds a transport
+    /// that is `None` forever, so this is the number that says the queue is
+    /// waiting rather than empty.
+    pub fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Whether the flush drove nothing.
+    pub fn is_empty(&self) -> bool {
+        self.driven == 0 && self.refused == 0 && self.held == 0
+    }
+}
+
+/// Puts every queued send on the wire, in enqueue order.
+///
+/// **The one door the outbox has, and `PLAN.md` §7's flush.** The order of the
+/// operations is the whole contract:
+///
+/// 1. [`actions::flush_outbox`] resolves the queued identities into frames, **in
+///    enqueue order**, reading each body from the row the client holds.
+/// 2. Each frame goes to the transport, **in that order** — one loop, no sorting,
+///    no re-queueing.
+/// 3. **Nothing is dequeued.** Not by a success, not by a refusal. The entry
+///    leaves when `MessageAcked` or a terminal `MessageSendFailed` arrives, which
+///    `state/actions.rs` owns.
+///
+/// **Step 3 is the defect this door exists to fix, and the reason is a fact about
+/// `network/ws.rs`.** Its worker takes an item off the outbound queue, and if
+/// `write_frame` fails the arm returns without putting the item back — so a frame
+/// that reaches [`try_send_message`] and then meets a dying socket is *gone*. A
+/// transport-level queue is not a queue that survives a disconnection, and
+/// `MAX_OUTBOUND_FRAMES` is where that illusion ends. Driving the same frames
+/// again on the next flush is safe because the server deduplicates on
+/// `client_msg_id` and answers a duplicate with an ACK.
+///
+/// **Re-driving is a bounded cost, not an unbounded one.** The loop stops driving
+/// an entry only when the server answers, and every drive is a `try_send` into a
+/// 256-slot queue. A caller that wants the flush only on a *transition* may call
+/// this when `ConnectionState` becomes `Connected`; the shell calls it on every
+/// tick, because a retry enqueued while already connected would otherwise have no
+/// trigger at all (see `Shell::apply_inbox`).
+///
+/// # Errors
+///
+/// `None` when the state is not installed, for the reason [`try_send_message`]
+/// gives. **A flush with nothing queued, and a flush with no socket, are both
+/// `Some`** — a [`FlushReport`] of zeroes or of `held`, never a failure.
+pub fn try_flush_outbox(cx: &mut App) -> Option<FlushReport> {
+    if !is_installed(cx) {
+        return None;
+    }
+
+    // **The queue is read before the socket is named**, so a client with no
+    // transport pays one map lookup and stops: `flush_outbox` yields nothing while
+    // `can_send` is false, and `actions.rs` owns that decision rather than this
+    // seam re-deriving it.
+    let queued =
+        cx.update_global::<AppStateGlobal, _>(|global, _| actions::flush_outbox(&global.state));
+    if queued.is_empty() {
+        return Some(FlushReport::default());
+    }
+
+    let transport = cx
+        .try_global::<OutboundGlobal>()
+        .and_then(|global| global.transport.clone());
+    let Some(transport) = transport else {
+        return Some(FlushReport {
+            held: queued.len(),
+            ..FlushReport::default()
+        });
+    };
+
+    let mut report = FlushReport::default();
+    for send in &queued {
+        match transport.send_message(send.client_msg_id(), send.channel_id(), send.content()) {
+            Ok(()) => report.driven += 1,
+            // **Reported and nothing else.** The entry stays queued and the row
+            // stays `Pending`; see `FlushReport::refused`.
+            Err(_) => report.refused += 1,
+        }
+    }
+    Some(report)
 }
 
 /// Whether the application state is installed.
@@ -759,13 +910,15 @@ pub fn try_begin_send(
 ///
 /// [`actions::retry_send`] moves a send from
 /// [`DeliveryState::Failed`](crate::state::DeliveryState::Failed) to `Pending`
-/// and stops. There is no socket on this side of the seam — `network/` is not
-/// wired — and the outbox that would put a `Pending` send on a wire is `PLAN.md`
-/// §7's Phase 3 work. So a user who clicks retry watches the badge read
-/// `sending…`, and it stays there until an outbox exists to move it.
-/// **A caller that reported this door's success as "sent" would be reporting a
-/// transport that does not exist**, which is the failure this paragraph exists to
-/// prevent.
+/// **and puts it at the back of `AppState`'s outbox**, then stops. It does not
+/// push a frame: the frame is [`try_flush_outbox`]'s work, and the next flush
+/// picks the entry up because it is queued.
+///
+/// **So a user who clicks retry now watches the badge change from `failed: …` to
+/// `sending…`, and this time it stays only as long as the server takes to
+/// answer.** A caller that reported this door's success as "sent" would still be
+/// wrong — the transmission is [`try_flush_outbox`]'s, and its report is what
+/// says a frame reached the socket.
 ///
 /// # Errors
 ///

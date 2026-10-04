@@ -25,6 +25,14 @@
 //! | A channel never grows past `MAX_MESSAGES_PER_CHANNEL`, and the one exception is stated | `a_channel_at_its_bound_keeps_the_cap_and_loses_the_oldest`, `a_channel_whose_every_row_is_a_send_in_flight_is_allowed_over_the_cap`, plus the bound inside `assert_internally_consistent` | hand-written for the number (work unit 3C), property for the shape |
 //! | A send in flight is never the row eviction takes | `a_send_in_flight_is_never_the_row_that_is_evicted` | `#[rstest]`, pending and failed |
 //! | A reader scrolled into history keeps their row | `a_reader_scrolled_into_history_keeps_their_row_when_the_head_is_evicted` in `tests/ui_message_list.rs` | hand-written, at 10 001 messages through a real window |
+//! | An offline send is queued and a connected one is not | `only_an_offline_send_is_queued` | `#[rstest]`, five connection states |
+//! | Reconnecting drives every queued send in enqueue order | `a_reconnect_drives_every_queued_send_in_enqueue_order` | hand-written; the order is decided by `actions::flush_outbox` and checkable nowhere else |
+//! | A queued entry leaves only on an ack or a terminal failure | `a_queued_send_leaves_on_an_ack_or_a_terminal_failure_and_on_nothing_else` | hand-written; the "and on nothing else" half is the claim |
+//! | The bound refuses rather than dropping | `the_outbox_refuses_at_its_bound_and_the_row_says_which_bound`, `the_outbox_holds_its_bound_however_many_sends_are_composed` | hand-written, at and past the boundary |
+//! | A retry re-queues at the back | `a_retry_requeues_at_the_back_and_leaves_on_an_ack_or_a_failure`, `a_retry_at_a_full_queue_is_refused_and_the_row_stays_failed` | hand-written, three-entry queue |
+//! | A queued send never outlives its row | `a_discard_retires_nothing_because_a_failed_send_is_never_queued`, `a_queued_send_at_the_head_is_never_the_row_eviction_takes` | hand-written, through the discard and through eviction |
+//! | A resync echo retires the entry too | `a_resync_echo_of_a_queued_send_retires_its_entry` | hand-written; the third door, and the one the proptest found missing |
+//! | Every queue entry names a held, awaited row | inside `assert_internally_consistent` | **proptest**, checked after *every* step |
 //!
 //! # The two properties, and why they are two tests
 //!
@@ -96,12 +104,12 @@ use sh_nexus::core::models::message::{Message, Reaction};
 use sh_nexus::core::models::user::UserStatus;
 use sh_nexus::core::ordering;
 use sh_nexus::state::actions::{
-    apply_event, begin_send, discard_failed_send, render_and_cache, retry_send, select_channel,
-    set_channels, ApplyOutcome, IgnoreReason, SendOutcome,
+    apply_event, begin_send, discard_failed_send, flush_outbox, render_and_cache, retry_send,
+    select_channel, set_channels, ApplyOutcome, IgnoreReason, SendOutcome,
 };
 use sh_nexus::state::app_state::{
-    AppState, DeliveryState, MAX_MESSAGES_PER_CHANNEL, MAX_TYPING_CHANNELS,
-    MAX_TYPING_USERS_PER_CHANNEL,
+    AppState, DeliveryState, SendFailure, MAX_MESSAGES_PER_CHANNEL, MAX_OUTBOX_ENTRIES,
+    MAX_TYPING_CHANNELS, MAX_TYPING_USERS_PER_CHANNEL,
 };
 use uuid::Uuid;
 
@@ -3192,6 +3200,13 @@ fn an_edit_invalidates_the_cached_parse_and_an_ack_that_only_fills_the_id_does_n
     "ignored: nobody was typing in c_0"
 )]
 #[case(
+    IgnoreReason::OutboxFull {
+        client_msg_id: Uuid::from_u128(5)
+    },
+    "ignored: the outbox for 00000000-0000-0000-0000-000000000005 is full at 1024 \
+     queued sends"
+)]
+#[case(
     IgnoreReason::RenderedDocumentTooLarge,
     "ignored: the parsed document exceeds the segment cache budget"
 )]
@@ -3240,6 +3255,9 @@ fn the_refusal_reason_cases_cover_every_reason() {
         IgnoreReason::AlreadyPending {
             client_msg_id: cid(4),
         },
+        IgnoreReason::OutboxFull {
+            client_msg_id: cid(5),
+        },
         IgnoreReason::UnknownChannel {
             channel_id: "c_0".to_owned(),
         },
@@ -3257,8 +3275,8 @@ fn the_refusal_reason_cases_cover_every_reason() {
 
     assert_eq!(
         rendered.len(),
-        12,
-        "one case per variant, and the count is written down so a thirteenth is a \
+        13,
+        "one case per variant, and the count is written down so a fourteenth is a \
          deliberate edit here rather than a silent gap"
     );
     // Every one renders to something non-empty and single-line, which is the two
@@ -3273,7 +3291,12 @@ fn the_refusal_reason_cases_cover_every_reason() {
     }
 }
 
-/// A send's outcome says which of the three things happened, in words.
+/// A send's outcome says which of the four things happened, in words.
+///
+/// **The fourth case is the one that has to exist at all.** A send refused at the
+/// outbox bound produces a *visible failed row*, and `AGENTS.md` §5.2 makes the
+/// explanation part of the product — so the line a `tracing` record or a badge
+/// carries is asserted in full, including the bound the user could act on.
 #[rstest]
 #[case(
     SendOutcome::Pending { client_msg_id: Uuid::from_u128(1), offline: false },
@@ -3287,11 +3310,56 @@ fn the_refusal_reason_cases_cover_every_reason() {
     SendOutcome::Ignored(IgnoreReason::EmptyContent),
     "not sent: the message body is empty"
 )]
-fn a_send_outcome_says_in_words_which_of_the_three_things_happened(
+fn a_send_outcome_says_in_words_which_of_the_four_things_happened(
     #[case] outcome: SendOutcome,
     #[case] expected: &str,
 ) {
     assert_eq!(outcome.to_string(), expected);
+}
+
+/// The outbox refusal renders as one line naming the identity and the bound, and
+/// `SendFailure` renders its code whether or not the server sent a detail.
+///
+/// **Two gaps closed together because both are Display arms nothing else would
+/// execute.** `IgnoreReason`'s `OutboxFull` arm is only ever reached from
+/// `retry_send` at a full queue — a case no flow test walks — and `SendFailure`'s
+/// own `Display` is the only thing that turns the reason on a refused row into a
+/// sentence. A message that renders to `""`, or to two lines, is a bug in the
+/// product's only user-facing surface for this state.
+#[test]
+fn the_outbox_refusal_and_the_failure_beside_it_render_one_readable_line() {
+    let identity = cid(9);
+    let reason = SendFailure::new("client.outbox_full", "1024 sends are waiting");
+    assert_eq!(
+        reason.to_string(),
+        "client.outbox_full: 1024 sends are waiting"
+    );
+
+    // **A `message.error` may carry a code and no prose**, and `code: ` with
+    // nothing after it is worse than the code alone -- it reads as a sentence that
+    // lost its ending.
+    let bare = SendFailure::new("validation_error", String::new());
+    assert_eq!(bare.to_string(), "validation_error");
+
+    let rendered = SendOutcome::Failed {
+        client_msg_id: identity,
+        reason: SendFailure::new(
+            "client.outbox_full",
+            "this machine already has 1024 sends waiting for a connection",
+        ),
+    }
+    .to_string();
+
+    assert_eq!(
+        rendered,
+        "not queued: 00000000-0000-0000-0000-00000000000a failed: \
+         client.outbox_full: this machine already has 1024 sends waiting for a \
+         connection"
+    );
+    assert!(
+        !rendered.contains('\n'),
+        "one line, because a badge is one line and a `tracing` record is one record"
+    );
 }
 
 /// A merge reports the fields that disagreed, by name, and an empty report says
@@ -3446,6 +3514,836 @@ fn a_channel_with_messages_and_no_recorded_cursor_resumes_from_its_newest() {
     assert_eq!(state.resync_cursor("c_0"), Some(at(9)));
 }
 
+// ---------------------------------------------------------------------------
+// 11. The outbox
+// ---------------------------------------------------------------------------
+
+/// An offline send is queued; **a connected send is not, and that is a
+/// decision rather than an omission.**
+///
+/// **`PLAN.md` §7's first bullet, and the flag it was waiting for.** `begin_send`
+/// computed `offline = !state.can_send()` before this queue existed and returned it
+/// in `SendOutcome::Pending`; nothing read it. This is the test that says the
+/// return value now has an effect.
+///
+/// **The connected case is asserted as carefully as the offline one.** A connected
+/// send is handed straight to the transport by `MessageList::enqueue`, so queuing
+/// it too would put two `message.send` frames on the wire for one message. The
+/// server would drop the second as a duplicate and no transcript would be harmed —
+/// but it would be a doubled frame per send, forever, for nothing. **The residual
+/// hole that leaves is stated in `state/actions.rs`'s module docs, §7.1: a write
+/// that fails *after* a connected send left the client is still not re-driven,
+/// because closing it means the composer must ask the outbox instead of the
+/// transport, which is a `ui/` change.**
+#[rstest]
+#[case(ConnectionState::Connected, false)]
+#[case(ConnectionState::Connecting, true)]
+#[case(ConnectionState::Reconnecting { attempt: 1 }, true)]
+#[case(ConnectionState::Disconnected, true)]
+#[case(
+    ConnectionState::Rejected {
+        code: "version".to_owned(),
+        detail: "v2".to_owned()
+    },
+    true
+)]
+fn only_an_offline_send_is_queued(#[case] connection: ConnectionState, #[case] queued: bool) {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+    fire(&mut state, DomainEvent::ConnectionStateChanged(connection));
+
+    let mine = cid(1);
+    assert_eq!(
+        begin_send(&mut state, "c_0", "written offline", mine, at(0)),
+        SendOutcome::Pending {
+            client_msg_id: mine,
+            offline: queued,
+        }
+    );
+
+    assert_eq!(
+        state.outbox_len(),
+        usize::from(queued),
+        "the outbox holds the send exactly when the connection could not carry it"
+    );
+    assert_eq!(
+        state.outbox_holds(&mine),
+        queued,
+        "and it holds the right one"
+    );
+    assert_eq!(
+        state.message_count("c_0"),
+        1,
+        "the row is on screen either way -- the Optimistic Send Flow is \
+         connection-independent"
+    );
+    assert_eq!(
+        state.delivery(&mine),
+        Some(DeliveryState::Pending),
+        "and the row is `Pending` either way"
+    );
+}
+
+/// **Reconnecting re-drives every queued send, in enqueue order** — and the order
+/// is asserted here because this is where it is decided.
+///
+/// `PLAN.md` §7's second bullet. **`actions::flush_outbox` is the function that
+/// turns the queue into frames, so the order is a property of it and not of
+/// anything downstream** — `state/bridge.rs`'s loop is a `for` over what this
+/// returns. A test at the seam could only assert "all of them went"; the ordering
+/// claim is checkable only here.
+///
+/// **Three sends in two channels**, so the channel cannot be what fixes the order:
+/// a queue keyed by channel, or one sorted by channel name, would produce
+/// `c_0, c_0, c_1` and fail this.
+#[test]
+fn a_reconnect_drives_every_queued_send_in_enqueue_order() {
+    let mut state = AppState::new("u_me");
+    set_channels(
+        &mut state,
+        vec![channel("c_0", "channel-0"), channel("c_1", "channel-1")],
+    );
+
+    // Offline, which is the only way a send is queued at all.
+    for (index, channel_id) in ["c_0", "c_1", "c_0"].iter().enumerate() {
+        let identity = cid(u128::try_from(index).expect("three is far below u128::MAX"));
+        let second = i64::try_from(index).expect("three is far below i64::MAX");
+        begin_send(
+            &mut state,
+            channel_id,
+            &format!("body {index}"),
+            identity,
+            at(second),
+        );
+    }
+
+    // **The queue is identities, and that is what the return type says.** Not a
+    // copy of the body: a queued send is stored exactly once, which is the storage
+    // half of the ids-not-content decision (`AGENTS.md` §2.3's "no deep clones in
+    // hot paths" and §7.1's bound both point the same way).
+    assert_eq!(state.outbox_ids(), vec![cid(0), cid(1), cid(2)]);
+
+    // **A queued row's body cannot actually change while it is queued, and that is
+    // worth saying because the obvious demonstration does not work.** The only
+    // writer that can change a held message's content is the server, and every
+    // server-delivered copy carries a real id — which reconciles the row to
+    // `Acked` and retires its entry (see
+    // `a_resync_echo_of_a_queued_send_retires_its_entry`). So "the queue holds
+    // identities so an edit while queued is transmitted" is a *reason* that no test
+    // can demonstrate, and the honest claim is the one above: one copy.
+    assert_eq!(state.delivery(&cid(0)), Some(DeliveryState::Pending));
+
+    // Still offline: the flush produces nothing, and produces nothing *without
+    // touching the queue* — the whole point of the gate.
+    assert!(
+        flush_outbox(&state).is_empty(),
+        "a connection that cannot carry a send has nothing to drive"
+    );
+    assert_eq!(state.outbox_len(), 3, "and the queue is untouched");
+
+    // The connection returns.
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Connected),
+    );
+    let driven = flush_outbox(&state);
+
+    assert_eq!(
+        driven
+            .iter()
+            .map(|send| send.client_msg_id())
+            .collect::<Vec<_>>(),
+        vec![cid(0), cid(1), cid(2)],
+        "PLAN.md section 7 flushes in enqueue order, and the queue is what fixes it"
+    );
+    assert_eq!(
+        driven
+            .iter()
+            .map(|send| send.channel_id())
+            .collect::<Vec<_>>(),
+        vec!["c_0", "c_1", "c_0"],
+        "each frame names the channel it was composed in"
+    );
+    assert_eq!(
+        driven
+            .iter()
+            .map(|send| send.content().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["body 0", "body 1", "body 2"],
+        "and each carries the body read back from the row the client holds"
+    );
+
+    // **And a second flush drives the same entries again.** Nothing was retired:
+    // see the next test for why that is the whole design.
+    assert_eq!(
+        flush_outbox(&state).len(),
+        3,
+        "the entries are still queued -- re-driving is what makes a lost frame \
+         recoverable"
+    );
+    assert_eq!(state.outbox_len(), 3, "and the queue says so");
+}
+
+/// **A queued entry leaves only on an acknowledgement or a terminal failure —
+/// never because a write succeeded.**
+///
+/// This is the defect the whole unit exists to remove. `network/ws.rs`'s worker
+/// consumes an item off its outbound queue and returns **without putting it back**
+/// when `write_frame` fails, so `MAX_OUTBOUND_FRAMES` is backpressure between the
+/// enqueue and the write and not a queue that survives a disconnection.
+///
+/// **Every half is asserted, and the "never" half is the one that matters:** a
+/// flush that resolved every entry is *not* an exit, a `Pending` row after a
+/// successful flush is *not* an exit, and neither is a `can_send` answer or a
+/// dropped event. Only the server's two answers are.
+#[test]
+fn a_queued_send_leaves_on_an_ack_or_a_terminal_failure_and_on_nothing_else() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+
+    // Three offline sends, and then the connection comes back.
+    for index in 0..3u128 {
+        let second = i64::try_from(index).expect("three is far below i64::MAX");
+        begin_send(
+            &mut state,
+            "c_0",
+            &format!("body {index}"),
+            cid(index),
+            at(second),
+        );
+    }
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Connected),
+    );
+
+    // A flush, twice, with everything resolved and nothing retired.
+    assert_eq!(flush_outbox(&state).len(), 3, "the frames are produced");
+    assert_eq!(
+        state.outbox_len(),
+        3,
+        "a successful *resolution* is not an acknowledgement: the bytes left this \
+         process, which is not the same as the server storing the row"
+    );
+    assert_eq!(flush_outbox(&state).len(), 3, "and again");
+    assert_eq!(state.outbox_len(), 3, "still nothing retired");
+
+    // Events that are not the server's answer, and none of them may retire.
+    fire(
+        &mut state,
+        DomainEvent::PresenceUpdated {
+            user_id: "u_ada".to_owned(),
+            status: UserStatus::Online,
+        },
+    );
+    fire(
+        &mut state,
+        DomainEvent::TypingUpdated {
+            channel_id: "c_0".to_owned(),
+            user_id: "u_ada".to_owned(),
+            active: true,
+        },
+    );
+    fire(
+        &mut state,
+        DomainEvent::ResyncRequested {
+            channel_id: "c_0".to_owned(),
+            after: at(0),
+        },
+    );
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Reconnecting { attempt: 1 }),
+    );
+    assert_eq!(
+        state.outbox_len(),
+        3,
+        "unrelated events, and a connection that goes away again, retire nothing"
+    );
+
+    // **The first door: an ACK.**
+    fire(
+        &mut state,
+        DomainEvent::MessageAcked {
+            client_msg_id: cid(0),
+            message: stored("m_0", 0, "c_0", "u_me", "body 0", 0),
+        },
+    );
+    assert_eq!(
+        state.outbox_ids(),
+        vec![cid(1), cid(2)],
+        "the acknowledged send left, and the order of the rest is untouched"
+    );
+
+    // **The second door: a terminal `message.error`.** Every `message.error` on
+    // this protocol is terminal -- there is no retryable code and no backoff hint,
+    // and `retry_send` is the user's gesture for the next attempt.
+    fire(
+        &mut state,
+        DomainEvent::MessageSendFailed {
+            client_msg_id: cid(1),
+            code: "server.refused".to_owned(),
+            detail: String::new(),
+        },
+    );
+    assert_eq!(
+        state.outbox_ids(),
+        vec![cid(2)],
+        "and the refused send left, staying visible as a Failed row"
+    );
+    assert_eq!(state.delivery(&cid(1)), Some(DeliveryState::Failed));
+    assert_eq!(state.message_count("c_0"), 3, "the row is still on screen");
+
+    // And an error for a send this client does not hold retires nothing.
+    fire(
+        &mut state,
+        DomainEvent::MessageSendFailed {
+            client_msg_id: cid(99),
+            code: "server.refused".to_owned(),
+            detail: String::new(),
+        },
+    );
+    assert_eq!(
+        state.outbox_len(),
+        1,
+        "an unknown identity is a refusal, not an exit"
+    );
+
+    // The ACK, and the queue is empty.
+    fire(
+        &mut state,
+        DomainEvent::MessageAcked {
+            client_msg_id: cid(2),
+            message: stored("m_2", 2, "c_0", "u_me", "body 2", 2),
+        },
+    );
+    assert!(
+        state.outbox_len() == 0,
+        "every entry left through one of the two doors"
+    );
+}
+
+/// **At the bound the enqueue is refused, the row reads `Failed`, and the reason
+/// names the bound.**
+///
+/// `AGENTS.md` §7.1 forbids unbounded in-memory state; `PLAN.md` §7's *"failures
+/// are never silently dropped"* forbids answering that by dropping something. **So
+/// the third option is the only one left: refuse, and say so where the user can
+/// read it** — which is `AGENTS.md` §5.2's "clear, actionable error".
+///
+/// **Neither entry is dropped, and that is asserted explicitly.** An implementation
+/// that made room by evicting the oldest queued send would pass every other
+/// assertion here, so the test says which entries survived.
+#[test]
+fn the_outbox_refuses_at_its_bound_and_the_row_says_which_bound() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+
+    for index in 0..MAX_OUTBOX_ENTRIES {
+        let outcome = begin_send(
+            &mut state,
+            "c_0",
+            &format!("queued {index}"),
+            cid(u128::try_from(index).expect("the bound is far below u128::MAX")),
+            at(0),
+        );
+        assert!(
+            matches!(outcome, SendOutcome::Pending { offline: true, .. }),
+            "send {index} of {MAX_OUTBOX_ENTRIES} fits"
+        );
+    }
+    assert_eq!(
+        state.outbox_len(),
+        MAX_OUTBOX_ENTRIES,
+        "the queue is exactly at its bound"
+    );
+    assert!(state.outbox_is_full());
+
+    // One past it.
+    let over = cid(u128::try_from(MAX_OUTBOX_ENTRIES).expect("in range"));
+    let refused = begin_send(&mut state, "c_0", "one too many", over, at(1));
+
+    let SendOutcome::Failed {
+        client_msg_id,
+        reason,
+    } = &refused
+    else {
+        panic!("the row must be visible and failed, got {refused:?}");
+    };
+    assert_eq!(*client_msg_id, over);
+    assert_eq!(
+        reason.code(),
+        "client.outbox_full",
+        "the code names the client, not the server: the server never saw this send"
+    );
+    assert!(
+        reason.detail().contains(&MAX_OUTBOX_ENTRIES.to_string()),
+        "the reason names the bound a user could act on, and it says {:?}",
+        reason.detail()
+    );
+
+    assert_eq!(
+        state.delivery(&over),
+        Some(DeliveryState::Failed),
+        "the row reads Failed, which is what the badge draws"
+    );
+    assert_eq!(
+        state.message("c_0", &over).map(|row| row.content.as_str()),
+        Some("one too many"),
+        "and the user's words are still on screen -- not discarded"
+    );
+    assert!(
+        !state.outbox_holds(&over),
+        "the refused send was not queued, so it is not the queue's problem to solve"
+    );
+
+    // **Neither the oldest nor the newest queued entry went.** This is the half a
+    // "make room by evicting" implementation would fail and nothing else here
+    // would catch.
+    assert_eq!(
+        state.outbox_len(),
+        MAX_OUTBOX_ENTRIES,
+        "the queue is still exactly at its bound: nothing was evicted to make room"
+    );
+    assert!(
+        state.outbox_holds(&cid(0)),
+        "the oldest queued send is still queued -- PLAN.md section 7 forbids \
+         dropping it silently, and the user still believes it is waiting"
+    );
+    assert!(
+        state.outbox_holds(&cid(
+            u128::try_from(MAX_OUTBOX_ENTRIES - 1).expect("in range")
+        )),
+        "and so is the newest one that fitted"
+    );
+
+    // **And the refusal is recoverable, which is what makes it acceptable.** One
+    // acknowledgement makes room; the refused send is then queued by its retry.
+    fire(
+        &mut state,
+        DomainEvent::MessageAcked {
+            client_msg_id: cid(0),
+            message: stored("m_0", 0, "c_0", "u_me", "queued 0", 0),
+        },
+    );
+    assert_eq!(state.outbox_len(), MAX_OUTBOX_ENTRIES - 1);
+    assert!(!state.outbox_is_full());
+    assert_eq!(
+        retry_send(&mut state, over),
+        ApplyOutcome::Applied,
+        "the user's retry is the way out of a full queue"
+    );
+    assert_eq!(state.outbox_len(), MAX_OUTBOX_ENTRIES);
+    assert!(
+        state.outbox_holds(&over),
+        "and it is queued now, at the back"
+    );
+    assert_eq!(state.delivery(&over), Some(DeliveryState::Pending));
+}
+
+/// **However many sends are composed, the bound holds** — and the refusals
+/// accumulate rather than the queue growing.
+///
+/// **A separate test from the one above because the number is the claim.** The
+/// other test pins the *policy* at the boundary; this one walks well past it,
+/// because a check performed once at the boundary is exactly the check a
+/// `>=`/`>` off-by-one survives on the far side. Twenty-two hundred is a little
+/// over twice the bound: enough to show the queue stops at 1024 and the rest of the
+/// sends become visible failures, which is the whole of what §7.1 asks for.
+#[test]
+fn the_outbox_holds_its_bound_however_many_sends_are_composed() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+
+    let attempts = MAX_OUTBOX_ENTRIES + 1_200;
+    let mut queued = 0usize;
+    let mut refused = 0usize;
+    for index in 0..attempts {
+        let identity = cid(u128::try_from(index).expect("far below u128::MAX"));
+        match begin_send(&mut state, "c_0", "body", identity, at(0)) {
+            SendOutcome::Pending { offline: true, .. } => queued += 1,
+            SendOutcome::Failed { .. } => refused += 1,
+            other => panic!("send {index} produced {other:?}"),
+        }
+        assert!(
+            state.outbox_len() <= MAX_OUTBOX_ENTRIES,
+            "the queue grew to {} on attempt {index}, over its bound",
+            state.outbox_len()
+        );
+    }
+
+    assert_eq!(queued, MAX_OUTBOX_ENTRIES, "exactly the bound was taken");
+    assert_eq!(
+        refused,
+        attempts - MAX_OUTBOX_ENTRIES,
+        "and every send past it was refused rather than dropped or queued"
+    );
+    assert_eq!(state.outbox_len(), MAX_OUTBOX_ENTRIES);
+    assert_eq!(
+        state.message_count("c_0"),
+        attempts,
+        "every send is still on screen -- a refused send is a visible failure, not \
+         a discarded message"
+    );
+}
+
+/// **A retry re-queues at the back, and leaves through one of the two doors.**
+///
+/// `PLAN.md` §7 says the flush is in enqueue order, so *where* a retry lands is
+/// part of the contract rather than a detail. **At the front it would be a
+/// starvation bug**: one message the user retries repeatedly would be re-driven
+/// ahead of everything queued behind it, on every reconnect, forever — and this
+/// client's history would be reordered against every other client's.
+///
+/// **The three-entry queue is the shape that makes the assertion sharp.** With one
+/// or two entries, "at the back" and "in the queue" are the same claim.
+#[test]
+fn a_retry_requeues_at_the_back_and_leaves_on_an_ack_or_a_failure() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+
+    // Three offline sends; the middle one fails terminally, so it leaves the
+    // queue while staying visible -- which is `PLAN.md` §7's fourth bullet.
+    begin_send(&mut state, "c_0", "first", cid(0), at(0));
+    begin_send(&mut state, "c_0", "second", cid(1), at(1));
+    begin_send(&mut state, "c_0", "third", cid(2), at(2));
+    fire(
+        &mut state,
+        DomainEvent::MessageSendFailed {
+            client_msg_id: cid(1),
+            code: "server.refused".to_owned(),
+            detail: String::new(),
+        },
+    );
+    assert_eq!(state.outbox_ids(), vec![cid(0), cid(2)]);
+
+    assert_eq!(retry_send(&mut state, cid(1)), ApplyOutcome::Applied);
+    assert_eq!(
+        state.outbox_ids(),
+        vec![cid(0), cid(2), cid(1)],
+        "the retry goes to the BACK: PLAN.md section 7's order is enqueue order, and \
+         a retry at the front would let one repeatedly-retried message starve \
+         everything queued behind it"
+    );
+    assert_eq!(
+        state.delivery(&cid(1)),
+        Some(DeliveryState::Pending),
+        "and the row is back in flight"
+    );
+    assert_eq!(
+        state
+            .message("c_0", &cid(1))
+            .map(|row| row.content.as_str()),
+        Some("second"),
+        "with its text and its place intact -- a retry is the same send"
+    );
+    assert_eq!(
+        state.failure(&cid(1)),
+        None,
+        "and its stale reason retired with the state change"
+    );
+
+    // **A second retry does not queue it twice.** One message on the wire twice per
+    // flush would be the queue's own version of a duplicated transcript.
+    fire(
+        &mut state,
+        DomainEvent::MessageSendFailed {
+            client_msg_id: cid(1),
+            code: "server.refused".to_owned(),
+            detail: String::new(),
+        },
+    );
+    assert_eq!(retry_send(&mut state, cid(1)), ApplyOutcome::Applied);
+    assert_eq!(
+        state.outbox_ids(),
+        vec![cid(0), cid(2), cid(1)],
+        "one entry per identity, however many times the user asks"
+    );
+
+    // **It leaves through the terminal failure**...
+    fire(
+        &mut state,
+        DomainEvent::MessageSendFailed {
+            client_msg_id: cid(2),
+            code: "server.refused".to_owned(),
+            detail: String::new(),
+        },
+    );
+    assert_eq!(state.outbox_ids(), vec![cid(0), cid(1)]);
+    // **...and through an acknowledgement.** Both doors, on the same queue, is the
+    // claim of criterion 5 and neither half is checkable without the other.
+    fire(
+        &mut state,
+        DomainEvent::MessageAcked {
+            client_msg_id: cid(1),
+            message: stored("m_1", 1, "c_0", "u_me", "second", 1),
+        },
+    );
+    assert_eq!(state.outbox_ids(), vec![cid(0)]);
+    fire(
+        &mut state,
+        DomainEvent::MessageAcked {
+            client_msg_id: cid(0),
+            message: stored("m_0", 0, "c_0", "u_me", "first", 0),
+        },
+    );
+    assert!(state.outbox_len() == 0);
+    assert_eq!(
+        flush_outbox(&state).len(),
+        0,
+        "and there is nothing left to drive"
+    );
+}
+
+/// **A retry at a full queue is refused, and the row stays `Failed`.**
+///
+/// **The negative half of the bound, and it is the half that could have been got
+/// wrong quietly.** Promoting the row to `Pending` first and asking the outbox
+/// afterwards would leave a row on screen reading `sending…` with nothing behind
+/// it — a lie the user waits on, and `AGENTS.md` §5.2's "clear, actionable error"
+/// is written against exactly that.
+#[test]
+fn a_retry_at_a_full_queue_is_refused_and_the_row_stays_failed() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+
+    for index in 0..MAX_OUTBOX_ENTRIES {
+        begin_send(
+            &mut state,
+            "c_0",
+            "queued",
+            cid(u128::try_from(index).expect("far below u128::MAX")),
+            at(0),
+        );
+    }
+    // The one send that was refused at the bound, and so was never queued.
+    let refused = cid(u128::try_from(MAX_OUTBOX_ENTRIES).expect("in range"));
+    let SendOutcome::Failed { .. } = begin_send(&mut state, "c_0", "one too many", refused, at(1))
+    else {
+        panic!("the bound was reached, so this send must be refused");
+    };
+
+    assert_eq!(
+        retry_send(&mut state, refused),
+        ApplyOutcome::Ignored(IgnoreReason::OutboxFull {
+            client_msg_id: refused
+        }),
+        "the refusal names the bound rather than reporting a bare false"
+    );
+    assert_eq!(
+        state.delivery(&refused),
+        Some(DeliveryState::Failed),
+        "and the row did not move to Pending: a send with nothing queued behind it \
+         must not read as in flight"
+    );
+    assert!(!state.outbox_holds(&refused), "still not queued");
+}
+
+/// **A discard retires nothing, because a queued send is never a `Failed` one —
+/// and the two are separated on purpose.**
+///
+/// The outbox holds identities, which is only safe because every row a queued
+/// send lives in is one eviction skips. **This test pins that separation, because
+/// it is what makes the discard safe at all.** Every path out of the queue is tied
+/// to the transition that justifies it, and there is exactly one ordering of the
+/// two facts:
+///
+/// | | queued? | why |
+/// |---|---|---|
+/// | an offline send | yes, `Pending` | the connection cannot carry it |
+/// | a retry | yes, `Pending` | `retry_send` re-queues and moves the row to `Pending` in that order |
+/// | a terminal `message.error` | **no** | `fail_send` retires the entry *before* setting `Failed` |
+/// | a capacity refusal | **no** | it was never queued |
+///
+/// **So a `Failed` row is never queued, and the discard — which requires
+/// `Failed` — can never meet an entry.** That is what the first assertion says,
+/// and it is the answer to "what happens if a queued send's row is deleted":
+/// it cannot be reached, by construction rather than by a check.
+///
+/// **What the test then asserts is the direction that *could* have been got wrong
+/// quietly.** An implementation that cleared the whole queue on any row removal, or
+/// that let the discard's dequeue reach the wrong identity, would leave the
+/// surviving entry gone — a queued send silently dropped, which is the exact
+/// failure `PLAN.md` §7 is written against. `state/actions.rs` keeps a
+/// `dequeue_outbox` in `discard_failed_send` as defence for the invariant; this is
+/// the test that says the defence does not fire.
+///
+/// `discard_failed_send` is unreachable from the UI — work unit 3D decided that and
+/// `tests/layer_boundary.rs` enforces it — so this is the only place the
+/// interaction is exercised at all.
+#[test]
+fn a_discard_retires_nothing_because_a_failed_send_is_never_queued() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+
+    // Two offline sends, so one is queued and one is discarded.
+    begin_send(&mut state, "c_0", "survivor", cid(0), at(0));
+    begin_send(&mut state, "c_0", "doomed", cid(1), at(1));
+    assert_eq!(state.outbox_ids(), vec![cid(0), cid(1)]);
+
+    fire(
+        &mut state,
+        DomainEvent::MessageSendFailed {
+            client_msg_id: cid(1),
+            code: "server.refused".to_owned(),
+            detail: String::new(),
+        },
+    );
+    assert_eq!(
+        state.outbox_ids(),
+        vec![cid(0)],
+        "the terminal failure retired its own entry, before the row became Failed"
+    );
+    assert_eq!(state.delivery(&cid(1)), Some(DeliveryState::Failed));
+
+    // And a retried one goes back to `Pending`, never to `Failed`-and-queued.
+    assert_eq!(retry_send(&mut state, cid(1)), ApplyOutcome::Applied);
+    assert_eq!(state.outbox_ids(), vec![cid(0), cid(1)]);
+    fire(
+        &mut state,
+        DomainEvent::MessageSendFailed {
+            client_msg_id: cid(1),
+            code: "server.refused".to_owned(),
+            detail: String::new(),
+        },
+    );
+    assert_eq!(state.outbox_ids(), vec![cid(0)]);
+
+    assert_eq!(
+        discard_failed_send(&mut state, cid(1)),
+        ApplyOutcome::Applied
+    );
+    assert!(
+        state.outbox_holds(&cid(0)),
+        "the surviving entry is untouched: a discard removes exactly one row, and \
+         its retirement reached nothing else"
+    );
+    assert!(
+        !state.outbox_holds(&cid(1)),
+        "and the discarded identity is not queued -- it was already retired by the \
+         failure, which is why the dequeue in discard is defence and not a path"
+    );
+    assert!(
+        flush_outbox(&state)
+            .iter()
+            .all(|send| send.client_msg_id() != cid(1)),
+        "so no flush can produce a frame for a message that no longer exists"
+    );
+}
+
+/// **A resync echo retires the entry, because a real server id *is* the server
+/// saying it stored the row.**
+///
+/// **This door was not in the original design, and the proptest is what found its
+/// absence** — it reported a queued identity sitting on an `Acked` row. A row that
+/// has been reconciled against the server's stored copy is a message the client can
+/// *see* the server has, so an entry left behind would be re-driven on every
+/// reconnect forever, against a queue nothing else retires.
+///
+/// **The event is a `message.new`, not a `message.ack`, and that distinction is the
+/// whole reason this test exists**: a reader looking only at `acknowledge` would not
+/// believe the queue has a third door.
+#[test]
+fn a_resync_echo_of_a_queued_send_retires_its_entry() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+
+    begin_send(&mut state, "c_0", "queued offline", cid(0), at(0));
+    begin_send(&mut state, "c_0", "also queued", cid(1), at(1));
+    assert_eq!(state.outbox_len(), 2);
+
+    // A live `message.new` for one of them, carrying the server's stored copy.
+    // `core/models/events.rs` says a resync echo and a live delivery are "the same
+    // situation from the client's point of view", and this is that door.
+    fire(
+        &mut state,
+        DomainEvent::MessageReceived(stored("m_0", 0, "c_0", "u_me", "queued offline", 0)),
+    );
+
+    assert_eq!(
+        state.delivery(&cid(0)),
+        Some(DeliveryState::Acked),
+        "the row is reconciled against the server's copy"
+    );
+    assert_eq!(
+        state.outbox_ids(),
+        vec![cid(1)],
+        "and its entry is retired: the client now holds the server's stored row, so \
+         re-driving it would transmit something whose fate is already decided"
+    );
+    assert!(
+        state.outbox_holds(&cid(1)),
+        "and the untouched entry is still queued"
+    );
+}
+
+/// **A queued send is never evicted by the history bound, at any distance.**
+///
+/// `AppState::oldest_candidate` skipping `Pending` and `Failed` rows is what makes
+/// an outbox of identities safe rather than a dangling list. The unit test below
+/// covers the immediate case; this one fills the channel past its cap *with the
+/// queued send at the front*, which is the arrangement that would expose a scan
+/// that stopped early.
+#[test]
+fn a_queued_send_at_the_head_is_never_the_row_eviction_takes() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+
+    // The queued send goes in first, so it sits at the head of the channel's order
+    // for as long as nothing newer arrives.
+    begin_send(&mut state, "c_0", "queued and oldest", cid(0), at(0));
+    assert!(
+        state.outbox_holds(&cid(0)),
+        "the send is queued, so it is offline by construction"
+    );
+
+    // Push the channel past its cap with ordinary history.
+    for index in 1..=MAX_MESSAGES_PER_CHANNEL {
+        fire(
+            &mut state,
+            DomainEvent::MessageReceived(stored(
+                &format!("m_{index}"),
+                u128::try_from(index).expect("far below u128::MAX") + 10_000,
+                "c_0",
+                "u_ada",
+                "history",
+                0,
+            )),
+        );
+    }
+
+    assert!(
+        state.message_count("c_0") <= MAX_MESSAGES_PER_CHANNEL,
+        "the channel is at its cap, and the cap held"
+    );
+    assert!(
+        state.message("c_0", &cid(0)).is_some(),
+        "the queued send is still on screen: eviction skips every row the client \
+         is still waiting on, which is what lets the outbox hold identities"
+    );
+    assert!(
+        state.outbox_holds(&cid(0)),
+        "so its entry still names something"
+    );
+
+    // The connection returns, and the flush resolves the entry to the right body.
+    // **The reconnect is here and not at the top of the test** because the send had
+    // to be composed *offline* to be queued at all, and `flush_outbox` is gated on
+    // `can_send`.
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Connected),
+    );
+    assert_eq!(
+        flush_outbox(&state)
+            .iter()
+            .find(|send| send.client_msg_id() == cid(0))
+            .map(|send| send.content()),
+        Some("queued and oldest"),
+        "so a flush can still transmit it, and reads the body from the held row"
+    );
+}
+
 /// The universe the generated sequences draw from.
 ///
 /// **Small enough to reason about and to enumerate, wide enough to hit every
@@ -3580,6 +4478,12 @@ fn perform(state: &mut AppState, step: &Step) -> ApplyOutcome {
             );
             match outcome {
                 SendOutcome::Pending { .. } => ApplyOutcome::Applied,
+                // **A row created and failed at the outbox bound is still a row.**
+                // This arm is unreachable from this alphabet -- six identities
+                // against a 1024 bound -- and it is here because the match has to
+                // be total; mapping it as `Applied` says what is true of it, which
+                // is that the send produced a held, tracked row.
+                SendOutcome::Failed { .. } => ApplyOutcome::Applied,
                 SendOutcome::Ignored(reason) => ApplyOutcome::Ignored(reason),
             }
         }
@@ -3768,19 +4672,35 @@ fn assert_internally_consistent(state: &AppState, retried: &BTreeSet<Uuid>, at_s
             );
 
             // THE convention: an empty id means the server has not accepted it,
-            // so the row is one of this client's sends and is pending.
+            // so the row is one of this client's sends, and the client is still
+            // waiting on the server about it.
+            //
+            // **`Pending` OR `Failed`, and the second case is not a relaxation.**
+            // A `Failed` row with no server id is the outbox's capacity refusal
+            // (`actions::begin_send`), and the server has indeed not accepted it.
+            // The assertion that is still absolute is the one below: it is *this
+            // client's* send, tracked in the delivery map.
             if message.id.is_empty() {
-                assert_eq!(
-                    state.delivery(&message.client_msg_id),
-                    Some(DeliveryState::Pending),
-                    "{where_}: a held message with no server id is not tracked as pending"
-                );
                 assert!(
-                    state
-                        .pending_sends()
-                        .contains(&(channel_id.as_str(), message.client_msg_id)),
-                    "{where_}: and it is not listed among the pending sends"
+                    matches!(
+                        state.delivery(&message.client_msg_id),
+                        Some(DeliveryState::Pending | DeliveryState::Failed)
+                    ),
+                    "{where_}: a held message with no server id is neither pending \
+                     nor failed, so nothing is tracking this client's send"
                 );
+                // **And `pending_sends` lists only the `Pending` half**, by
+                // definition -- it is a query about rows awaiting transmission,
+                // and a `Failed` row is not one. Listing both would make the
+                // accessor's name wrong.
+                if state.delivery(&message.client_msg_id) == Some(DeliveryState::Pending) {
+                    assert!(
+                        state
+                            .pending_sends()
+                            .contains(&(channel_id.as_str(), message.client_msg_id)),
+                        "{where_}: and it is not listed among the pending sends"
+                    );
+                }
             } else if let Some(DeliveryState::Pending) = state.delivery(&message.client_msg_id) {
                 assert!(
                     retried.contains(&message.client_msg_id),
@@ -3857,6 +4777,59 @@ fn assert_internally_consistent(state: &AppState, retried: &BTreeSet<Uuid>, at_s
             unique.len(),
             typing.len(),
             "{where_}: the typing set for {channel_id} holds a duplicate"
+        );
+    }
+
+    // The outbox, checked on every step of the whole alphabet rather than only at
+    // the end of a sequence -- and **three claims, because the queue's whole
+    // safety rests on the weakest one.**
+    //
+    // 1. **The bound holds.** `AGENTS.md` §7.1; see `MAX_OUTBOX_ENTRIES` for why
+    //    the refusal is the other half of that claim.
+    // 2. **No identity is queued twice.** A duplicate entry would put one message
+    //    on the wire twice per flush for as long as it sat there.
+    // 3. **Every entry names a held row that is `Pending`.** This is the
+    //    load-bearing one, and it is stated as `Pending` alone rather than as
+    //    "not `Acked`" because it is two claims at once. It is what lets the
+    //    outbox hold *identities* instead of copies of the content, since
+    //    eviction skips exactly those rows; and it says the queue holds only sends
+    //    this client is *still waiting on* -- never one it can already see stored,
+    //    and never one the server refused terminally.
+    //
+    // **The property earned the `Acked` half of this rather than assuming it.**
+    // The first version accepted `Pending | Failed`, and the very first run
+    // reported a queued identity sitting on an `Acked` row: a resync echo of a
+    // queued send upgrades the delivery state through `ingest` and had left the
+    // entry behind. A queue entry on a stored row is re-driven on every reconnect
+    // forever, so the loose version of this invariant was hiding a leak and the
+    // tight one is what closes it.
+    //
+    // **A discard, a terminal failure, a retry and a resync echo are four paths
+    // that could disagree about the queue**, and only an arbitrary *order* of them
+    // reaches the sequence where they do.
+    let queued = state.outbox_ids();
+    assert!(
+        queued.len() <= MAX_OUTBOX_ENTRIES,
+        "{where_}: the outbox holds {} entries, over its bound of {MAX_OUTBOX_ENTRIES}",
+        queued.len()
+    );
+    let distinct: BTreeSet<Uuid> = queued.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        queued.len(),
+        "{where_}: the outbox queues one identity more than once"
+    );
+    for client_msg_id in &queued {
+        let channel_id = state.channel_holding(client_msg_id).unwrap_or_else(|| {
+            panic!("{where_}: the outbox queues {client_msg_id}, which is held nowhere")
+        });
+        assert_eq!(
+            state.delivery(client_msg_id),
+            Some(DeliveryState::Pending),
+            "{where_}: the outbox queues {client_msg_id} in {channel_id}, and the \
+             client is not waiting on the server about it -- so either eviction may \
+             take the row, or the flush is re-driving a send whose fate is already \
+             decided"
         );
     }
 }
