@@ -241,14 +241,37 @@ async fn every_other_connected_client_receives_every_message() {
         "first",
         "bob must hear the message he did not send"
     );
-    assert_eq!(
+
+    // **Carol's two messages are compared as a set, and that is the whole fix.**
+    //
+    // This assertion used to demand `"first"` and then `"second"`, in that order,
+    // and CI rejected it: `left: "second", right: "first"`, in 1.16s -- a fast
+    // runner, so not a slow-machine timeout but an ordering race that happens to
+    // land the other way roughly once in twenty runs.
+    //
+    // The order simply is not a property this server has. `send_text` returns once
+    // the frame is written to the socket, which says nothing about when the server
+    // runs `accept_message` for it, so alice's and bob's messages are accepted by two
+    // independent connection tasks and can complete in either order. Carol receives
+    // both broadcasts in *acceptance* order -- and acceptance order is exactly what
+    // is not knowable from the test. Only carol asserts an order at all, because a
+    // sender's own message never reaches it, leaving every sender with exactly one
+    // delivery and therefore nothing to order.
+    //
+    // The test still proves what it exists to prove: both messages reached a third
+    // party, and neither was duplicated or dropped. Total order across concurrent
+    // connections is deliberately not the server's job -- it is the client's, in
+    // `core::ordering`, which sorts by `(accepted_at, id)` and drops what it has
+    // already seen. Asserting a global order here asserted the absence of that layer.
+    let mut carol_heard = vec![
         body_of(&mut carol, "carol's first message.new").await,
-        "first",
-        "a client that sent nothing hears every message, in acceptance order"
-    );
-    assert_eq!(
         body_of(&mut carol, "carol's second message.new").await,
-        "second"
+    ];
+    carol_heard.sort_unstable();
+    assert_eq!(
+        carol_heard,
+        vec!["first", "second"],
+        "a client that sent nothing hears both messages exactly once, in any order"
     );
 
     // And nobody heard a third thing: exactly one message.new each for the two
