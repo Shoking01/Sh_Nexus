@@ -27,6 +27,27 @@ path = "src/lib.rs"
 # is the connection settings in `app.rs`.
 tracing = { workspace = true }
 
+# tracing-subscriber: the other half of the entry above, and the reason a
+# `tracing::error!` is a log line rather than a no-op. `tracing` is a facade; with
+# no subscriber installed every event it is handed is dropped on the floor, so
+# `app.rs`'s two `tracing::error!` calls on the startup path — "the client has no
+# socket", "the connection settings are incomplete" — reached nobody at all.
+#
+# NOT a new dependency. `Cargo.toml:263` of the workspace root already pins
+# `tracing-subscriber = { version = "0.3", features = ["env-filter"] }` for
+# `sh_nexus_server`, with the 7.2 audit written out in the comment above it: MIT
+# OR Apache-2.0, the Rust logging standard, already in `Cargo.lock` and already
+# compiled into this workspace's build graph. This line names a workspace member;
+# it adds no crate, no licence to review and no compile unit to the workspace as a
+# whole — the same argument the `tracing` line above makes about its own first
+# use, and the same one `futures-util` makes below.
+#
+# `env-filter` is what makes `RUST_LOG` work, and it is not optional here:
+# `AGENTS.md` 7.5 says "in release builds, the minimum level must be info (set via
+# RUST_LOG or config)", which is a statement about a *filter* rather than about a
+# subscriber. The feature was already declared workspace-wide for that reason.
+tracing-subscriber = { workspace = true }
+
 # gpui: platform-agnostic core of Zed's UI framework. Apache-2.0. Pinned to a
 # `rev` rather than a semver range because the git channel expresses no
 # version guarantee and every upstream sync must be a deliberate review, not a

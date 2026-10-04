@@ -30,6 +30,9 @@
 //! | **The composer's frame actually reaches the transport's outbound queue** | [`begin_send_puts_the_frame_on_the_wire_when_a_transport_is_published`] | runtime, three-way contrast, no server |
 //! | Escape hands focus to the shell and does **not** fire its gesture | [`escape_hands_focus_to_the_shell_without_returning_the_list_to_the_tail`] | runtime, negative |
 //! | The draft is bounded, by a constant that already exists | [`the_draft_is_bounded_by_the_message_ceiling`] | runtime + parsed constant |
+//! | **A healthy connection renders no banner element at all** | [`a_connected_client_renders_no_banner_at_all`] | runtime, negative |
+//! | Each unhealthy state renders its own words and its own colour | [`each_unhealthy_connection_renders_its_own_words`] | runtime + the view's own answer |
+//! | **No banner when no connection was ever attempted** | [`no_banner_is_rendered_when_no_connection_was_attempted`] | runtime, negative |
 //!
 //! # The composer tests are the ones that could pass for the wrong reason
 //!
@@ -90,11 +93,11 @@ use gpui::{px, Entity, EntityInputHandler, Focusable, TestAppContext, VisualTest
 use rstest::rstest;
 use sh_nexus::app::{self, ConnectionSettings, Shell, DRAIN_INTERVAL, STARTUP_CHANNEL};
 use sh_nexus::core::markdown::MAX_MESSAGE_BYTES;
-use sh_nexus::core::models::events::DomainEvent;
+use sh_nexus::core::models::events::{ConnectionState, DomainEvent};
 use sh_nexus::core::models::message::Message;
 use sh_nexus::core::theme::BuiltIn;
 use sh_nexus::state::bridge::{self, Delivery, EventSender};
-use sh_nexus::state::DeliveryState;
+use sh_nexus::state::{ApplyOutcome, DeliveryState};
 use sh_nexus::ui::Colors;
 use sh_nexus::UNSIGNED_IN_USER;
 use smallvec::SmallVec;
@@ -1761,5 +1764,274 @@ fn the_shell_window_is_chat_sized() {
         "the shell's window must be chat-sized: rows per frame scale with viewport \
          height, so a spike-sized window publishes a number that says nothing \
          about a chat client"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Connection visibility
+// ---------------------------------------------------------------------------
+
+/// The banner's own answers about a state, read through the view rather than
+/// rebuilt by the test.
+///
+/// **`use`d rather than spelled out per call so the test asserts the production
+/// decision.** A test that rebuilt the `match` to check the `match` is a test of
+/// the reimplementation — the mistake
+/// `ui_markdown_blocks.rs::a_truncated_message_renders_a_notice_rather_than_losing_its_tail`
+/// documents at length, where an earlier version of it inlined the notice and would
+/// have passed even if `document()` had stopped rendering one.
+use sh_nexus::ui::views::connection_banner::announcement;
+
+/// The selector the banner records its bounds under.
+///
+/// **Imported from the view rather than spelled as a literal, for the reason
+/// `message_row.rs` gives about static selectors:** a test that hard-coded the
+/// string would keep passing if the view renamed it, and would then be asserting
+/// about an element nobody draws.
+const BANNER: &str = sh_nexus::ui::views::connection_banner::SELECTOR;
+
+/// Starts the dead-endpoint socket the banner's *presence* rule needs.
+///
+/// **A transport is started, and the state is never left to the worker, because
+/// those are two different fixtures.** Presence is answered by
+/// `Shell::transport` — *a connection was attempted* — and content is answered by
+/// the state's `ConnectionState`. This helper buys only the first: without a
+/// transport the shell draws nothing connection-shaped at all, which is the
+/// documented offline shell rather than a failure ([`DEAD_ENDPOINT`]'s
+/// neighbourhood and `ConnectionSettings::from_env`). Content is then stated
+/// explicitly by [`connection_is`], so no assertion in this section depends on
+/// what a worker thread happened to publish or when.
+fn with_a_transport(cx: &mut VisualTestContext, shell: &Entity<Shell>) {
+    let settings = ConnectionSettings::from_parts_for_test(DEAD_ENDPOINT, NO_TOKEN);
+    shell
+        .update(cx, |shell, cx| shell.start_transport(&settings, cx))
+        .expect("starting a worker thread is not a network operation");
+
+    assert!(
+        shell.read_with(cx, |shell, _| shell.transport().is_some()),
+        "the fixture must have started a socket: without one the shell draws no \
+         banner whatever the state says, and every test below would pass for the \
+         wrong reason"
+    );
+}
+
+/// States `state` on the seam and asks for the frame that shows it.
+///
+/// **Through `bridge::try_apply_event` and not the inbox, and the reason is that
+/// the fixture must not race a worker thread.** `WsTransport`'s worker publishes
+/// `Connecting`, then `Reconnecting { attempt }` for every retry, into the very
+/// same inbox the shell's pump drains — so a test that queued its own event and
+/// ticked could have the worker's event applied after it and assert against a
+/// state it never set. This door applies the event synchronously through
+/// [`actions::apply_event`](sh_nexus::state::actions::apply_event), which is the
+/// same production seam `MessageList::enqueue` uses when it turns a refused
+/// outbound frame into a failed send.
+///
+/// **The `cx.notify()` afterwards is load-bearing rather than tidy.** No seam door
+/// schedules a frame — `bridge::drain`'s own module docs, §6, assign that to the
+/// caller — so a state changed here would sit in the state while the last painted
+/// frame still showed the previous word. The notify is what makes the assertion
+/// below about something a user could see rather than about a value in a struct.
+/// `ui_message_list.rs`'s `a_click_that_arrives_after_the_ack_does_nothing` asks for
+/// its frame the same way.
+fn connection_is(cx: &mut VisualTestContext, shell: &Entity<Shell>, state: ConnectionState) {
+    shell.update_in(cx, |_shell, _window, cx| {
+        assert_eq!(
+            bridge::try_apply_event(cx, DomainEvent::ConnectionStateChanged(state)),
+            Some(ApplyOutcome::Applied),
+            "a connection state is not something the state may refuse to hear: \
+             `actions::apply_event` applies it unconditionally, and a fixture that \
+             was quietly dropped would make every assertion below vacuous"
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+/// A healthy client draws no banner element at all.
+///
+/// **The negative assertion is the design, and this is the only test that can
+/// enforce it.** `ConnectionState::Connected` is the state a user is in almost all
+/// the time, so a banner for it would be a permanent distraction occupying the gap
+/// between the log and the composer. `tests/ui_markdown_blocks.rs`'s pair
+/// (`a_truncated_message_renders_a_notice_rather_than_losing_its_tail` /
+/// `an_ordinary_message_renders_no_truncation_notice`) is the same shape: the
+/// positive half alone cannot tell a selective notice from a constant one.
+#[gpui::test]
+fn a_connected_client_renders_no_banner_at_all(cx: &mut TestAppContext) {
+    let (shell, cx) = shell(cx);
+    with_a_transport(cx, &shell);
+
+    connection_is(cx, &shell, ConnectionState::Connected);
+
+    assert!(
+        cx.debug_bounds(BANNER).is_none(),
+        "a connected client must paint no `{BANNER}` element whatsoever — not an \
+         empty one, not a zero-height one. A banner for the healthy state is a \
+         permanent distraction, and it is the state a user spends their day in"
+    );
+}
+
+/// Each unhealthy state renders its own words and its own colour.
+///
+/// **One loop over all four rather than four tests, and the reason is that the
+/// claim is comparative.** "The banner says something when it is not connected" is
+/// satisfied by one hard-coded string, and so is "each state names itself" if only
+/// one of them is ever checked. The four are asserted against each other in one
+/// place so that a `match` with a single arm for everything but `Rejected` cannot
+/// pass.
+///
+/// **The words come from [`ConnectionBanner::announcement`], and the element from
+/// the painted frame, and both are asserted.** Reading only the view would pass
+/// with the view wired into nothing; reading only the bounds would pass with any
+/// text at all. `ui_message_list.rs` asserts the palette the same two ways — the
+/// row's own accessor for the value, `debug_bounds` for the paint.
+///
+/// **The colour is half the claim.** `AGENTS.md` §7.3 is a rule about the colour a
+/// text element draws with, and a banner that said `Reconnecting (attempt 4)…` in
+/// `danger` would report a failure that has not happened: retrying is progress,
+/// and `accent` is the palette's interactive colour — the same one the retry badge
+/// uses ([`MessageRow`](sh_nexus::ui::views::message_row::MessageRow)'s
+/// `RETRY_LABEL`). Only `Rejected` is `danger`, and `Rejected` is the only state
+/// the enum documents as terminal.
+#[gpui::test]
+fn each_unhealthy_connection_renders_its_own_words(cx: &mut TestAppContext) {
+    /// The four states that are not healthy, with the words and the colour each
+    /// must draw.
+    ///
+    /// `Rejected`'s `detail` is a sentence no test in this project can predict,
+    /// so it is written here as the kind of thing a *server* says and asserted
+    /// against the state this section is about.
+    const THE_SERVER_SAID: &str = "this client speaks protocol 2, and this server speaks 1";
+    const THE_SERVERS_CODE: &str = "version.unsupported";
+
+    let colors = app::theme_colors();
+    let cases = [
+        (
+            ConnectionState::Disconnected,
+            "Disconnected".to_owned(),
+            colors.text_muted,
+        ),
+        (
+            ConnectionState::Connecting,
+            "Connecting\u{2026}".to_owned(),
+            colors.accent,
+        ),
+        (
+            ConnectionState::Reconnecting { attempt: 4 },
+            "Reconnecting (attempt 4)\u{2026}".to_owned(),
+            colors.accent,
+        ),
+        (
+            ConnectionState::Rejected {
+                code: THE_SERVERS_CODE.to_owned(),
+                detail: THE_SERVER_SAID.to_owned(),
+            },
+            format!("{THE_SERVER_SAID} ({THE_SERVERS_CODE})"),
+            colors.danger,
+        ),
+    ];
+
+    let (shell, cx) = shell(cx);
+    with_a_transport(cx, &shell);
+
+    for (state, expected, expected_color) in cases {
+        connection_is(cx, &shell, state.clone());
+
+        // The paint first, because that is what a user would see; the view's own
+        // answer second, because that is how this section knows *what* it is
+        // painting. Asserted in this order so a failure names the missing half.
+        let painted = cx
+            .debug_bounds(BANNER)
+            .unwrap_or_else(|| panic!("{state:?} must paint a `{BANNER}` element"));
+        assert!(
+            painted.size.height > px(0.),
+            "{state:?}: the banner must be laid out, not merely built, got {painted:?}"
+        );
+
+        let announced = announcement(&state, colors)
+            .unwrap_or_else(|| panic!("{state:?} is not connected, so it must say so"));
+
+        assert_eq!(
+            announced.text, expected,
+            "each state must name itself: a banner that read the same word for \
+             {state:?} would leave a user unable to tell waiting from failing"
+        );
+        assert_eq!(
+            announced.color, expected_color,
+            "{state:?} must draw in the palette's colour for what it means, and \
+             AGENTS.md 7.3 is a rule about the colour a text element draws with"
+        );
+    }
+
+    // And the last of the four is the one that must speak the server's words
+    // rather than a string of its own. Asserted after the loop rather than inside
+    // it because it is a claim about *whose* text, not about which text: it is the
+    // difference between a user who can act on the banner and one who is told
+    // "the connection failed" with nothing to do about it, which is the failure
+    // `ConnectionState::Rejected`'s own documentation calls unactionable and
+    // `AGENTS.md` §5.2's "clear, actionable error" is written against.
+    let rejected = ConnectionState::Rejected {
+        code: THE_SERVERS_CODE.to_owned(),
+        detail: THE_SERVER_SAID.to_owned(),
+    };
+    let text = announcement(&rejected, colors)
+        .expect("a rejection is not connected, so it must say so")
+        .text;
+    assert!(
+        text.contains(THE_SERVER_SAID),
+        "the banner must carry the server's own detail, got {text:?}"
+    );
+    assert!(
+        text.contains(THE_SERVERS_CODE),
+        "and the machine-readable code beside it, so a user can quote something \
+         actionable rather than a paraphrase, got {text:?}"
+    );
+}
+
+/// A shell that never attempted a connection draws no banner, even though the
+/// state would have something to say.
+///
+/// **This is the test that keeps presence and content from being merged.** The
+/// state is `Disconnected` here and the transport is `None`, and
+/// [`ConnectionBanner::announcement`] has a word for exactly that state — so the
+/// only thing stopping a banner is `Shell::transport`. A client launched with no
+/// `SH_NEXUS_URL` is in local mode **by design**
+/// ([`ConnectionSettings::from_env`](sh_nexus::app::ConnectionSettings::from_env)
+/// treats both variables absent as offline, not as a misconfiguration), and a red
+/// failure banner on that window forever would be noise about a choice the user
+/// made. `app::open`'s `Ok(None)` arm says *"not an error, and not a banner — there
+/// is no connection to describe"*.
+///
+/// **So the two halves are asserted in the order that makes the failure legible:**
+/// first that the content exists, then that nothing is painted. Without the first,
+/// this would pass for any shell that drew no banner at all.
+#[gpui::test]
+fn no_banner_is_rendered_when_no_connection_was_attempted(cx: &mut TestAppContext) {
+    let colors = app::theme_colors();
+    let (shell, cx) = shell(cx);
+
+    assert!(
+        shell.read_with(cx, |shell, _| shell.transport().is_none()),
+        "this fixture must never start a transport: `Shell::new` publishes none, and \
+         a shell that had one would draw a banner whatever the state said"
+    );
+
+    let announced = announcement(&ConnectionState::Disconnected, colors).expect(
+        "`Disconnected` is a state worth reporting — the fixture is what the \
+                 state alone would have drawn",
+    );
+    assert_eq!(
+        announced.text, "Disconnected",
+        "the content side of the rule is live here, which is what makes the missing \
+         element below a decision rather than an accident"
+    );
+
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds(BANNER).is_none(),
+        "a client with no configured server is offline by design and must draw no \
+         failure banner: there is no connection to describe, and a permanent red \
+         strip would be an apology for a choice the user made"
     );
 }

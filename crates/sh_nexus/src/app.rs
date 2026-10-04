@@ -117,7 +117,7 @@
 //! |---|---|
 //! | the channel rail | `actions::set_channels` has zero callers because no `DomainEvent` carries a channel list (`bridge.rs` §5), so a rail would render zero channels, permanently |
 //! | thread panel, search, editing | `docs/ARCHITECTURE.md` ADR-006 places them outside this work |
-//! | a `tracing::error!` for a failed open | `errors.rs` assigns this file a source-chain log, `tracing` is not in the workspace, and §7.2's approval process is not this unit's business |
+//! | a log line carrying the source chain of a failed open | `errors.rs` assigns this file one, and `main.rs` now has a subscriber to receive it — but a GPUI `anyhow::Error`'s chain is a foreign type and `errors.rs` rule 1 forbids the `From<anyhow::Error>` that would name it, so the reduction below is the half that can be honoured without a new error variant |
 //!
 //! **The composer is not listed among the missing things any more, because
 //! `AGENTS.md` §3.2's rule is that a module that exists and does nothing reads
@@ -126,10 +126,23 @@
 //! draft of this file that first composed the list, and the input-bar work unit
 //! deleted it for exactly that reason.
 //!
-//! **And the shell is silent, which is `AGENTS.md` §7.1's ban on `println!`
-//! arriving as a consequence rather than as a preference.** There is no sanctioned
-//! logger in this crate yet, so a failure here is reported by a returned error
-//! and by `main.rs`'s `eprintln!`, and by nothing else.
+//! # 6. What the user sees about the connection, and where
+//!
+//! **One line, between the log and the composer, and it is a view rather than a
+//! branch of this file** for the reason §5 gives: a second place to answer "what
+//! does the connection look like" is the audit trail. It is
+//! [`crate::ui::views::connection_banner`], and the one thing this file owns about
+//! it is **whether there is one**: [`Self::transport`] says whether a connection was
+//! ever attempted, which is a question about this shell and not about the state.
+//! `ui/` is not permitted to reach for the shell's field, and the seam has no
+//! opinion on whether a socket was started — so the decision has to be made here,
+//! and the two must not be merged. See that module's docs for the other half.
+//!
+//! **The shell stays silent about it, which is the point.** `AGENTS.md` §7.1 bans
+//! `println!` in production and §7.5 assigns levels to `tracing`; a client that
+//! printed its connection state into a terminal would be a client reporting to
+//! whoever launched it rather than to the person looking at it. The banner is the
+//! user-facing surface, and `main.rs`'s subscriber is for the developer's terminal.
 
 use std::fmt;
 use std::time::Duration;
@@ -143,6 +156,7 @@ use crate::core::theme::BuiltIn;
 use crate::errors::ShNexusError;
 use crate::network::ws::{TransportConfig, TransportError, WsTransport};
 use crate::state::bridge::{self, EventSender};
+use crate::ui::views::connection_banner;
 use crate::ui::views::input_bar::InputBar;
 use crate::ui::views::message_list::MessageList;
 use crate::ui::Colors;
@@ -610,13 +624,23 @@ impl Shell {
     /// Exposed for the same reason [`Self::list`] and [`Self::input`] are: a test
     /// asserting the transport is *actually running* is what makes "the client
     /// connects" a checkable claim rather than prose.
+    ///
+    /// **`Option<&WsTransport>` and never a `bool`, and that is the whole reason
+    /// this accessor exists.** A `is_connected()` used to stand beside it and was
+    /// removed rather than corrected: it returned `transport.is_some()`, which is
+    /// *a worker thread was started*, while the name promised *the peer answered*.
+    /// The two differ on the first frame and forever after — a shell pointed at a
+    /// dead port reports "connected" for as long as the backoff keeps retrying —
+    /// and PR #43's own test asserted that lie against `ws://127.0.0.1:1/ws`.
+    ///
+    /// **The truth already exists and has one owner:** `AppState::can_send()`, which
+    /// answers the composer's question and is exposed through
+    /// [`bridge::try_read`]. Two answers to one question is what `bridge.rs` §5
+    /// calls the audit-trail hazard, so this accessor stays about the one thing the
+    /// field honestly knows — and that is also exactly what
+    /// [`connection_banner`] needs to decide whether to draw at all.
     pub fn transport(&self) -> Option<&WsTransport> {
         self.transport.as_ref()
-    }
-
-    /// Whether this shell has a socket to deliver on.
-    pub fn is_connected(&self) -> bool {
-        self.transport.is_some()
     }
 
     /// The production message list this shell composes.
@@ -701,12 +725,28 @@ impl Shell {
     /// path that knows a real change happened: a tick that applied nothing asks
     /// for no frame, and twenty quiet ticks a second cost no repaints.
     ///
-    /// **Only the list is repainted, and that is not an oversight.** The shell's
-    /// own tree draws the palette and the child, neither of which is a function
-    /// of the state, so asking it for a frame would be a repaint that changes no
-    /// pixel. A view added later reads the state too and joins this list; the
-    /// alternative — repainting the root unconditionally — is the frame cost this
-    /// client cannot afford to pay for a quiet inbox.
+    /// **Two views are notified, and the second one is why this is no longer a
+    /// one-line repaint.** [`crate::ui::views::connection_banner`] is not an
+    /// `Entity`: `Render` cannot return nothing, so a healthy connection would
+    /// always contribute an element and the banner's whole design — *draw nothing
+    /// at all when connected* — would be unobservable from a painted frame. Being a
+    /// function of the shell's own frame instead makes the **shell** the view that
+    /// has to be told, and that is this notification.
+    ///
+    /// **It is gated on `transport.is_some()` so the cost stays where the banner
+    /// is.** An offline shell draws no banner whatever the state says, so
+    /// repainting its root on every tick that changed a message would be a
+    /// repaint that cannot change a pixel — the exact thing the paragraph below
+    /// rejects. And when the shell *does* hold a transport, the repaint is a
+    /// rebuild of the element tree with two cached child entities in it; neither
+    /// the list nor the composer re-renders, because GPUI only re-renders an
+    /// entity it was told to.
+    ///
+    /// **The shell's own tree otherwise draws no function of the state**, so
+    /// without this line a changed `ConnectionState` would sit in the state while
+    /// the last painted frame kept showing the previous word — and
+    /// `tests/app_shell.rs`'s connection-visibility section is what says so rather
+    /// than leaving it to be discovered.
     ///
     /// **`None` from the drain is reported as zero applied rather than treated as
     /// a failure**, and the pump keeps running. `None` means the state is not
@@ -722,6 +762,9 @@ impl Shell {
             return 0;
         }
         self.list.update(cx, |_list, cx| cx.notify());
+        if self.transport.is_some() {
+            cx.notify();
+        }
         report.applied()
     }
 
@@ -863,6 +906,38 @@ impl Focusable for Shell {
 
 impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // **The banner is read before the tree is built, and that ordering is the
+        // two-questions rule made mechanical.** `self.transport.is_some()` answers
+        // *was a connection attempted* — the one thing that field honestly knows —
+        // and the element itself is built inside the read of the real
+        // `ConnectionState`. Both halves must be true to draw anything, and the
+        // first is checked here rather than inside the view because the view cannot
+        // see the shell's field at all: `ui/` is not allowed to reach for
+        // `Shell::transport`, and the seam has no opinion on whether a socket was
+        // ever started.
+        //
+        // **One read, and the state is borrowed rather than cloned.** The obvious
+        // shape reads first and formats second — `try_read(.., |s|
+        // s.connection().clone())` — and it clones a `ConnectionState` on **every
+        // frame the shell repaints**, which for `Rejected` is two `String`
+        // allocations to produce text nobody repaints. `AGENTS.md` §2.3 counts
+        // allocations on the frame path, so the borrow and the formatting happen
+        // inside one closure: the only string built per frame is the one the
+        // element draws.
+        //
+        // **A client with no `SH_NEXUS_URL` therefore draws nothing here**, which
+        // is the offline shell documented on `ConnectionSettings::from_env` rather
+        // than a failure. `app::open`'s `Ok(None)` arm says the same in one line,
+        // and the two are the same decision stated in two layers.
+        let banner = if self.transport.is_some() {
+            bridge::try_read(cx, |state| {
+                connection_banner::banner(state.connection(), self.colors)
+            })
+            .flatten()
+        } else {
+            None
+        };
+
         // Every element here is a container rather than a text element, and the
         // colours are still set explicitly. GPUI does not inherit text colour
         // from a parent (AGENTS.md 7.3), the spike established that satisfying
@@ -884,6 +959,13 @@ impl Render for Shell {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.list.clone())
+            // The connection line, between the log and the field, and the order is
+            // the reason it is not anywhere else: it is what a user crosses on the
+            // way to type, so a refusal to send has to be readable *before* they
+            // type rather than after. `when_some` rather than an unconditional
+            // `child` is what makes "renders nothing when connected" true of the
+            // element tree and not merely of the banner's own return value.
+            .when_some(banner, |column, banner| column.child(banner))
             // The composer, below the list and last in the column, and the order
             // is `PLAN.md` §6's: the log above, the field below, which is what a
             // chat client has looked like since before any of this was a
@@ -928,8 +1010,8 @@ fn window_options(cx: &App) -> WindowOptions {
 ///   `errors.rs` rule 1 forbids a `From<anyhow::Error>` impl existing anywhere, so
 ///   the conversion is written here by hand and `anyhow` is never named. The
 ///   source chain is *not* logged: `errors.rs` assigns that to `tracing::error!`,
-///   and `tracing` is not in the workspace, so the reduction is the half of that
-///   plan this crate can honour today.
+///   and naming an `anyhow::Error`'s chain would need a variant this crate does not
+///   have — so the reduction is the half of that plan this crate can honour today.
 /// - **The state could not be installed.** A refusal here means a global of this
 ///   type already exists, which no remote peer can cause and this function cannot
 ///   cause twice — the launch callback runs once per process. It is `Unknown`
