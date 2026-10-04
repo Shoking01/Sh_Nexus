@@ -242,6 +242,50 @@ pub fn wait_until(what: &str, budget: Duration, mut condition: impl FnMut() -> b
     }
 }
 
+/// Whether a server at `address` is answering HTTP, as opposed to merely accepting.
+///
+/// **`TcpStream::connect(..).is_ok()` is not a readiness probe**, and it was what this
+/// module used in two places. It opens a connection and drops it without writing a
+/// byte, which leaves axum holding a half-open connection it will wait on forever,
+/// because nothing ever says the request is finished. Sixteen tests run these probes
+/// concurrently, so a run accumulated a pile of connections the server was politely
+/// waiting on — and on a loaded machine that was enough to push a start past
+/// `READY_BUDGET` and fail a suite roughly once in twenty runs.
+///
+/// A real request with `Connection: close` gives the server a complete message to read
+/// and a reason to hang up, so the probe costs it nothing. The health route is used
+/// because it needs no credential.
+fn server_answers_http(address: std::net::SocketAddr) -> bool {
+    use std::io::{Read, Write};
+    let host = address.to_string();
+    let Ok(mut stream) = TcpStream::connect(address) else {
+        return false;
+    };
+    // **The WebSocket handshake, not a health route — there is none.** `lib.rs` says so
+    // outright: "There is deliberately no fallback route, no health endpoint". Asking
+    // for `/health` would get a 405, which proves the server is listening just as well,
+    // but it would look like a bug to the next reader. The handshake is what a client
+    // actually sends, so the probe exercises the same path the product does — and a 401
+    // is a *success* here, because it means routing and the auth layer both answered.
+    let request = format!(
+        "GET {WS_PATH} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: c2hfLW5lY3VzLXBvYmU=\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = String::new();
+    // Reading to end is what makes the close happen; a bounded read would leave the
+    // same half-open connection this function exists to avoid.
+    stream.read_to_string(&mut response).is_ok() && response.starts_with("HTTP/1.1")
+}
+
 /// A running `sh_nexus_server`, killed and cleaned up when it goes out of scope.
 pub struct ServerProcess {
     child: Option<Child>,
@@ -318,7 +362,7 @@ impl ServerProcess {
             .expect("a loopback socket address this suite just formatted");
         let mut exited = None;
         wait_until("the server to accept a connection", READY_BUDGET, || {
-            if TcpStream::connect(address).is_ok() {
+            if server_answers_http(address) {
                 return true;
             }
             match child.try_wait() {
@@ -414,7 +458,7 @@ impl ServerProcess {
             .expect("a loopback socket address this suite just formatted");
         let mut exited = None;
         wait_until("the server to accept a connection", READY_BUDGET, || {
-            if TcpStream::connect(address).is_ok() {
+            if server_answers_http(address) {
                 return true;
             }
             match child.try_wait() {
@@ -446,10 +490,35 @@ impl ServerProcess {
     /// because the most likely cause by far is a fixture password that does not
     /// match, and "expected 200, got 401 with `invalid_credentials`" says that;
     /// "the login failed" would not.
+    ///
+    /// **The connect is retried, because this login is a client of a process that is
+    /// still starting.** `ServerProcess::start_on` waits for the port to accept a
+    /// TCP connection, and there is a window between that and axum having its routes
+    /// mounted and its SQLite schema migrated; a login landing in it failed the suite
+    /// roughly once in twenty-five runs. The retry here is a bound on an observation
+    /// — "has the server finished coming up" — and it gives up with the same message
+    /// rather than looping.
     pub fn token(&self) -> String {
         let address = format!("127.0.0.1:{}", self.port);
-        let mut stream = TcpStream::connect(&address)
-            .unwrap_or_else(|error| panic!("could not reach the server on {address}: {error}"));
+        let mut stream = {
+            let deadline = Instant::now() + READY_BUDGET;
+            let mut attempt = 0usize;
+            loop {
+                attempt += 1;
+                match TcpStream::connect(&address) {
+                    Ok(stream) => break stream,
+                    Err(error) => {
+                        if Instant::now() >= deadline {
+                            panic!(
+                                "could not reach the server on {address} after \
+                                 {attempt} attempts within {READY_BUDGET:?}: {error}"
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        };
 
         let body = serde_json::json!({
             "username": ADMIN_USERNAME,
@@ -574,8 +643,8 @@ pub fn revoke(server: &ServerProcess, token: &str) {
         .unwrap_or_else(|error| panic!("could not reach the server on {address}: {error}"));
     let request = format!(
         "POST {LOGOUT_PATH} HTTP/1.1\r\n\
-         Host: {address}\r\n\
-         Authorization: Bearer {token}\r\n\
+           Host: {address}\r\n\
+           Authorization: Bearer {token}\r\n\
          Content-Length: 0\r\n\
          Connection: close\r\n\
          \r\n"

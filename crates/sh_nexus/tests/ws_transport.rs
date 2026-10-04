@@ -91,6 +91,66 @@ const CHANNEL: &str = "c_general";
 /// body rather than about some non-empty string.
 const BODY: &str = "hello from client A";
 
+/// How long a socket's counters must hold still before a test may treat the worker
+/// as finished with it.
+///
+/// **A bound on an observation, not a `sleep()` waiting for logic.** The read loop
+/// runs on its own OS thread with no completion signal, so "it has stopped moving" is
+/// the only honest available answer; this is the interval across which that is checked,
+/// and it is several times the loop's own turnaround so an in-flight delivery lands
+/// inside the window rather than after it.
+const QUIESCE_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long a worker gets to go quiet before the wait gives up and says so.
+///
+/// **Its own budget, not [`READY_BUDGET`]**, and deliberately larger. `READY_BUDGET` is
+/// sized for a loopback handshake; a worker spending its connect allowance waits out a
+/// real backoff between attempts, and reusing the shorter budget meant the wait
+/// expired mid-backoff and read the counters before the worker's last act.
+const QUIESCE_FINISH_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Waits until a transport's worker has genuinely finished, and returns its stats.
+///
+/// **`is_closed()` is not this.** It reads a flag that `shutdown()` sets and that the
+/// worker's own terminal branch sets, and in both cases the flag goes up *before* the
+/// loop stops touching the socket. Two tests read a counter immediately after waiting
+/// on `is_closed()` and saw the state from *before* the worker's last act: one read
+/// `connect_failures == 1` where two attempts were allowed, and one read 1025
+/// delivered against a bound of 1024. Both reproduced on the CI runner and not in ten
+/// local runs, which is the worst possible ratio to debug with.
+///
+/// **Two earlier versions of this helper were worse than the bug, and both are
+/// recorded here so the shape is not "simplified" back into them.** The first slept
+/// inside a `wait_until` predicate — but that helper sleeps 1 ms per iteration and
+/// checks its own deadline, so a 150 ms sleep inside the predicate blew the budget and
+/// returned with every counter at zero, failing 20 runs out of 20. The second fixed
+/// that by snapshotting before the first sleep, which made "nothing changed" trivially
+/// true for a worker that had not started yet. So: **its own loop, and quiet only
+/// counts once work has been seen.**
+///
+/// There is no `JoinHandle` to await, so the counters — the only observable that means
+/// "nothing more will happen" — are polled directly. The deadline is generous on
+/// purpose: a worker spending its allowance waits out a real backoff between attempts,
+/// and this must outlast that rather than race it.
+fn wait_for_worker_to_finish(transport: &WsTransport) -> TransportStats {
+    let deadline = Instant::now() + QUIESCE_FINISH_BUDGET;
+    let mut last = transport.stats();
+    let mut seen_work = false;
+    while Instant::now() < deadline {
+        std::thread::sleep(QUIESCE_SETTLE);
+        let now = transport.stats();
+        seen_work |= now != TransportStats::default();
+        if seen_work && now == last {
+            return now;
+        }
+        last = now;
+    }
+    panic!(
+        "the transport's worker never went quiet within {QUIESCE_FINISH_BUDGET:?}; \
+         last seen {last:?}"
+    );
+}
+
 /// A timestamp the caller supplies, since `state/` may not read a clock.
 fn at(second: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_789_000_000 + second, 0)
@@ -351,28 +411,38 @@ fn a_full_inbox_refuses_the_arriving_event_rather_than_growing(cx: &mut TestAppC
         .send_message(client_msg_id, CHANNEL, BODY)
         .expect("the send is queued");
 
-    support::wait_until(
-        "B to have read the frame and refused it",
-        READY_BUDGET,
-        || {
-            let stats = transport_b.stats();
-            stats.frames_read >= 1 && stats.events_delivered == 0 && stats.events_refused >= 1
-        },
+    support::wait_until("B to have read the frame", READY_BUDGET, || {
+        transport_b.stats().frames_read >= 1
+    });
+
+    // **Then wait for B to be quiescent, and the reason is not cosmetic.**
+    //
+    // An earlier version of this test waited for `events_refused >= 1`, which a
+    // connection-state event satisfies just as well as the message does — B's inbox
+    // is full, so its `Connecting` and `Connected` are refused too. That wait
+    // returned before B had read the message frame at all, the drain below freed a
+    // slot, and **the message then fitted**: 1025 delivered against a bound of 1024.
+    // It reproduced on the CI runner and not in ten local runs, which is the worst
+    // possible ratio.
+    //
+    // `frames_read >= 1` alone is not sufficient either, because the delivery attempt
+    // happens after the read. The observable that means "nothing more will be
+    // enqueued" is the worker's counters going still.
+    let settled = wait_for_worker_to_finish(&transport_b);
+    assert!(
+        settled.frames_read >= 1 && settled.events_delivered == 0 && settled.events_refused >= 1,
+        "B read the frame, delivered nothing, and refused it: {settled:?}"
     );
 
     // And the inbox did not grow to make room: draining takes exactly what was put
     // in, and not one more. This is the assertion that matters, because "the event
     // was refused" and "the event was dropped to make space" are the same counter.
-    // **Both transports are stopped before the drain, and that ordering is the
-    // assertion.** `bridge::drain` loops on `try_recv` until the inbox is empty, so
-    // with a live producer it can consume *more* than the instantaneous capacity:
-    // a slot freed at the top of the loop is refilled before the loop reaches
-    // `Empty`. The bound itself is structural — a `sync_channel(MAX_PENDING_EVENTS)`
-    // never holds more than that at any instant — and this test once asserted
-    // `delivered() == MAX_PENDING_EVENTS` while a producer was still running, which
-    // failed intermittently at 1025. Draining a quiesced inbox is what makes the
-    // exact figure mean "the inbox reached its bound and held there", rather than
-    // "the drain loop won a race".
+    // Both transports are stopped before the drain, so nothing is still mid-send. That
+    // is necessary and it is **not** sufficient: `shutdown()` sets a flag without
+    // joining, so the wait above is what actually establishes quiescence. The bound
+    // itself was never violated — a `sync_channel(MAX_PENDING_EVENTS)` cannot hold
+    // more than that at any instant — and what this asserts is that the inbox reached
+    // its bound and held there while a socket was actively delivering into it.
     transport_a.shutdown();
     transport_b.shutdown();
 
@@ -571,11 +641,27 @@ fn the_transport_gives_up_after_its_configured_allowance(cx: &mut TestAppContext
     )
     .expect("a thread");
 
-    support::wait_until("the transport to give up", READY_BUDGET, || {
-        transport.is_closed()
+    // **Both conditions, and the reason is specific.** `is_closed()` is the worker
+    // saying it will make no further attempt, but the flag goes up *before* the loop
+    // stops, so reading `connect_failures` straight after waiting on it can observe
+    // `1` on a run where two attempts were allowed and the second had not been made
+    // yet. That reproduced roughly once in twenty-five runs, on the CI runner and not
+    // in ten local runs, which is a bad ratio for a test that exists to be evidence.
+    //
+    // Waiting on `connect_failures >= 2` **alone** is not sufficient either: the second
+    // counter can climb while the worker is between its last attempt and the terminal
+    // `Disconnected` emission. Both together say "the allowance is spent and the loop
+    // has finished", which is the thing being asserted; the counter is the more
+    // specific of the two, so it is the one that gates the flag.
+    support::wait_until("the transport to spend its allowance", READY_BUDGET, || {
+        transport.is_closed() && transport.stats().connect_failures >= 2
     });
 
     let stats: TransportStats = transport.stats();
+    assert!(
+        transport.is_closed(),
+        "having spent its allowance, the transport says so: {stats}"
+    );
     assert_eq!(
         stats.connect_failures, 2,
         "two attempts were allowed and exactly two were made: {stats}"
@@ -888,11 +974,13 @@ fn a_refused_session_token_is_a_rejected_connection_and_the_transport_stops(
     }
 
     // Terminal: the worker ended, so no further attempt is made and the handle
-    // reports itself closed.
-    support::wait_until("the transport to stop", READY_BUDGET, || {
-        transport.is_closed()
-    });
-    let stats = transport.stats();
+    // reports itself closed. The counters are read after the worker has actually
+    // stopped, not after the flag went up -- see `wait_for_worker_to_finish`.
+    let stats = wait_for_worker_to_finish(&transport);
+    assert!(
+        transport.is_closed(),
+        "a terminal rejection ends the transport: {stats}"
+    );
     assert_eq!(
         stats.rejected_handshakes, 1,
         "exactly one attempt: a terminal rejection is not retried. {stats}"
