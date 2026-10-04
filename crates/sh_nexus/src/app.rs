@@ -131,6 +131,7 @@
 //! logger in this crate yet, so a failure here is reported by a returned error
 //! and by `main.rs`'s `eprintln!`, and by nothing else.
 
+use std::fmt;
 use std::time::Duration;
 
 use gpui::{
@@ -140,6 +141,7 @@ use gpui::{
 
 use crate::core::theme::BuiltIn;
 use crate::errors::ShNexusError;
+use crate::network::ws::{TransportConfig, TransportError, WsTransport};
 use crate::state::bridge::{self, EventSender};
 use crate::ui::views::input_bar::InputBar;
 use crate::ui::views::message_list::MessageList;
@@ -231,6 +233,196 @@ pub fn theme_colors() -> Colors {
     }
 }
 
+/// The environment the client reads its server from.
+///
+/// # The two variables, and what absent means
+///
+/// | Variable | Meaning |
+/// |---|---|
+/// | `SH_NEXUS_URL` | The server's WebSocket URL, e.g. `ws://127.0.0.1:8484/ws`. |
+/// | `SH_NEXUS_TOKEN` | The session token, sent as `Authorization: Bearer`. |
+///
+/// **Both absent means no transport is started and the shell runs exactly as it did
+/// before this existed** — no error, no banner, no connection state. A developer with
+/// no server configured gets the offline shell, which is the point: a client that
+/// refuses to start without a server is a client nobody can run for the first time.
+///
+/// **A URL with no token is a misconfiguration, and it is refused.** ADR-010 made
+/// authentication mandatory, so a URL alone can only end in an opaque 401 the user
+/// cannot act on — and `AGENTS.md` §7.5 says an actionable code beats a silently
+/// dropped explanation. Failing at startup says which variable is missing, before a
+/// window opens, which is strictly more useful than the same message arriving after
+/// the user has typed something.
+///
+/// # Why the environment and not a file or a login screen
+///
+/// `AGENTS.md` §7.1 forbids plaintext token storage and names the OS keychain as where
+/// a token belongs. **There is no keychain here**: `platform/` does not exist, and
+/// building it is its own milestone. An environment variable is the one place a
+/// credential can live that is not a file this project wrote, so until the keychain
+/// lands this is the correct storage rather than a shortcut around it. **The token is
+/// never logged, never written, and never rendered into a `Debug` or `Display` output**
+/// — [`ConnectionSettings`]'s own `Debug` impl is what enforces that, and a test
+/// asserts it.
+///
+/// This is also the server's own convention, which is why the names match:
+/// `crates/sh_nexus_server/src/main.rs` reads `SH_NEXUS_BIND` and `SH_NEXUS_DB` the
+/// same way. One project, one way of being configured.
+///
+/// # What this is not
+///
+/// It is not multi-account, not persisted, and not a settings screen. It is the wiring
+/// that makes the transport reachable from the running application, which is what
+/// stopped it being a library only tests could exercise.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConnectionSettings {
+    url: String,
+    token: String,
+}
+
+impl ConnectionSettings {
+    /// Reads both variables, or explains precisely what is missing.
+    ///
+    /// `Ok(None)` is the **no-server case and is not an error**: the shell runs
+    /// offline. `Err` is only ever "you asked for a connection and did not finish
+    /// describing it".
+    pub fn from_env() -> Result<Option<Self>, MissingSetting> {
+        match (
+            std::env::var("SH_NEXUS_URL"),
+            std::env::var("SH_NEXUS_TOKEN"),
+        ) {
+            (Err(_), Err(_)) => Ok(None),
+            (Ok(url), Ok(token)) => Ok(Some(Self { url, token })),
+            (Ok(_), Err(_)) => Err(MissingSetting::Token),
+            (Err(_), Ok(_)) => Err(MissingSetting::Url),
+        }
+    }
+
+    /// The server's WebSocket URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Builds settings from values the caller already has.
+    ///
+    /// **Public because `from_env` is untestable for the populated case**, and the
+    /// reason it is untestable is worth recording: reaching the "both variables are
+    /// set" arm means calling `std::env::set_var`, which is `unsafe` under Rust 2024
+    /// and mutates state every other test in the process reads. A test that sets an
+    /// environment variable to prove something about a constructor is a test that
+    /// breaks unrelated ones.
+    ///
+    /// **Not a test-only escape hatch** — the production path builds the same values
+    /// from the same two fields through [`Self::from_env`], so there is one
+    /// representation of "a URL and a token" rather than two that could drift. What is
+    /// test-only is the *source* of the two strings.
+    pub fn from_parts_for_test(url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            token: token.into(),
+        }
+    }
+
+    /// Builds the transport configuration this describes.
+    ///
+    /// The token goes in here and nowhere else. It is passed to the transport, which
+    /// drops it inside `handshake()` — that function is the only place in the
+    /// codebase where a credential exists at all, which is what makes a leak
+    /// something that would have to be written on purpose rather than arrived at by
+    /// refactoring.
+    pub fn transport_config(&self) -> TransportConfig {
+        TransportConfig::new(&self.url).with_token(&self.token)
+    }
+}
+
+/// Which half of the connection configuration is absent.
+///
+/// **A distinct type rather than a `String`,** because the message is the whole point:
+/// an operator who set a URL and got "invalid configuration" has to guess, and one who
+/// is told `SH_NEXUS_TOKEN` is missing can fix it without reading this source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingSetting {
+    /// `SH_NEXUS_URL` is set but `SH_NEXUS_TOKEN` is not.
+    Token,
+    /// `SH_NEXUS_TOKEN` is set but `SH_NEXUS_URL` is not.
+    Url,
+}
+
+impl fmt::Display for MissingSetting {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Token => formatter.write_str(
+                "SH_NEXUS_URL is set but SH_NEXUS_TOKEN is not; the server requires a \
+                 session token, so a URL alone can only be refused with an opaque 401",
+            ),
+            Self::Url => formatter.write_str(
+                "SH_NEXUS_TOKEN is set but SH_NEXUS_URL is not; there is no server to \
+                 send it to",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MissingSetting {}
+
+/// Why [`Shell::start_transport`] did not start one.
+///
+/// **Two causes, and they are not the same kind of thing.** A [`MissingSetting`] is the
+/// operator's configuration being incomplete and is fixed in a shell; a
+/// [`TransportError`] is this machine failing to spawn a thread and is fixed by
+/// restarting. Collapsing them into one string would lose exactly the distinction that
+/// tells the user whether to edit an environment variable or reboot.
+#[derive(Debug)]
+pub enum StartError {
+    /// Half the configuration was given.
+    Missing(MissingSetting),
+    /// The worker thread could not be started.
+    Transport(TransportError),
+}
+
+impl fmt::Display for StartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(missing) => write!(formatter, "{missing}"),
+            Self::Transport(error) => write!(formatter, "could not start the socket: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StartError {}
+
+impl From<MissingSetting> for StartError {
+    fn from(missing: MissingSetting) -> Self {
+        Self::Missing(missing)
+    }
+}
+
+/// `#[derive(Debug)]` would print `token`, and this struct is reachable from any
+/// `{:?}` on an error or a log line. `AGENTS.md` §7.5 forbids logging credentials,
+/// so the implementation is written out instead of derived — the same reason
+/// `network::ws::TransportConfig` does the same thing.
+impl fmt::Debug for ConnectionSettings {
+    /// Prints the URL and whether a token is present, never the token.
+    ///
+    /// The token's *presence* is printed rather than the field hidden entirely,
+    /// because "a URL with no token is configured" is a diagnosable condition and one
+    /// boolean is enough to see it.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectionSettings")
+            .field("url", &self.url)
+            .field("token_configured", &!self.token.is_empty())
+            .finish()
+    }
+}
+
+impl From<TransportError> for StartError {
+    fn from(error: TransportError) -> Self {
+        Self::Transport(error)
+    }
+}
+
+/// The production message list, the one view this shell composes.
 /// The root component: the palette's owner, the list's parent, the drain pump's
 /// lifetime, and the window's key target.
 ///
@@ -258,6 +450,19 @@ pub struct Shell {
     ///
     /// See the module docs, §2: dropping it closes the inbox.
     sender: EventSender,
+    /// The socket, when one was started.
+    ///
+    /// **An `Option` because both being absent is the documented offline case**, not a
+    /// failure — see [`ConnectionSettings::from_env`]. `None` means this shell is the
+    /// offline one and the user sees nothing connection-shaped, which is correct
+    /// rather than a degraded state to apologise for.
+    ///
+    /// **Held, and not dropped, and that is the whole reason the field exists.** The
+    /// transport owns the worker thread; dropping it would tear the socket down
+    /// silently, with no event and no log, and the composer would simply stop
+    /// delivering sends. Holding it for the shell's life is what makes the connection
+    /// outlive a frame.
+    transport: Option<WsTransport>,
     /// The palette this shell's own elements draw with.
     ///
     /// **A copy rather than a borrow of the theme, and the same reason
@@ -329,9 +534,58 @@ impl Shell {
             sender,
             colors,
             focus_handle,
+            transport: None,
         };
         shell.start_drain_pump(cx);
         shell
+    }
+
+    /// Starts the socket if this machine is configured for one, and reports what it did.
+    ///
+    /// **A separate method, and not a step inside [`Self::new`], because a constructor
+    /// that reads the environment is only testable by luck.** `new` is called from
+    /// tests that must not depend on the developer's shell, and a transport started
+    /// inside it would try to reach whatever `SH_NUSUS_URL` happens to hold — or
+    /// spawn a thread on every test that builds a shell. Reading the environment here,
+    /// explicitly, keeps the constructor pure and makes this the single place where
+    /// the decision is made.
+    ///
+    /// **Both variables absent is `Ok(None)` and not an error.** See
+    /// [`ConnectionSettings::from_env`]; the offline shell is the documented default.
+    ///
+    /// The transport publishes through this shell's **own** [`EventSender`], so frames
+    /// arrive at the same inbox the drain pump already empties. There is one channel
+    /// into the state, not two, which is what keeps ADR-009's confinement intact: the
+    /// worker touches no context type and the main thread still applies everything
+    /// itself.
+    ///
+    /// # Errors
+    ///
+    /// Two, and neither is about the network:
+    ///
+    /// - [`MissingSetting`] — half the configuration was given. Reported before any
+    ///   window opens rather than surfacing later as an opaque 401.
+    /// - [`TransportError`] — the worker thread could not be started.
+    pub fn start_transport(&mut self, settings: &ConnectionSettings) -> Result<(), StartError> {
+        self.transport = Some(WsTransport::start(
+            settings.transport_config(),
+            self.sender.clone(),
+        )?);
+        Ok(())
+    }
+
+    /// The socket this shell is holding, if any.
+    ///
+    /// Exposed for the same reason [`Self::list`] and [`Self::input`] are: a test
+    /// asserting the transport is *actually running* is what makes "the client
+    /// connects" a checkable claim rather than prose.
+    pub fn transport(&self) -> Option<&WsTransport> {
+        self.transport.as_ref()
+    }
+
+    /// Whether this shell has a socket to deliver on.
+    pub fn is_connected(&self) -> bool {
+        self.transport.is_some()
     }
 
     /// The production message list this shell composes.
@@ -659,6 +913,31 @@ pub fn open(cx: &mut App) -> crate::errors::Result<WindowHandle<Shell>> {
     let options = window_options(cx);
     let opened = cx.open_window(options, move |window, cx| {
         let shell = cx.new(|cx| Shell::new(sender, cx));
+
+        // **Read and start the transport here, inside the window's own closure,**
+        // because the Shell must exist before it can be given a socket: the
+        // transport publishes through the shell's `EventSender`, and that handle
+        // comes from the shell. Reading the environment any earlier would make the
+        // decision invisible from the window that the user is looking at.
+        //
+        // **A missing token beside a URL is a startup failure, not a warning.**
+        // `AGENTS.md` §7.5 says an actionable code the user can report beats a
+        // silently dropped explanation, and this is the only place the user's
+        // terminal can still show them the message: once the socket is up, the same
+        // misconfiguration arrives as a 401 with nothing to act on.
+        match ConnectionSettings::from_env() {
+            // Both variables absent: the documented offline shell. Not an error, and
+            // not a banner — there is no connection to describe.
+            Ok(None) => {}
+            Ok(Some(settings)) => {
+                if let Err(error) = shell.update(cx, |shell, _| shell.start_transport(&settings)) {
+                    tracing::error!(error = %error, "the client has no socket");
+                }
+            }
+            Err(missing) => {
+                tracing::error!(error = %missing, "the connection settings are incomplete");
+            }
+        }
         // Focus the composer on open, mirroring how a real client focuses
         // whatever will receive typing. That is now the composer and not the
         // root: a chat window that opens with a text field focused is one the

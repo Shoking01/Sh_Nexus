@@ -15,6 +15,18 @@ name = "sh_nexus"
 path = "src/lib.rs"
 
 [dependencies]
+# tracing: structured logging. Audited per AGENTS.md 7.2 in the workspace
+# `Cargo.toml`, and already in `Cargo.lock` at 0.1.44 through the server, so this
+# names a dependency the workspace already links rather than adding one.
+#
+# Declared here because the client could not honour 7.5 without it: 7.5 requires
+# `tracing` and 7.1 bans `println!`, and `main.rs` was carrying a `eprintln!` on
+# the startup-failure path with a comment saying a project-wide logger would
+# replace it. This is that. `network/ws.rs` deliberately logs **nothing** — it
+# counts instead, and its counters are the observable surface — so this first use
+# is the connection settings in `app.rs`.
+tracing = { workspace = true }
+
 # gpui: platform-agnostic core of Zed's UI framework. Apache-2.0. Pinned to a
 # `rev` rather than a semver range because the git channel expresses no
 # version guarantee and every upstream sync must be a deliberate review, not a
