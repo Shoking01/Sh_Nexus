@@ -391,7 +391,7 @@ this milestone's migration and is additive; §3.1 names the two tables it adds.
 | Table | Exercised | Note |
 |---|---|---|
 | `users` | yes | **A real account, authenticated.** `password_hash` is an Argon2id hash; `is_admin` is what "administrator" means, rather than creation order — inferring it from the earliest `created_at` would make a privilege grant depend on a tie-break, and a tie broken by id is a privilege decided by a UUID. The reserved `u_unattributed` row is **retained**: ADR-010 keeps authorship on removal, and a database migrated from schema 1 has message rows pointing at it under a foreign key. It carries no `password_hash`, so it can never log in. |
-| `channels` | one seeded row | `c_general`. A send naming any other channel is **refused**, not silently created — channel provisioning is a later milestone. |
+| `channels` | one seeded row | `c_general`, which is what `sh_nexus::app::STARTUP_CHANNEL` names — the placeholder `c_startup` that used to sit there was a channel no server had ever heard of, and a send naming it was refused at runtime. The client's constant is asserted **behaviourally**, by `ws_transport::the_shell_s_channel_is_one_the_server_accepts`, which sends through it against a real server: a rename on either side turns that test red rather than production red. A send naming any other channel is **refused**, not silently created — channel provisioning is a later milestone. |
 | `messages` | the whole round trip | `client_msg_id` is globally `UNIQUE`, which is what makes dedupe a single lookup. `user_id` is now the authenticated account, never a frame-supplied value. |
 | `read_cursors` | **no** | ADR-010 requires per-`(user, channel)` read state "from the first migration". Deliberately unread here. |
 | `channel_members` | yes | Checked on the send. A non-member is refused with `not_a_member`; the socket stays open, because one socket serves every channel the client can type into. |
@@ -409,7 +409,7 @@ decode and are then **logged at `warn!` with the connection kept open**, which i
 | Missing | Consequence for a client |
 |---|---|
 | Authentication, registration, tokens | `message.send` has no author; every message is `u_unattributed`. |
-| REST, channel and user provisioning | Only `c_general` exists. |
+| REST, channel and user provisioning | Only `c_general` exists, and the client names it by constant rather than by a channel list it cannot yet fetch. |
 | Presence | No `presence.update` is ever sent. |
 | Typing | `typing.start`/`typing.stop` are accepted and discarded. No `typing.update` is ever sent. |
 | Reactions | `reaction.add` is accepted and discarded. No `reaction.update` is ever sent. |

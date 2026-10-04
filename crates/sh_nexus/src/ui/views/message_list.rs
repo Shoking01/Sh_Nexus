@@ -151,6 +151,7 @@ use gpui::{
 use uuid::Uuid;
 
 use crate::core::markdown::{parse as parse_markdown, Document};
+use crate::core::models::events::DomainEvent;
 use crate::state::bridge::{self, Rendered};
 use crate::state::DeliveryState;
 use crate::ui::views::message_row::{MessageRow, RowCache, RowSpec};
@@ -989,7 +990,72 @@ impl MessageList {
             // before the server has seen it — `AGENTS.md` §8.1's whole point.
             cx.notify();
         }
+        if on_screen {
+            self.enqueue(cx, client_msg_id, &channel, content);
+        }
         on_screen
+    }
+
+    /// Puts an accepted optimistic send on the wire.
+    ///
+    /// **Called only after [`MessageList::begin_send`] confirmed the row exists,
+    /// and that order is load-bearing.** A frame for a send the state refused would
+    /// put a message on the server that this client does not know about, which is
+    /// the one outcome worse than a send that fails: the sender would see it arrive
+    /// back as somebody else's message with no pending row to reconcile it against.
+    ///
+    /// **The optimistic row goes up first, on purpose.** `AGENTS.md` §8.1 wants the
+    /// row on screen before the server has seen the message, and `try_begin_send` is
+    /// synchronous — so by the time this runs the user is already looking at it. The
+    /// enqueue itself is a channel hand-off, not a network round trip; the worker
+    /// thread owns the socket.
+    ///
+    /// **An enqueue failure rolls back through the existing failure path rather than
+    /// a second rollback written here.** `send_message` can fail synchronously when
+    /// the socket is closed or the outbound queue is full, and the honest outcome is
+    /// the same one a `message.error` produces: the row becomes `failed` with a
+    /// reason the user can read and retry. Handing a synthetic
+    /// [`DomainEvent::MessageSendFailed`] to `bridge::try_apply_event` reuses
+    /// [`actions::fail_send`](crate::state::actions) verbatim, so the two ways a send
+    /// can fail produce one state transition instead of two that can drift.
+    ///
+    /// **The frame is named by [`bridge::try_send_message`], never by a socket this
+    /// view holds.** `AGENTS.md` §3.2 gives `network/` to the seam, and
+    /// `tests/layer_boundary.rs::ui_reaches_gpui_and_the_bridge_and_nothing_below_them`
+    /// fails the build when `ui/` imports it — the first version of this feature held
+    /// a `WsTransport` in this struct, and that test caught it. **The decision to
+    /// send is this view's; the socket is not its to name.**
+    ///
+    /// **With no transport the row stays pending, and that is stated rather than
+    /// papered over.** The composer gates on
+    /// [`AppState::can_send`](crate::state::app_state::AppState), which requires
+    /// `ConnectionState::Connected`, so a user cannot reach this branch by typing.
+    /// The alternative — inventing an outbox here — is `PLAN.md` §7's Phase 3 work
+    /// and `AGENTS.md` §7.1 forbids the unbounded growth it would need.
+    fn enqueue(
+        &mut self,
+        cx: &mut Context<Self>,
+        client_msg_id: Uuid,
+        channel: &str,
+        content: &str,
+    ) {
+        if let bridge::EnqueueOutcome::Refused(detail) =
+            bridge::try_send_message(cx, client_msg_id, channel, content)
+        {
+            bridge::try_apply_event(
+                cx,
+                DomainEvent::MessageSendFailed {
+                    client_msg_id,
+                    // Namespaced to this client rather than to the server, because
+                    // it is this machine's queue that refused, not a server that
+                    // rejected the message.
+                    code: "transport.enqueue_failed".to_owned(),
+                    detail,
+                },
+            );
+            // The rollback changed the row's badge, and this view draws rows.
+            cx.notify();
+        }
     }
 
     /// Puts a failed send back in flight, on the badge's behalf.
