@@ -22,17 +22,47 @@
 //!
 //! # Configuration
 //!
-//! Two environment variables, both optional:
+//! Four environment variables. The first two were here before authentication
+//! existed; the second pair are ADR-010's and are the only way an account comes
+//! into existence without an authenticated administrator.
 //!
 //! | Variable | Default | Meaning |
 //! |---|---|---|
 //! | `SH_NEXUS_BIND` | `127.0.0.1:8484` | The socket address to bind. A full `host:port`, not a port alone, so there is never a question about which interface was meant. |
 //! | `SH_NEXUS_DB` | `sh_nexus.db` | The SQLite file. Relative paths resolve against the process's working directory. |
+//! | `SH_NEXUS_ADMIN_USERNAME` | — | The login handle for the instance's first administrator. Read only when the instance has no account that can log in. |
+//! | `SH_NEXUS_ADMIN_PASSWORD` | — | That account's password. **Never logged, never echoed, and never required on a second start.** |
 //!
-//! The bind default is loopback, not `0.0.0.0`, and that is deliberate under
-//! ADR-010: this milestone has **no authentication**, so an instance reachable
-//! from the network would be a readable one. An operator who wants it exposed has
-//! to say so explicitly.
+//! # Bootstrapping, and what "only the first time" is measured against
+//!
+//! [`auth::bootstrap`] runs on **every** start and creates exactly one account the
+//! first time it finds an instance with no account that can log in. It is
+//! deliberately a no-op afterwards, and the check is
+//! [`db::Store::account_count`] rather than a row count -- see that function for
+//! why the difference is what makes this correct on a database migrated from
+//! schema 1 as well as on a fresh file.
+//!
+//! **A partially-configured environment is a startup failure, not a warning.**
+//! Setting one of the two variables without the other, or setting either to an
+//! empty or too-short value, exits with [`ServerError::Configuration`] naming the
+//! variable. The alternative -- starting with no administrator and logging a
+//! `warn!` -- produces an instance nobody can log into and an operator who finds
+//! out from a failed connection attempt rather than from the log line that would
+//! have told them.
+//!
+//! **The password is not required once an account exists.** That is what makes the
+//! second start safe: an operator can stop exporting it, and the instance keeps
+//! running. `auth::bootstrap`'s own docs cover what happens if the username
+//! collides with a row that cannot log in.
+//!
+//! # Why the bind default is still loopback
+//!
+//! The default is `127.0.0.1`, not `0.0.0.0`, and that is still deliberate under
+//! ADR-010 even though this milestone has authentication: the threat model there is
+//! that the adversary is *outside* the team, and the cheapest defence against a
+//! peer who has to be on the network at all is not being on the same network. An
+//! operator who wants the instance exposed says so explicitly with
+//! `SH_NEXUS_BIND`, and `docs/API.md` says what has to be in front of it.
 
 #![forbid(unsafe_code)]
 
@@ -42,9 +72,9 @@ use std::process::ExitCode;
 
 use sh_nexus_server::db::Store;
 use sh_nexus_server::error::{Result, ServerError};
-use sh_nexus_server::{AppState, Hub};
+use sh_nexus_server::{auth, AppState, Hub};
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 /// The default filter when `RUST_LOG` is unset.
@@ -55,7 +85,7 @@ use tracing_subscriber::EnvFilter;
 const DEFAULT_FILTER: &str = "info";
 
 /// The bind address used when `SH_NEXUS_BIND` is unset. Loopback; see the module
-/// docs for why that is the safe default while there is no authentication.
+/// docs for why that is the safe default.
 const DEFAULT_BIND: &str = "127.0.0.1:8484";
 
 /// The database file used when `SH_NEXUS_DB` is unset.
@@ -66,6 +96,12 @@ const BIND_VARIABLE: &str = "SH_NEXUS_BIND";
 
 /// The name of the database environment variable.
 const DATABASE_VARIABLE: &str = "SH_NEXUS_DB";
+
+/// The name of the bootstrap administrator's login handle.
+const ADMIN_USERNAME_VARIABLE: &str = "SH_NEXUS_ADMIN_USERNAME";
+
+/// The name of the bootstrap administrator's password.
+const ADMIN_PASSWORD_VARIABLE: &str = "SH_NEXUS_ADMIN_PASSWORD";
 
 /// Entry point.
 ///
@@ -97,16 +133,23 @@ fn init_tracing() {
         .init();
 }
 
-/// Opens the database, starts the runtime, and serves until stopped.
+/// Opens the database, bootstraps the first administrator, starts the runtime, and
+/// serves until stopped.
 ///
 /// The database is opened **before** the runtime exists, on purpose. `Store` is
 /// synchronous (`db.rs`'s module docs) and opening it is blocking I/O; doing it
 /// here means no runtime thread is blocked, not even once, and there is no
 /// `spawn_blocking` call whose failure mode would have to be reasoned about at
 /// startup.
+///
+/// The bootstrap is here for the same reason, with one addition that matters:
+/// **an argon2 hash is ~50 ms of deliberately slow work**, and running it on the
+/// main thread before the runtime exists means a cold start pays it once, visibly,
+/// instead of paying it inside a request that some other thread is waiting on.
 fn run() -> Result<()> {
     let settings = Settings::from_env()?;
     let store = Store::open(&settings.database)?;
+    bootstrap_first_administrator(&store, &settings)?;
     let state = AppState::new(store, Hub::new());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -114,6 +157,84 @@ fn run() -> Result<()> {
         .build()?;
 
     runtime.block_on(serve(settings.bind, settings.database, state))
+}
+
+/// Creates the instance's first administrator, if it has none.
+///
+/// # Arguments
+///
+/// * `store` - the already-opened store.
+/// * `settings` - the process configuration, which is where the two
+///   `SH_NEXUS_ADMIN_*` values came from.
+///
+/// # Returns
+///
+/// `Ok(())` whether or not one was created, and the difference is a log line.
+///
+/// # Errors
+///
+/// [`ServerError::Configuration`] naming the variable at fault when the pair is
+/// incomplete, empty, or too short -- see the module docs for why that is a
+/// startup failure rather than a warning. [`ServerError::UsernameTaken`] and
+/// [`ServerError::Crypto`] are propagated as they are: both mean an operator has to
+/// look at the file, and neither is something this process can sensibly work
+/// around.
+fn bootstrap_first_administrator(store: &Store, settings: &Settings) -> Result<()> {
+    let username = settings.admin_username.as_deref();
+    let password = settings.admin_password.as_deref();
+
+    match (username, password) {
+        (None, None) => {
+            // The only case that is not an error: an instance that already has an
+            // account, started without exporting the bootstrap pair. Logged at
+            // `debug!` because it is the ordinary second start, and at `info!`
+            // would tell an operator to look for an administrator problem they do
+            // not have.
+            debug!("no bootstrap credentials are exported; not creating an administrator")
+        }
+        (Some(_), None) => {
+            return Err(ServerError::Configuration(format!(
+                "{ADMIN_USERNAME_VARIABLE} is set but {ADMIN_PASSWORD_VARIABLE} is not; \
+                 unset both to run an instance that already has an account, or set \
+                 both to create the first administrator"
+            )))
+        }
+        (None, Some(_)) => {
+            return Err(ServerError::Configuration(format!(
+                "{ADMIN_PASSWORD_VARIABLE} is set but {ADMIN_USERNAME_VARIABLE} is not; \
+                 the two are read as a pair"
+            )))
+        }
+        (Some(found), Some(secret)) => {
+            let found = found.trim();
+            if found.is_empty() {
+                return Err(ServerError::Configuration(format!(
+                    "{ADMIN_USERNAME_VARIABLE} is set but blank; unset it to run an \
+                     instance that already has an account"
+                )));
+            }
+            if found.chars().count() > sh_nexus_server::auth::MAX_USERNAME_CHARS {
+                return Err(ServerError::Configuration(format!(
+                    "{ADMIN_USERNAME_VARIABLE} is longer than the {} characters this \
+                     server accepts",
+                    sh_nexus_server::auth::MAX_USERNAME_CHARS
+                )));
+            }
+            if !auth::password_is_acceptable(secret) {
+                // The rule and the number; never the value. An operator reading
+                // this line learns exactly what to fix and nothing about the
+                // secret they chose.
+                return Err(ServerError::Configuration(format!(
+                    "{ADMIN_PASSWORD_VARIABLE} is shorter than the {} characters this \
+                     server requires",
+                    auth::MIN_PASSWORD_CHARS
+                )));
+            }
+            auth::bootstrap(store, found, secret)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Binds the listener and serves until a shutdown signal arrives.
@@ -165,10 +286,20 @@ struct Settings {
     bind: SocketAddr,
     /// The SQLite file to open.
     database: PathBuf,
+    /// The bootstrap administrator's handle, if exported.
+    admin_username: Option<String>,
+    /// The bootstrap administrator's password, if exported.
+    ///
+    /// A `String` and not a `Secret`-shaped wrapper because this crate declares no
+    /// `zeroize` and pretending otherwise would be the kind of security theatre the
+    /// project does not do: what is true is that it is read once, hashed once,
+    /// dropped when `Settings` goes out of scope at the end of `run`, and never
+    /// logged. A wrapper type would change none of that and would need an audit.
+    admin_password: Option<String>,
 }
 
 impl Settings {
-    /// Reads both variables, applying the documented defaults.
+    /// Reads all four variables, applying the documented defaults.
     ///
     /// # Errors
     ///
@@ -177,6 +308,13 @@ impl Settings {
     /// operator who meant `:9000` listening on 8484 and wondering why nobody can
     /// connect, which is the failure mode `AGENTS.md` §7.3's explicit rejections
     /// exist to prevent.
+    ///
+    /// **The two `SH_NEXUS_ADMIN_*` variables are read but not validated here.**
+    /// Whether a set-but-incomplete pair is an error depends on whether the
+    /// instance already has an account, which only the database knows, so the
+    /// pairing rule lives in [`bootstrap_first_administrator`] where the store is
+    /// available. That split is deliberate: `Settings` is "what the operator said"
+    /// and the bootstrap is "what the instance needs".
     fn from_env() -> Result<Self> {
         let bind = match std::env::var(BIND_VARIABLE) {
             Ok(value) => value.parse::<SocketAddr>().map_err(|error| {
@@ -215,6 +353,33 @@ impl Settings {
             }
         };
 
-        Ok(Self { bind, database })
+        Ok(Self {
+            bind,
+            database,
+            admin_username: optional_variable(ADMIN_USERNAME_VARIABLE)?,
+            admin_password: optional_variable(ADMIN_PASSWORD_VARIABLE)?,
+        })
+    }
+}
+
+/// Reads one optional variable, treating an empty value as absent.
+///
+/// **Empty is absent, and the reason is operator ergonomics rather than
+/// leniency.** `SH_NEXUS_ADMIN_PASSWORD=` in a shell profile or a systemd unit is
+/// how a secret most often gets "removed" without anybody meaning to remove it, and
+/// treating it as a set-but-empty credential would make the process exit with a
+/// confusing message about a value the operator believes they unset.
+///
+/// The `NotUnicode` arm is reported rather than ignored: a variable that cannot be
+/// read is a broken environment, and silently acting as though it were unset is the
+/// class of bug `AGENTS.md` §2.1's explicit rejections exist to prevent.
+fn optional_variable(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) if value.is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(ServerError::Configuration(format!(
+            "{name} could not be read: {error}"
+        ))),
     }
 }

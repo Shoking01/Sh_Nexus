@@ -118,8 +118,16 @@ async fn two_clients_exchange_a_message_and_the_sender_is_acknowledged() {
     assert_eq!(acked.channel_id, DEFAULT_CHANNEL_ID);
     assert_eq!(acked.content, "hello team");
     assert_eq!(
+        acked.user_id,
+        server.admin_user_id(),
+        "the author comes from the handshake's session, so the transcript names the \
+         account that sent the message rather than a reserved row"
+    );
+    assert_ne!(
         acked.user_id, UNATTRIBUTED_USER_ID,
-        "there is no authentication in this milestone, so the author is the reserved row"
+        "the reserved row is not the author of anything this build accepts; `db.rs` \
+         keeps the row only so a transcript written before this milestone still \
+         renders an author"
     );
     assert!(
         !acked.id.is_empty(),

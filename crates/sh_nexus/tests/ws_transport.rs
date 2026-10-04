@@ -91,6 +91,66 @@ const CHANNEL: &str = "c_general";
 /// body rather than about some non-empty string.
 const BODY: &str = "hello from client A";
 
+/// How long a socket's counters must hold still before a test may treat the worker
+/// as finished with it.
+///
+/// **A bound on an observation, not a `sleep()` waiting for logic.** The read loop
+/// runs on its own OS thread with no completion signal, so "it has stopped moving" is
+/// the only honest available answer; this is the interval across which that is checked,
+/// and it is several times the loop's own turnaround so an in-flight delivery lands
+/// inside the window rather than after it.
+const QUIESCE_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long a worker gets to go quiet before the wait gives up and says so.
+///
+/// **Its own budget, not [`READY_BUDGET`]**, and deliberately larger. `READY_BUDGET` is
+/// sized for a loopback handshake; a worker spending its connect allowance waits out a
+/// real backoff between attempts, and reusing the shorter budget meant the wait
+/// expired mid-backoff and read the counters before the worker's last act.
+const QUIESCE_FINISH_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Waits until a transport's worker has genuinely finished, and returns its stats.
+///
+/// **`is_closed()` is not this.** It reads a flag that `shutdown()` sets and that the
+/// worker's own terminal branch sets, and in both cases the flag goes up *before* the
+/// loop stops touching the socket. Two tests read a counter immediately after waiting
+/// on `is_closed()` and saw the state from *before* the worker's last act: one read
+/// `connect_failures == 1` where two attempts were allowed, and one read 1025
+/// delivered against a bound of 1024. Both reproduced on the CI runner and not in ten
+/// local runs, which is the worst possible ratio to debug with.
+///
+/// **Two earlier versions of this helper were worse than the bug, and both are
+/// recorded here so the shape is not "simplified" back into them.** The first slept
+/// inside a `wait_until` predicate — but that helper sleeps 1 ms per iteration and
+/// checks its own deadline, so a 150 ms sleep inside the predicate blew the budget and
+/// returned with every counter at zero, failing 20 runs out of 20. The second fixed
+/// that by snapshotting before the first sleep, which made "nothing changed" trivially
+/// true for a worker that had not started yet. So: **its own loop, and quiet only
+/// counts once work has been seen.**
+///
+/// There is no `JoinHandle` to await, so the counters — the only observable that means
+/// "nothing more will happen" — are polled directly. The deadline is generous on
+/// purpose: a worker spending its allowance waits out a real backoff between attempts,
+/// and this must outlast that rather than race it.
+fn wait_for_worker_to_finish(transport: &WsTransport) -> TransportStats {
+    let deadline = Instant::now() + QUIESCE_FINISH_BUDGET;
+    let mut last = transport.stats();
+    let mut seen_work = false;
+    while Instant::now() < deadline {
+        std::thread::sleep(QUIESCE_SETTLE);
+        let now = transport.stats();
+        seen_work |= now != TransportStats::default();
+        if seen_work && now == last {
+            return now;
+        }
+        last = now;
+    }
+    panic!(
+        "the transport's worker never went quiet within {QUIESCE_FINISH_BUDGET:?}; \
+         last seen {last:?}"
+    );
+}
+
 /// A timestamp the caller supplies, since `state/` may not read a clock.
 fn at(second: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_789_000_000 + second, 0)
@@ -196,11 +256,10 @@ fn two_transports_exchange_a_message_through_one_real_server(cx: &mut TestAppCon
     let sender_a = install(cx, ME);
     let sender_b = install(&mut b, THEM);
 
-    let url = server.url();
-    let transport_a =
-        WsTransport::start(TransportConfig::new(url.clone()), sender_a.clone()).expect("a thread");
-    let transport_b =
-        WsTransport::start(TransportConfig::new(url), sender_b.clone()).expect("a thread");
+    let config_a = server.authenticated_config();
+    let config_b = server.authenticated_config();
+    let transport_a = WsTransport::start(config_a.clone(), sender_a.clone()).expect("a thread");
+    let transport_b = WsTransport::start(config_b.clone(), sender_b.clone()).expect("a thread");
 
     await_connected(cx);
     await_connected(&mut b);
@@ -335,10 +394,10 @@ fn a_full_inbox_refuses_the_arriving_event_rather_than_growing(cx: &mut TestAppC
         "the bound is the bridge's, and it is already reached: {overflow}"
     );
 
-    let url = server.url();
-    let transport_a =
-        WsTransport::start(TransportConfig::new(url.clone()), sender_a).expect("a thread");
-    let transport_b = WsTransport::start(TransportConfig::new(url), sender_b).expect("a thread");
+    let config_a = server.authenticated_config();
+    let config_b = server.authenticated_config();
+    let transport_a = WsTransport::start(config_a.clone(), sender_a).expect("a thread");
+    let transport_b = WsTransport::start(config_b.clone(), sender_b).expect("a thread");
 
     // **Waited on the counter, not on the inbox.** B's inbox is full, so B's
     // connection-state events are being refused too — which is the honest situation
@@ -352,18 +411,41 @@ fn a_full_inbox_refuses_the_arriving_event_rather_than_growing(cx: &mut TestAppC
         .send_message(client_msg_id, CHANNEL, BODY)
         .expect("the send is queued");
 
-    support::wait_until(
-        "B to have read the frame and refused it",
-        READY_BUDGET,
-        || {
-            let stats = transport_b.stats();
-            stats.frames_read >= 1 && stats.events_delivered == 0 && stats.events_refused >= 1
-        },
+    support::wait_until("B to have read the frame", READY_BUDGET, || {
+        transport_b.stats().frames_read >= 1
+    });
+
+    // **Then wait for B to be quiescent, and the reason is not cosmetic.**
+    //
+    // An earlier version of this test waited for `events_refused >= 1`, which a
+    // connection-state event satisfies just as well as the message does — B's inbox
+    // is full, so its `Connecting` and `Connected` are refused too. That wait
+    // returned before B had read the message frame at all, the drain below freed a
+    // slot, and **the message then fitted**: 1025 delivered against a bound of 1024.
+    // It reproduced on the CI runner and not in ten local runs, which is the worst
+    // possible ratio.
+    //
+    // `frames_read >= 1` alone is not sufficient either, because the delivery attempt
+    // happens after the read. The observable that means "nothing more will be
+    // enqueued" is the worker's counters going still.
+    let settled = wait_for_worker_to_finish(&transport_b);
+    assert!(
+        settled.frames_read >= 1 && settled.events_delivered == 0 && settled.events_refused >= 1,
+        "B read the frame, delivered nothing, and refused it: {settled:?}"
     );
 
     // And the inbox did not grow to make room: draining takes exactly what was put
     // in, and not one more. This is the assertion that matters, because "the event
     // was refused" and "the event was dropped to make space" are the same counter.
+    // Both transports are stopped before the drain, so nothing is still mid-send. That
+    // is necessary and it is **not** sufficient: `shutdown()` sets a flag without
+    // joining, so the wait above is what actually establishes quiescence. The bound
+    // itself was never violated — a `sync_channel(MAX_PENDING_EVENTS)` cannot hold
+    // more than that at any instant — and what this asserts is that the inbox reached
+    // its bound and held there while a socket was actively delivering into it.
+    transport_a.shutdown();
+    transport_b.shutdown();
+
     let report = drain_report(cx);
     assert_eq!(
         report.delivered(),
@@ -375,8 +457,6 @@ fn a_full_inbox_refuses_the_arriving_event_rather_than_growing(cx: &mut TestAppC
         "the refused message must not have reached the state by another route"
     );
 
-    transport_a.shutdown();
-    transport_b.shutdown();
     drop(server);
 }
 
@@ -412,9 +492,17 @@ fn a_dropped_connection_is_retried_on_the_backoff_schedule_and_recovers(cx: &mut
     let url = format!("ws://127.0.0.1:{port}{WS_PATH}");
     let sender = install(cx, ME);
 
-    // Nothing is listening on `port` yet, so this transport starts by failing — which
-    // is the only way to observe the schedule without a proxy in the middle.
-    let transport = WsTransport::start(TransportConfig::new(url), sender).expect("a thread");
+    // The server is started, a session is taken from it, and then it is **stopped**.
+    // That sequence is the only way to hold a valid token across a gap in which the
+    // port is closed: a token is bound to one database file, and a database is only
+    // readable through a server. So the transport is started against a port nothing
+    // is listening on, with a credential the restarted server will accept.
+    let mut server = ServerProcess::start_on(port, "reconnect");
+    let token = server.token();
+    server.stop();
+
+    let transport =
+        WsTransport::start(TransportConfig::new(url).with_token(token), sender).expect("a thread");
 
     support::wait_until("the first connect to fail", READY_BUDGET, || {
         transport.stats().connect_failures >= 1
@@ -432,11 +520,12 @@ fn a_dropped_connection_is_retried_on_the_backoff_schedule_and_recovers(cx: &mut
          that reconnects 100 times a second against a server that is down."
     );
 
-    // The server arrives on the port the transport is already watching. `connects`
-    // counts *established* sockets, so it is 1 here and not 3: the two attempts made
-    // while the port was empty never produced a socket, which is what
+    // The server arrives on the port the transport is already watching, against the
+    // same database, so the token the transport already holds is still the right one.
+    // `connects` counts *established* sockets, so it is 1 here and not 3: the two
+    // attempts made while the port was empty never produced a socket, which is what
     // `connect_failures` counts instead.
-    let server = ServerProcess::start_on(port, "reconnect");
+    server.restart();
     await_connected(cx);
     assert!(
         transport.stats().connects >= 1,
@@ -552,11 +641,27 @@ fn the_transport_gives_up_after_its_configured_allowance(cx: &mut TestAppContext
     )
     .expect("a thread");
 
-    support::wait_until("the transport to give up", READY_BUDGET, || {
-        transport.is_closed()
+    // **Both conditions, and the reason is specific.** `is_closed()` is the worker
+    // saying it will make no further attempt, but the flag goes up *before* the loop
+    // stops, so reading `connect_failures` straight after waiting on it can observe
+    // `1` on a run where two attempts were allowed and the second had not been made
+    // yet. That reproduced roughly once in twenty-five runs, on the CI runner and not
+    // in ten local runs, which is a bad ratio for a test that exists to be evidence.
+    //
+    // Waiting on `connect_failures >= 2` **alone** is not sufficient either: the second
+    // counter can climb while the worker is between its last attempt and the terminal
+    // `Disconnected` emission. Both together say "the allowance is spent and the loop
+    // has finished", which is the thing being asserted; the counter is the more
+    // specific of the two, so it is the one that gates the flag.
+    support::wait_until("the transport to spend its allowance", READY_BUDGET, || {
+        transport.is_closed() && transport.stats().connect_failures >= 2
     });
 
     let stats: TransportStats = transport.stats();
+    assert!(
+        transport.is_closed(),
+        "having spent its allowance, the transport says so: {stats}"
+    );
     assert_eq!(
         stats.connect_failures, 2,
         "two attempts were allowed and exactly two were made: {stats}"
@@ -605,16 +710,15 @@ fn the_transport_gives_up_after_its_configured_allowance(cx: &mut TestAppContext
 #[test]
 fn an_unsupported_major_version_is_refused_rather_than_silently_continued() {
     let server = ServerProcess::start("version");
+    let token = server.token();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("a current-thread runtime");
 
     runtime.block_on(async {
-        let url = server.url();
-        let (mut socket, _) = connect_async(url.as_str())
-            .await
-            .expect("a websocket upgrade");
+        let request = server.handshake_request(Some(&token));
+        let (mut socket, _) = connect_async(request).await.expect("a websocket upgrade");
 
         // Announce a major this build does not speak. The envelope's `v` is public
         // precisely so that a peer *can* mis-announce; `ClientEnvelope::new` exists
@@ -678,6 +782,7 @@ fn an_unsupported_major_version_is_refused_rather_than_silently_continued() {
 #[test]
 fn a_frame_the_server_does_not_implement_leaves_the_socket_open() {
     let server = ServerProcess::start("unimplemented-frame");
+    let token = server.token();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -685,10 +790,8 @@ fn a_frame_the_server_does_not_implement_leaves_the_socket_open() {
 
     runtime.block_on(async {
         use futures_util::{SinkExt, StreamExt};
-        let url = server.url();
-        let (mut socket, _) = connect_async(url.as_str())
-            .await
-            .expect("a websocket upgrade");
+        let request = server.handshake_request(Some(&token));
+        let (mut socket, _) = connect_async(request).await.expect("a websocket upgrade");
 
         // A `resync` is exactly the frame `sh_nexus_server/src/ws.rs` decodes,
         // `warn!`s about and drops. The connection must survive it.
@@ -809,6 +912,240 @@ fn a_zero_capacity_outbound_queue_is_refused_rather_than_panicking(cx: &mut Test
 
     assert_eq!(error, TransportError::OutboundFull { capacity: 0 });
     assert_eq!(error.to_string(), "the outbound queue is full at 0 frames");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Authentication
+// ---------------------------------------------------------------------------
+
+/// A 401 on the handshake is a `Rejected` connection, and the transport stops.
+///
+/// **The client half of the auth milestone, and the reason it is its own test**
+/// rather than an assertion inside the two-client flow: a transport with no token is
+/// the state every user lands in when their session expires, and what this asserts
+/// is that the state is *terminal and visible* rather than an endless
+/// "reconnecting" that a user cannot act on.
+///
+/// Three separate claims, each of which would be false on its own:
+///
+/// 1. **`Rejected`, not `Disconnected`.** `ConnectionState::Disconnected` invites a
+///    retry, and a retry against a server that refuses identically every time is
+///    the exact loop `classify_frame_error`'s docs call terminal.
+/// 2. **Terminal.** The transport stops rather than backing off; `is_closed()`
+///    becomes true and no further attempt is counted. A rejected version already
+///    behaves this way — this is the second condition that gets it right.
+/// 3. **A distinct code**, so a sign-in screen can tell "your token is not accepted"
+///    from "this server is not this version of the protocol". Both are `Rejected`;
+///    only the code separates them.
+#[gpui::test]
+fn a_refused_session_token_is_a_rejected_connection_and_the_transport_stops(
+    cx: &mut TestAppContext,
+) {
+    let server = ServerProcess::start("unauthenticated");
+    let sender = install(cx, ME);
+
+    // No token at all. This is the ordinary failure: a client that has not signed
+    // in, or whose session the server has never heard of.
+    let url = server.endpoint();
+    let transport = WsTransport::start(TransportConfig::new(url), sender).expect("a thread");
+
+    support::wait_until("the handshake to be refused", READY_BUDGET, || {
+        drain(cx);
+        matches!(connection(cx), ConnectionState::Rejected { .. })
+    });
+
+    match connection(cx) {
+        ConnectionState::Rejected { code, detail } => {
+            assert_eq!(
+                code,
+                sh_nexus::network::ws::UNAUTHORIZED_CODE,
+                "a refused credential gets its own code, so a sign-in screen can \
+                 distinguish it from an unsupported protocol version"
+            );
+            assert_eq!(detail, sh_nexus::network::ws::UNAUTHORIZED_DETAIL);
+            assert!(
+                !detail.to_lowercase().contains("retry"),
+                "the detail must not invite a retry: a client that retries a refused \
+                 credential sits in a backoff loop against a server that will refuse \
+                 it identically every time. Got {detail:?}"
+            );
+        }
+        other => panic!("expected a Rejected connection, got {other:?}"),
+    }
+
+    // Terminal: the worker ended, so no further attempt is made and the handle
+    // reports itself closed. The counters are read after the worker has actually
+    // stopped, not after the flag went up -- see `wait_for_worker_to_finish`.
+    let stats = wait_for_worker_to_finish(&transport);
+    assert!(
+        transport.is_closed(),
+        "a terminal rejection ends the transport: {stats}"
+    );
+    assert_eq!(
+        stats.rejected_handshakes, 1,
+        "exactly one attempt: a terminal rejection is not retried. {stats}"
+    );
+    assert_eq!(
+        stats.connects, 0,
+        "and no socket was ever established, which is what the server's pre-upgrade \
+         refusal means from this side. {stats}"
+    );
+    assert_eq!(
+        transport.send_message(Uuid::new_v4(), CHANNEL, BODY),
+        Err(TransportError::ShutDown),
+        "a stopped transport sends nothing, so an optimistic row stays pending rather \
+         than failing for a reason the user cannot see"
+    );
+
+    transport.shutdown();
+    drop(server);
+}
+
+/// The same refusal for a token the server has never issued.
+///
+/// Distinct from the test above because it is the case a *stale* client hits: a
+/// session that expired, or one from a database that was replaced. The server
+/// answers it identically -- which is the point, and is what stops a peer from
+/// enumerating valid tokens by presenting invalid ones.
+#[gpui::test]
+fn an_unknown_token_is_refused_exactly_as_a_missing_one_is(cx: &mut TestAppContext) {
+    let server = ServerProcess::start("unknown-token");
+    let sender = install(cx, ME);
+
+    let url = server.endpoint();
+    // 64 lowercase hex characters, which is the shape `auth::bearer_token` accepts
+    // -- so this is refused by the *session lookup* and not by the shape check. The
+    // client cannot know which of the two the server applied, and that is the
+    // property; what it must do with either is identical.
+    let cfg = TransportConfig::new(url).with_token("0".repeat(64));
+    let transport = WsTransport::start(cfg, sender).expect("a thread");
+
+    support::wait_until("the handshake to be refused", READY_BUDGET, || {
+        drain(cx);
+        matches!(connection(cx), ConnectionState::Rejected { .. })
+    });
+    drain(cx);
+    match connection(cx) {
+        ConnectionState::Rejected { code, .. } => assert_eq!(
+            code,
+            sh_nexus::network::ws::UNAUTHORIZED_CODE,
+            "a token the server has never issued is refused the same way a missing one is"
+        ),
+        other => panic!("expected a Rejected connection, got {other:?}"),
+    }
+
+    transport.shutdown();
+    drop(server);
+}
+
+/// A revoked token stops working, and the client learns it the next time it connects.
+///
+/// The revocation path from the server's side, observed from here: log in, use the
+/// token, revoke it, and the *next* handshake is refused. A live socket is not
+/// killed -- `PLAN.md` §6 has no frame for a server-initiated revocation, and
+/// `sh_nexus_server::auth::logout`'s docs say so -- so the assertion is about the
+/// reconnect, which is the boundary this transport can actually observe.
+#[gpui::test]
+fn a_revoked_token_is_refused_on_the_next_handshake(cx: &mut TestAppContext) {
+    let server = ServerProcess::start("revoked");
+    let token = server.token();
+    let sender = install(cx, ME);
+
+    let url = server.endpoint();
+    let transport = WsTransport::start(TransportConfig::new(url).with_token(token.clone()), sender)
+        .expect("a thread");
+    await_connected(cx);
+
+    // Revoke it out of band, over the same HTTP endpoint the product would use.
+    support::revoke(&server, &token);
+
+    // The open socket keeps working, because nothing in the protocol tells the
+    // server to close it. What must happen is that the *next* handshake is refused,
+    // and the only way to observe that through this transport is to make it
+    // reconnect: `shutdown` plus a fresh transport on the same URL and token.
+    assert!(
+        {
+            drain(cx);
+            connection(cx) == ConnectionState::Connected
+        },
+        "the open socket is unaffected by a revocation: closing a live connection from \
+         the server is not in PLAN.md section 6 yet"
+    );
+    transport.shutdown();
+
+    // A second application, because `bridge::install` refuses a second install on one
+    // -- by design, so a second startup cannot orphan the first inbox. This is the
+    // same two-application shape the Real-time Flow test uses.
+    let mut second = cx.new_app();
+    let sender_again = install(&mut second, THEM);
+    let url = server.endpoint();
+    let again = WsTransport::start(
+        TransportConfig::new(url).with_token(token),
+        sender_again.clone(),
+    )
+    .expect("a thread");
+    support::wait_until("the revoked token to be refused", READY_BUDGET, || {
+        drain(&mut second);
+        matches!(connection(&second), ConnectionState::Rejected { .. })
+    });
+    drain(&mut second);
+    match connection(&second) {
+        ConnectionState::Rejected { code, .. } => assert_eq!(
+            code,
+            sh_nexus::network::ws::UNAUTHORIZED_CODE,
+            "a revoked token is refused exactly as an unknown one is"
+        ),
+        other => panic!("expected a Rejected connection, got {other:?}"),
+    }
+
+    again.shutdown();
+    drop(server);
+}
+
+/// The token is not in any `Debug` a caller can reach, and this client cannot hash
+/// a password.
+///
+/// The second half is the dependency-direction claim: `cargo tree -p sh_nexus` must
+/// not contain `argon2` or `sha2`. A client that could hash a password would be a
+/// client that had a password to hash, and the manifest comment on
+/// `tokio-tungstenite` is the reason this suite does not link the server to check
+/// it. So the assertion is made here, on the manifest text, in the same way
+/// `tests/layer_boundary.rs` asserts that the client does not depend on `serde`.
+#[test]
+fn the_client_declares_no_crypto_dependency_and_the_token_stays_out_of_debug() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let text = fs::read_to_string(&manifest)
+        .unwrap_or_else(|error| panic!("{} should be readable: {error}", manifest.display()));
+    let stripped: String = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for forbidden in ["argon2", "sha2", "jsonwebtoken", "ring"] {
+        assert!(
+            !stripped.contains(forbidden),
+            "this crate must not depend on `{forbidden}`. The client is handed an \
+             opaque session token and sends it; it never sees a password, so a \
+             password-hashing dependency here would be a dependency with nothing to \
+             do. ADR-010's token decision put hashing on the server side, and the \
+             reason is revocation."
+        );
+    }
+
+    let config = TransportConfig::new("ws://127.0.0.1:8484/ws").with_token("a-live-token");
+    let rendered = format!("{config:?}");
+    assert!(
+        !rendered.contains("a-live-token"),
+        "TransportConfig's Debug must not carry the token: AGENTS.md 7.5 names tokens \
+         as a thing that must never reach a log, and a {{:?}} in a panic message is a \
+         log. Got {rendered}"
+    );
+    assert!(
+        rendered.contains("token_configured: true"),
+        "and the presence of one is worth printing, because a transport that will be \
+         refused with a 401 is diagnosable from that boolean alone. Got {rendered}"
+    );
 }
 
 // ---------------------------------------------------------------------------

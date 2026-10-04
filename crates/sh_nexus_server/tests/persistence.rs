@@ -6,6 +6,25 @@
 //! public [`Store`] API rather than unit tests inside `db.rs`, so the assertions
 //! are about what a caller can observe -- which is the only thing a test can
 //! usefully pin down.
+//!
+//! # What changed when authentication arrived, and why this file barely moved
+//!
+//! Two deliberate edits, both worth naming rather than leaving as a diff:
+//!
+//! - **[`SCHEMA_VERSION`] is asserted against itself, so this file did not have to
+//!   change its version assertions at all** -- and that is the point of asserting
+//!   it as a constant rather than as `1`. What *did* change is what the schema
+//!   version means, and `tests/auth.rs::migration_two_is_additive_and_preserves_a
+//!   schema_one_database` is the test that pins the new meaning: a file migrated
+//!   from schema 1 keeps every row, every `messages` row keeps its author, and the
+//!   reserved row gains two nullable/defaulted columns.
+//! - **`accept_message` takes an author**, and the calls here pass
+//!   [`UNATTRIBUTED_USER_ID`]. That is not a step back to the pre-auth behaviour:
+//!   the store attributes a message to whatever id it is *given*, and what a real
+//!   connection gives it comes from the handshake. **The store is a container and
+//!   decides nothing about identity**, which is the same reason these tests can use
+//!   the reserved row without asserting anything about who wrote a message.
+//!   `tests/auth.rs` is where authorship is asserted.
 
 mod support;
 
@@ -47,7 +66,12 @@ fn adr_010_requires_read_cursors_to_exist_from_the_first_migration() {
     let directory = TempDir::new("read-cursors").expect("a temporary directory");
     let (store, path) = open(&directory);
     store
-        .accept_message(FIRST_ID, DEFAULT_CHANNEL_ID, "hello team")
+        .accept_message(
+            FIRST_ID,
+            DEFAULT_CHANNEL_ID,
+            UNATTRIBUTED_USER_ID,
+            "hello team",
+        )
         .expect("an accepted message");
 
     let connection = Connection::open(&path).expect("a reader connection");
@@ -103,7 +127,12 @@ fn channel_members_exists_and_enforces_its_foreign_keys() {
     let directory = TempDir::new("channel-members").expect("a temporary directory");
     let (store, path) = open(&directory);
     store
-        .accept_message(FIRST_ID, DEFAULT_CHANNEL_ID, "hello team")
+        .accept_message(
+            FIRST_ID,
+            DEFAULT_CHANNEL_ID,
+            UNATTRIBUTED_USER_ID,
+            "hello team",
+        )
         .expect("an accepted message");
 
     let connection = Connection::open(&path).expect("a reader connection");
@@ -151,7 +180,7 @@ fn every_byte_of_a_message_body_round_trips_verbatim() {
 
     for (index, content) in bodies.iter().enumerate() {
         let id = format!("id-{index}");
-        match store.accept_message(&id, DEFAULT_CHANNEL_ID, content) {
+        match store.accept_message(&id, DEFAULT_CHANNEL_ID, UNATTRIBUTED_USER_ID, content) {
             Ok(sh_nexus_server::AcceptOutcome::Inserted(message)) => {
                 assert_eq!(
                     &message.content, content,
@@ -192,6 +221,7 @@ fn messages_are_ordered_by_acceptance_then_by_id() {
             .accept_message(
                 &format!("id-{index}"),
                 DEFAULT_CHANNEL_ID,
+                UNATTRIBUTED_USER_ID,
                 &format!("message {index}"),
             )
             .expect("an accepted message");
@@ -229,10 +259,20 @@ fn reopening_an_existing_database_preserves_its_rows_and_its_version() {
     let directory = TempDir::new("reopen").expect("a temporary directory");
     let (store, path) = open(&directory);
     store
-        .accept_message(FIRST_ID, DEFAULT_CHANNEL_ID, "hello team")
+        .accept_message(
+            FIRST_ID,
+            DEFAULT_CHANNEL_ID,
+            UNATTRIBUTED_USER_ID,
+            "hello team",
+        )
         .expect("an accepted message");
     store
-        .accept_message(SECOND_ID, DEFAULT_CHANNEL_ID, "still here")
+        .accept_message(
+            SECOND_ID,
+            DEFAULT_CHANNEL_ID,
+            UNATTRIBUTED_USER_ID,
+            "still here",
+        )
         .expect("a second accepted message");
     drop(store);
 
@@ -286,7 +326,12 @@ fn a_file_from_a_newer_build_is_refused_rather_than_opened() {
     let directory = TempDir::new("too-new").expect("a temporary directory");
     let (store, path) = open(&directory);
     store
-        .accept_message(FIRST_ID, DEFAULT_CHANNEL_ID, "hello team")
+        .accept_message(
+            FIRST_ID,
+            DEFAULT_CHANNEL_ID,
+            UNATTRIBUTED_USER_ID,
+            "hello team",
+        )
         .expect("an accepted message");
     drop(store);
 
@@ -365,7 +410,7 @@ fn a_send_naming_an_unknown_channel_is_refused_by_the_store() {
     let directory = TempDir::new("unknown-channel").expect("a temporary directory");
     let (store, _) = open(&directory);
 
-    match store.accept_message(FIRST_ID, "c_nowhere", "hello team") {
+    match store.accept_message(FIRST_ID, "c_nowhere", UNATTRIBUTED_USER_ID, "hello team") {
         Err(ServerError::UnknownChannel { channel_id }) => {
             assert_eq!(channel_id, "c_nowhere");
         }

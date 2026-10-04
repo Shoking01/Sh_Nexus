@@ -63,24 +63,74 @@
 //!
 //! | Not here | Named as |
 //! |---|---|
-//! | Authentication, tokens, a login frame | ADR-010's next PR. The server accepts unauthenticated sends, so there is nothing to send. |
+//! | Storing the token | `AGENTS.md` §7.1's OS keychain, behind `platform/`. **There is no keychain in this build**, so a token does not survive the process. See the authentication section above. |
+//! | Obtaining the token | A login screen and a `POST /auth/login` call. This module is handed one. |
 //! | TLS. The URL must be `ws://`; `wss://` needs a TLS feature and a root store, and `AGENTS.md` §7.4's "certificate validation must never be disabled in release builds" is a rule about a stack this client does not have yet. | ADR-010 |
 //! | The outbox, so a `Pending` send survives a disconnect | `PLAN.md` §7's persistence work. This queues what it was handed while running; it does not persist. |
 //! | A `reaction.remove`, because `PLAN.md` §6 has no such frame | A protocol addition, not a client omission. |
 //! | Any log line | See below. |
 //!
+//! # Authentication: the token is sent, never stored
+//!
+//! [`TransportConfig::with_token`] takes an opaque session token that some other
+//! piece of this program obtained -- a `POST /auth/login` response -- and the
+//! transport puts it in one place and one place only: the `Authorization: Bearer`
+//! header on the WebSocket handshake. It is re-sent on every reconnect, because a
+//! reconnect re-does the handshake and a session that worked once works again.
+//!
+//! ## Where it goes, and what this milestone deliberately does NOT do
+//!
+//! | | |
+//! |---|---|
+//! | Written to a file | **No.** `AGENTS.md` §7.1 forbids plaintext storage of tokens and names the OS keychain as the answer. `platform/` does not exist yet, so **there is no keychain in this build**. |
+//! | Written to a log | **No.** See "Why there is no `tracing` call in this file" below -- there are no lines at all. |
+//! | In a `Debug` or an error | **No.** [`TransportConfig`]'s `Debug` is hand-written and omits the token; `TransportError` has no payload that could carry one; and the token is never formatted into a message. |
+//! | Sent in a frame | **No.** `PLAN.md` §6's frames have no field for it, and the server reads it from the handshake only. |
+//!
+//! **So this client holds a live credential in memory and will lose it when the
+//! process ends.** That is the honest state of the work, stated here rather than
+//! discovered by a user who was surprised to sign in again. The next milestone adds
+//! `platform/keychain.rs` and changes exactly one thing in this file: where the
+//! token comes from at startup. Nothing about the transport changes, because the
+//! transport was already built to be handed a token rather than to obtain one.
+//!
+//! # A `401` on the handshake is a `Rejected` connection, not a generic error
+//!
+//! The server refuses an unauthenticated upgrade **before** the upgrade, with an
+//! HTTP 401 and a `WWW-Authenticate: Bearer` header -- it never sends a 101 and then
+//! closes. `tokio-tungstenite` surfaces that as a failed handshake carrying the
+//! response, and this module turns it into
+//! [`ConnectionState::Rejected`] with [`UNAUTHORIZED_CODE`].
+//!
+//! **Terminal, and deliberately so**, because it is the same decision
+//! `classify_frame_error` makes for an unsupported protocol version: a client that
+//! retries a credential the server has already refused sits in a backoff loop
+//! against a server that will refuse it identically every time, and the user's only
+//! experience of it is a UI that says "reconnecting" forever. `Rejected` is the
+//! state the rest of this crate documents as "the peer refused this client, and
+//! retrying will not help", so a sign-in screen can act on it.
+//!
+//! **The response body is not parsed**, and the reason is a dependency-direction
+//! argument rather than laziness: an HTTP status line is not a `sh_nexus_wire`
+//! frame, so there is no versioned envelope to read and no protocol type
+//! describing that JSON. Parsing it would make this client depend on a
+//! server-internal shape that `sh_nexus_wire` does not define and cannot version.
+//! [`UNAUTHORIZED_CODE`] is therefore a constant this module owns, exactly as
+//! `UNSUPPORTED_VERSION_CODE` is the wire crate's.
+//!
 //! # Why there is no `tracing` call in this file
 //!
 //! `AGENTS.md` §7.5 requires `tracing` and §7.1 bans `println!`, and this file
-//! obeys both by making **no log line at all**: `crates/sh_nexus` does not
-//! declare `tracing`, and adding it is an `AGENTS.md` §7.2 audit this work unit
-//! does not carry. So instead of logging, the transport *counts*, and the counts
+//! obeys both by making **no log line at all**: `crates/sh_nexus` does not declare
+//! `tracing`, and adding it is an `AGENTS.md` §7.2 audit this work unit does not
+//! carry. So instead of logging, the transport *counts*, and the counts
 //! are public: [`WsTransport::stats`] returns a [`TransportStats`] snapshot in
-//! which `events_refused`, `frames_dropped`, `writes_failed`, `connect_timeouts`
-//! and `keepalive_abandoned` are exactly the five conditions that would have been
-//! log lines. A drop is never silent — it is a number a caller can poll — and no
-//! line can leak message content, because there are no lines. What the *server*
-//! logs about its half of the same conditions is `sh_nexus_server/src/ws.rs`.
+//! which `events_refused`, `frames_dropped`, `writes_failed`, `connect_timeouts`,
+//! `rejected_handshakes` and `keepalive_abandoned` are exactly the six conditions
+//! that would have been log lines. A drop is never silent — it is a number a
+//! caller can poll — and no line can leak message content or a credential, because
+//! there are no lines. What the *server* logs about its half of the same conditions
+//! is `sh_nexus_server/src/ws.rs`.
 //!
 //! # An example
 //!
@@ -117,7 +167,10 @@ use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Notify};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{HeaderValue, AUTHORIZATION};
+use tokio_tungstenite::tungstenite::http::{Request, StatusCode, Uri};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
@@ -545,6 +598,69 @@ pub fn classify_frame_error(error: &WireError) -> FrameFailure {
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// The `code` a rejected handshake carries in [`ConnectionState::Rejected`].
+///
+/// **Owned by this module rather than by `sh_nexus_wire`, and the reason is a
+/// protocol gap rather than an oversight.** An HTTP status line is not a frame:
+/// there is no `v` on it, no envelope to decode, and therefore nothing for the
+/// wire crate to define a code in. A future protocol revision may well introduce a
+/// versioned HTTP error shape, and defining the code there is a smaller change than
+/// having two copies of this one. The trade-off this buys is that
+/// [`UNAUTHORIZED_CODE`] is a vocabulary *between* the two sides rather than inside
+/// the protocol -- which is why a client's sign-in screen must treat it as "this
+/// token is not accepted" and not as a versioned statement it could switch on
+/// exhaustively.
+pub const UNAUTHORIZED_CODE: &str = "unauthorized";
+
+/// The sentence a rejected handshake shows.
+///
+/// **Fixed text, and the reason is that retrying is exactly the wrong advice.**
+/// `ConnectionState::Rejected` is documented throughout this crate as terminal, and
+/// this is the one place a client could accidentally invite a retry. "Sign in
+/// again" is what the user has to do; "the connection failed" is not.
+pub const UNAUTHORIZED_DETAIL: &str =
+    "this server refused the session token; sign in again to reconnect";
+
+/// The `code` an unusable endpoint or token carries in
+/// [`ConnectionState::Rejected`].
+///
+/// **Separate from [`UNAUTHORIZED_CODE`] because the fix is different.** A 401 means
+/// "get a new token"; an unparseable URL means "fix the configuration". Both are
+/// terminal -- waiting cannot make either one different -- but a sign-in screen that
+/// showed "sign in again" for a typo in a URL would send the user to the wrong form.
+pub const BAD_ENDPOINT_CODE: &str = "bad_endpoint";
+
+/// The sentence an unusable endpoint or token shows.
+pub const BAD_ENDPOINT_DETAIL: &str =
+    "the endpoint or the session token could not be put into a WebSocket handshake";
+
+/// Whether a failed handshake was the server refusing this client's credential.
+///
+/// **A pure function of the driver's error, with no I/O**, so the policy
+/// "a 401 is terminal, everything else is retryable" is one testable decision
+/// rather than a branch inside the connect loop.
+///
+/// # Arguments
+///
+/// * `error` - what `connect_async` returned.
+///
+/// # Returns
+///
+/// `true` only for an HTTP error carrying status 401. `false` for a DNS failure, a
+/// TCP refusal, a TLS failure, a protocol violation, and any other status: none of
+/// those is about the credential, and treating a 500 as terminal would strand a
+/// client against a server that is merely unwell.
+///
+/// The *response body* is deliberately not inspected -- see the module docs on why
+/// an HTTP refusal body is not a versioned protocol document.
+///
+/// The match is written against the status rather than the `Display` string on
+/// purpose: `WsError`'s `Display` for this variant is `"HTTP error: 401"`, and a
+/// policy that turned on prose would break the next time tungstenite reworded it.
+pub fn is_unauthorized(error: &WsError) -> bool {
+    matches!(error, WsError::Http(response) if response.status() == StatusCode::UNAUTHORIZED)
+}
+
 /// How one transport behaves.
 ///
 /// Every timeout is a field rather than a constant so a test can shorten a wait
@@ -553,17 +669,57 @@ pub fn classify_frame_error(error: &WireError) -> FrameFailure {
 /// schedule is documented against, and a test that needs a fast loop sets its own
 /// through [`TransportConfig::with_keepalive_interval`]. A constant a test cannot
 /// change is a constant a test stops asserting.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # The token is in here, and the `Debug` is hand-written for that reason
+///
+/// [`token`] is an `Option<String>` and this type's `Debug` prints
+/// `token_configured: bool` instead. A derived `Debug` would put a live bearer
+/// token into every `{:?}`, and this module's own [`WsTransport::stats`] doc
+/// explains the rule it is following: **a `{:?}` inside a panic message is a log**,
+/// and `AGENTS.md` §7.5 names tokens as a thing that must never reach one. A
+/// hand-written impl is a place where that promise is visible and reviewable; the
+/// alternative was a derive nobody had to think about.
+#[derive(Clone, PartialEq, Eq)]
 pub struct TransportConfig {
     url: String,
+    /// The bearer token presented on every handshake, if the caller supplied one.
+    ///
+    /// **Never persisted, never logged, and never sent in a frame.** See the module
+    /// docs for where it does and does not go, and for why the OS keychain that
+    /// `AGENTS.md` §7.1 asks for does not exist in this build.
+    token: Option<String>,
     connect_timeout: Duration,
     keepalive_interval: Duration,
     max_attempts: Option<u32>,
     outbound_capacity: usize,
 }
 
+impl fmt::Debug for TransportConfig {
+    /// Prints the URL and the shape of the configuration, never the token.
+    ///
+    /// The token's *presence* is printed rather than hidden entirely: "this
+    /// transport will be refused with a 401" is a diagnosable condition and one
+    /// boolean is enough to see it.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransportConfig")
+            .field("url", &self.url)
+            .field("token_configured", &self.token.is_some())
+            .field("connect_timeout", &self.connect_timeout)
+            .field("keepalive_interval", &self.keepalive_interval)
+            .field("max_attempts", &self.max_attempts)
+            .field("outbound_capacity", &self.outbound_capacity)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TransportConfig {
     /// A transport that talks to `url` and retries until told otherwise.
+    ///
+    /// **With no token, which against this project's server means a 401.** That is
+    /// the correct default rather than a convenient one: a transport that quietly
+    /// connected unauthenticated would be a hole in the credential model, and
+    /// [`TransportConfig::with_token`] is one call away for a caller that has one.
     ///
     /// # Arguments
     ///
@@ -584,11 +740,50 @@ impl TransportConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            token: None,
             connect_timeout: CONNECT_TIMEOUT,
             keepalive_interval: KEEPALIVE_INTERVAL,
             max_attempts: None,
             outbound_capacity: MAX_OUTBOUND_FRAMES,
         }
+    }
+
+    /// Presents `token` as `Authorization: Bearer` on every handshake.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - an opaque session token obtained elsewhere, most likely from
+    ///   `POST /auth/login`.
+    ///
+    /// # Returns
+    ///
+    /// The configured value, for chaining.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use sh_nexus::network::ws::TransportConfig;
+    ///
+    /// let config = TransportConfig::new("ws://127.0.0.1:8484/ws").with_token("a-token");
+    /// assert!(config.has_token());
+    ///
+    /// // The `Debug` impl must not carry it -- see the type's docs.
+    /// let rendered = format!("{config:?}");
+    /// assert!(rendered.contains("token_configured: true"), "{rendered}");
+    /// assert!(!rendered.contains("a-token"), "{rendered}");
+    /// ```
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
+    /// Whether a token was configured.
+    ///
+    /// A boolean rather than the token, and it exists for the same reason the
+    /// `Debug` impl omits it: there is no reason for a caller to be able to *read*
+    /// a credential out of a configuration object, only to hand one in.
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
     }
 
     /// Replaces the per-attempt connect timeout.
@@ -732,6 +927,7 @@ struct Counters {
     connects: AtomicU64,
     connect_failures: AtomicU64,
     connect_timeouts: AtomicU64,
+    rejected_handshakes: AtomicU64,
     runtime_failures: AtomicU64,
     frames_read: AtomicU64,
     frames_sent: AtomicU64,
@@ -760,6 +956,7 @@ impl Counters {
             connects: read(&self.connects),
             connect_failures: read(&self.connect_failures),
             connect_timeouts: read(&self.connect_timeouts),
+            rejected_handshakes: read(&self.rejected_handshakes),
             runtime_failures: read(&self.runtime_failures),
             frames_read: read(&self.frames_read),
             frames_sent: read(&self.frames_sent),
@@ -786,8 +983,10 @@ impl Counters {
 /// Six fields are worth watching: `events_refused` (the inbox is full),
 /// `frames_dropped` (a frame could not be read), `writes_failed` (a frame could
 /// not be written), `connect_timeouts` (a handshake that never answered),
-/// `runtime_failures` (no async runtime could be built at all) and
-/// `keepalive_abandoned` (a socket that stopped being readable).
+/// `rejected_handshakes` (a handshake the server answered with a 401 -- a
+/// credential problem, not a network one), `runtime_failures` (no async runtime
+/// could be built at all) and `keepalive_abandoned` (a socket that stopped being
+/// readable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TransportStats {
     /// Successful connects, including the first one.
@@ -796,6 +995,15 @@ pub struct TransportStats {
     pub connect_failures: u64,
     /// Connect attempts that hit the per-attempt timeout.
     pub connect_timeouts: u64,
+    /// Handshakes the server answered with an HTTP 401.
+    ///
+    /// **Separate from `connect_failures` because the two mean opposite things to
+    /// a user.** A connection failure is "the server is not there" and invites a
+    /// retry; a rejected handshake is "the server is there and refused this
+    /// client", which is the one condition this crate treats as terminal. Counting
+    /// them together would make that distinction invisible to anything watching
+    /// only the numbers.
+    pub rejected_handshakes: u64,
     /// Attempts abandoned because no `tokio` runtime could be built.
     pub runtime_failures: u64,
     /// Server text frames read.
@@ -1364,28 +1572,57 @@ impl Session {
     }
 
     /// Connects, replays the cursors, serves, and reports what happened.
+    ///
+    /// **The one place the token leaves this module.** `handshake` builds the HTTP
+    /// request, inserts the `Authorization` header, and drops the token; nothing
+    /// downstream of it -- the cursor replay, the keepalive ticker, every frame --
+    /// can reach a credential, which is why a leak here would have to be written
+    /// deliberately rather than arrived at by refactoring.
     async fn connect_and_serve(&mut self) -> Outcome {
-        let mut socket = match tokio::time::timeout(
-            self.config.connect_timeout,
-            connect_async(self.config.url.as_str()),
-        )
-        .await
-        {
-            Ok(Ok((socket, _response))) => socket,
-            // The handshake answered with something other than a 101, or the host
-            // did not resolve. Both are "not now", and both are counted.
-            Ok(Err(_)) => {
-                Counters::bump(&self.counters.connect_failures);
-                return Outcome::Failed;
-            }
-            // §7.4's connect timeout, per attempt rather than for a whole
-            // reconnection: the difference between a server that is not there and
-            // one that accepted a socket and stopped answering.
+        // **Before** the timeout and before the socket, because a request that
+        // cannot be built is not a network condition: no amount of waiting turns an
+        // unparseable URL or a token containing a newline into a working handshake.
+        let request = match handshake(&self.config) {
+            Ok(request) => request,
             Err(_) => {
-                Counters::bump(&self.counters.connect_timeouts);
-                return Outcome::Failed;
+                Counters::bump(&self.counters.rejected_handshakes);
+                return Outcome::Rejected(ConnectionState::Rejected {
+                    code: BAD_ENDPOINT_CODE.to_owned(),
+                    detail: BAD_ENDPOINT_DETAIL.to_owned(),
+                });
             }
         };
+
+        let mut socket =
+            match tokio::time::timeout(self.config.connect_timeout, connect_async(request)).await {
+                Ok(Ok((socket, _response))) => socket,
+                // The handshake answered with something other than a 101. **A 401 is
+                // separated out here** because it is not a network failure: the server
+                // is up, it read the request, and it refused this client. It becomes a
+                // terminal `Rejected` rather than a retry, which is what stops a
+                // client with an expired token from sitting in a backoff loop against a
+                // server that will refuse it identically every time.
+                Ok(Err(error)) if is_unauthorized(&error) => {
+                    Counters::bump(&self.counters.rejected_handshakes);
+                    return Outcome::Rejected(ConnectionState::Rejected {
+                        code: UNAUTHORIZED_CODE.to_owned(),
+                        detail: UNAUTHORIZED_DETAIL.to_owned(),
+                    });
+                }
+                // The host did not resolve, or the handshake failed for any other
+                // reason. Both are "not now", and both are counted.
+                Ok(Err(_)) => {
+                    Counters::bump(&self.counters.connect_failures);
+                    return Outcome::Failed;
+                }
+                // §7.4's connect timeout, per attempt rather than for a whole
+                // reconnection: the difference between a server that is not there and
+                // one that accepted a socket and stopped answering.
+                Err(_) => {
+                    Counters::bump(&self.counters.connect_timeouts);
+                    return Outcome::Failed;
+                }
+            };
 
         Counters::bump(&self.counters.connects);
 
@@ -1539,6 +1776,64 @@ fn split_outbound(item: Outbound) -> (Uuid, ClientFrame, bool) {
             true,
         ),
     }
+}
+
+/// Builds the HTTP request `connect_async` will send, with the bearer token on it.
+///
+/// **A function rather than a `Request` value built at configuration time**, for
+/// one reason: a `Request` carries the header map, and the header map carries the
+/// token, and a value that holds a credential across a whole `TransportConfig`'s
+/// lifetime is one more thing that has to be remembered not to print. Building it
+/// here means the token exists for the length of one expression.
+///
+/// # Errors
+///
+/// The URL does not parse as a URI, or the token is not a legal HTTP header value.
+/// **Neither names the token**: the second failure says the value is unusable,
+/// which is a fact the caller needs and a fact that is safe to log.
+///
+/// # Example
+///
+/// ```
+/// use sh_nexus::network::ws::{handshake, TransportConfig};
+///
+/// let request = handshake(&TransportConfig::new("ws://127.0.0.1:8484/ws")
+///     .with_token("a-token"))
+///     .expect("a well-formed handshake request");
+/// assert_eq!(request.uri().path(), "/ws");
+/// assert!(request.headers().contains_key("authorization"));
+/// ```
+pub fn handshake(config: &TransportConfig) -> Result<Request<()>, TransportError> {
+    let mut request = config
+        .url
+        .parse::<Uri>()
+        .map_err(|error| TransportError::Thread(format!("the endpoint URL is not a URI: {error}")))?
+        .into_client_request()
+        .map_err(|error| {
+            TransportError::Thread(format!("could not build a handshake request: {error}"))
+        })?;
+
+    if let Some(token) = &config.token {
+        // `from_str` rather than `from_static` or a manual `push`: a token that
+        // cannot be a header value has to be reported before the socket is opened,
+        // not after the server has seen a malformed request. A token with a newline
+        // in it would otherwise be an HTTP request-splitting vector handed to
+        // whatever sits behind this client.
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+            // The value itself is never named. A `HeaderValue` parse failure says
+            // "this cannot be a header", and that is the whole diagnostic.
+            TransportError::Thread(String::from(
+                "the session token is not a usable Authorization header value",
+            ))
+        })?;
+        // `sensitive(true)` is the honest marking even for a request this client
+        // builds and immediately sends: it is what a future redacting logger or
+        // middleware would key on, and it costs nothing here.
+        value.set_sensitive(true);
+        request.headers_mut().insert(AUTHORIZATION, value);
+    }
+
+    Ok(request)
 }
 
 /// Encodes and writes one client frame, counting both outcomes.

@@ -83,11 +83,35 @@ which is exactly the argument the root `Cargo.toml` makes for them.
 The server is a separate binary; `§6.1`'s release-binary row for the client cannot
 move because of it.
 
-**The server binary is 4.03 MiB** (`target/release/sh_nexus_server.exe`, 4,229,120
-bytes). Its own resolved tree is **94 unique crates**. `§6.1`'s <30 MiB ceiling is
-met with room to spare, and the figure is recorded rather than left to be
-discovered, because the next milestone adds `argon2` and `jsonwebtoken` and both
-are new subtrees.
+**The server binary was 4.03 MiB** at the message-path milestone
+(`target/release/sh_nexus_server.exe`, 4,229,120 bytes) and is **4.89 MiB** after
+authentication (5,132,288 bytes). Its resolved tree was 94 unique crates before
+`argon2` and `sha2`, which are the only genuinely new subtrees this milestone adds.
+`§6.1`'s <30 MiB ceiling is met with room to spare either way.
+
+### The two crates authentication added, and one it did not
+
+| Crate | Version | Licence | Why |
+|---|---|---|---|
+| `argon2` | 0.6.0 | MIT OR Apache-2.0 | Password hashing. Slow **on purpose** — that is the property that makes a stolen database expensive to attack. |
+| `sha2` | 0.11.0 | MIT OR Apache-2.0 | Hashing session tokens. Fast **on purpose**: the hash runs on every WebSocket handshake, inside `§6.2`'s 16 ms budget, and `argon2` would be the wrong tool for a preimage problem. |
+
+**`jsonwebtoken` is the crate this milestone did *not* add**, and the omission is a
+decision rather than an oversight. Two reasons, recorded here because `PLAN.md`
+assumed it:
+
+- **A JWT cannot be revoked.** In a per-team instance, expelling a member has to kill
+  their session immediately; a signature that stays valid until it expires means
+  waiting. `sessions.revoked_at_unix_ms` is the mechanism that a JWT cannot offer.
+- **It would have brought a crypto backend.** `ring` and `rustls` are absent from
+  this workspace's tree entirely, so a JWT means a signature-verification stack in a
+  project with no crypto dependency — on a crate the **client** never links.
+
+**The client gained neither.** `cargo tree -p sh_nexus` shows no `argon2`, no
+`sha2`, and no `password-hash`: it sends the opaque token it was handed and never
+hashes or mints anything. That is asserted by
+`the_client_declares_no_crypto_dependency_and_the_token_stays_out_of_debug` in
+`crates/sh_nexus/tests/ws_transport.rs`, so the separation cannot rot silently.
 
 ### Three things the server needs that this milestone could not have
 

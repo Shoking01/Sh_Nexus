@@ -13,7 +13,7 @@
 //!   `crates/sh_nexus_wire/src/error.rs`.
 //! - `thiserror` is **not** in `crates/sh_nexus_server/Cargo.toml`, and adding a
 //!   dependency needs a `AGENTS.md` §7.2 audit and a change to a manifest this
-//!   milestone does not touch. Nine variants with hand-written `Display` arms is
+//!   milestone does not touch. Thirteen variants with hand-written `Display` arms is
 //!   the cheap honest answer here; if the enum grows materially, the audit for
 //!   `thiserror` is a small, self-contained pull request.
 //!
@@ -34,6 +34,13 @@
 //! records the same instinct from the other direction: an opaque code the user can
 //! report beats a silently dropped explanation.
 //!
+//! **An authentication failure is neither, and that is a decision.** `auth.rs`
+//! answers a bad token, a bad password and an existing-but-expired session with
+//! the *same* 401, because a peer that can tell those three apart learns something
+//! about the credential store from a single unauthenticated request. The variants
+//! that let `auth.rs` log them apart live here and in
+//! [`crate::db::SessionState`]; none of them reaches a response body.
+//!
 //! # What is never in here
 //!
 //! No message content, and no `client_msg_id`. `AGENTS.md` §7.5 forbids logging
@@ -42,6 +49,12 @@
 //! is peer-supplied and length-unbounded, so an error that could reach a log
 //! carries its length rather than its value. The same reasoning is applied
 //! consistently in `message.rs`.
+//!
+//! **Nor a password, a password hash, or a session token** -- the three values
+//! `AGENTS.md` §7.5 names directly. [`ServerError::Crypto`] is the variant that
+//! could have carried them and does not, because `auth.rs` builds its message from
+//! the upstream error rather than from its input; `auth.rs`'s own module docs say
+//! so at the place where a future edit would break the promise.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -144,6 +157,41 @@ pub enum ServerError {
         /// The value that could not be converted.
         unix_millis: i64,
     },
+
+    /// `argon2` or `sha2` refused the work it was given.
+    ///
+    /// **Wrapped as its own string rather than as the upstream error type**, for
+    /// the reason the file's own module docs give about `thiserror`: the upstream
+    /// types would then be reachable from every `?` in the crate, and this
+    /// dependency audit is exactly the kind of thing a `#[from]` makes implicit.
+    ///
+    /// The `Display` below never includes a password or a hash, because the only
+    /// inputs that can produce this are one of those and a malformed stored PHC
+    /// string. See `auth.rs`, which is where this is created and where that
+    /// promise is kept.
+    Crypto(String),
+
+    /// An account was created with a username that already exists.
+    ///
+    /// Carries the username because it is the whole diagnostic and it is
+    /// **operator-supplied, not peer-supplied**: it comes from a bootstrap
+    /// environment variable or from an authenticated administrator's request, so
+    /// it is bounded text with no message content in it. The same rule that lets
+    /// `message.rs` quote a `channel_id` and nothing else.
+    UsernameTaken {
+        /// The handle that is already in use.
+        username: String,
+    },
+
+    /// No account has this username.
+    ///
+    /// Reachable only from [`crate::db::Store::promote_to_administrator`], which
+    /// is an operator command rather than a request path -- so it is a loud
+    /// configuration mistake, not something to soften into a 404.
+    UnknownAccount {
+        /// The handle that named no row.
+        username: String,
+    },
 }
 
 impl fmt::Display for ServerError {
@@ -180,6 +228,19 @@ impl fmt::Display for ServerError {
                 formatter,
                 "stored timestamp {unix_millis} ms since the epoch is not a representable instant"
             ),
+            // The upstream detail is carried but the inputs are not, and that
+            // asymmetry is the point: `auth.rs` never puts a password or a hash
+            // into the string it hands here, so this line is safe in an
+            // `error!` exactly as every other line in this crate is.
+            Self::Crypto(detail) => {
+                write!(formatter, "credential error: {detail}")
+            }
+            Self::UsernameTaken { username } => {
+                write!(formatter, "the username {username:?} is already taken")
+            }
+            Self::UnknownAccount { username } => {
+                write!(formatter, "there is no account named {username:?}")
+            }
         }
     }
 }
@@ -196,7 +257,10 @@ impl StdError for ServerError {
             | Self::UnversionedSchema
             | Self::JournalModeUnavailable { .. }
             | Self::UnknownChannel { .. }
-            | Self::TimestampOutOfRange { .. } => None,
+            | Self::TimestampOutOfRange { .. }
+            | Self::Crypto(_)
+            | Self::UsernameTaken { .. }
+            | Self::UnknownAccount { .. } => None,
         }
     }
 }
