@@ -176,7 +176,7 @@ fn starting_a_transport_gives_the_shell_one_and_holding_it_is_what_keeps_it_aliv
     let settings = ConnectionSettings::from_parts_for_test("ws://127.0.0.1:1/ws", A_TOKEN);
 
     shell
-        .update(cx, |shell, _| shell.start_transport(&settings))
+        .update(cx, |shell, cx| shell.start_transport(&settings, cx))
         .expect("starting a worker thread is not a network operation");
 
     shell.update_in(cx, |shell, _window, _cx| {

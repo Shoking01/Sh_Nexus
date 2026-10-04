@@ -27,6 +27,7 @@
 //! | Enter sends and clears, and no newline is left behind | [`enter_sends_the_draft_and_clears_it`] | runtime |
 //! | A blank Enter neither sends nor destroys the draft | [`a_blank_enter_does_not_send_and_does_not_destroy_the_draft`] | runtime, negative |
 //! | The optimistic row is up before any ACK, and stays `Pending` | [`the_optimistic_row_is_on_screen_before_any_ack`] | runtime |
+//! | **The composer's frame actually reaches the transport's outbound queue** | [`begin_send_puts_the_frame_on_the_wire_when_a_transport_is_published`] | runtime, three-way contrast, no server |
 //! | Escape hands focus to the shell and does **not** fire its gesture | [`escape_hands_focus_to_the_shell_without_returning_the_list_to_the_tail`] | runtime, negative |
 //! | The draft is bounded, by a constant that already exists | [`the_draft_is_bounded_by_the_message_ceiling`] | runtime + parsed constant |
 //!
@@ -87,7 +88,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::{px, Entity, EntityInputHandler, Focusable, TestAppContext, VisualTestContext};
 use rstest::rstest;
-use sh_nexus::app::{self, Shell, DRAIN_INTERVAL, STARTUP_CHANNEL};
+use sh_nexus::app::{self, ConnectionSettings, Shell, DRAIN_INTERVAL, STARTUP_CHANNEL};
 use sh_nexus::core::markdown::MAX_MESSAGE_BYTES;
 use sh_nexus::core::models::events::DomainEvent;
 use sh_nexus::core::models::message::Message;
@@ -134,6 +135,45 @@ const ENOUGH_TO_OVERFLOW: u128 = 40;
 /// test" this file's module docs rule out. `AGENTS.md` §4.3's `rstest` is used
 /// below, where the property under test needs no window.
 const BURST_SIZES: [u128; 3] = [1, 2, 16];
+
+/// A WebSocket endpoint with nothing listening on it.
+///
+/// **A dead port is the design, not a compromise.** `WsTransport::send_message`
+/// hands a frame to an `mpsc` queue and returns; the worker thread writes the
+/// socket only once it has connected to something. So an endpoint nothing is
+/// serving still exercises everything the send-path test below asks — *did the
+/// composer's gesture reach the transport* — and it does so without spawning
+/// `sh_nexus_server`, without waiting for a handshake, and without a `sleep()`.
+/// `tests/ws_transport.rs` follows a frame the rest of the way to a real server's
+/// `message.ack`; this file is the half that runs on a machine with no server on
+/// it at all, and the two are one sentence each rather than one test that needs
+/// both.
+const DEAD_ENDPOINT: &str = "ws://127.0.0.1:1/ws";
+
+/// A token for a socket that will never answer.
+///
+/// **Fixture text rather than a credential, and it says so in its own body.**
+/// `AGENTS.md` §7.5 names tokens as a thing that must never reach a log; this value
+/// exists only because `ConnectionSettings::from_parts_for_test` takes two arguments,
+/// and a string that looked like a real credential would be one that could be
+/// mistaken for one in a failing `Debug` — the failure mode
+/// `tests/shell_connection.rs`'s own token is written to avoid.
+const NO_TOKEN: &str = "tok_fixture_never_answers_do_not_log_me";
+
+/// The three bodies the send-path test types, one per send.
+///
+/// **Distinct so a test can tell the rows apart, and the reason it must do it by
+/// body is worth recording.** `InputBar::send` mints every `client_msg_id` with
+/// `Uuid::new_v4()` and stamps each row with `Utc::now()`, so a test can neither
+/// name which row is which in advance nor rely on the order they landed in:
+/// `core::ordering::compare` breaks a timestamp tie on `client_msg_id` (see its own
+/// documentation), and three sends from one gesture can share a timestamp. The
+/// composer is the only party that knows the pairing, and the body is what it
+/// paired. None of these is ever printed — `AGENTS.md` §7.5 forbids message content
+/// in a log and a panic message is a log.
+const BODY_NO_SOCKET: &str = "typed with no socket";
+const BODY_ON_THE_WIRE: &str = "typed with a socket";
+const BODY_AT_A_STOPPED_SOCKET: &str = "typed at a stopped socket";
 
 /// A timestamp the caller supplies, since `state/` may not read a clock.
 fn at(second: i64) -> DateTime<Utc> {
@@ -333,6 +373,80 @@ fn first_sent(
         })
         .flatten()
     })
+}
+
+/// Whether the application has a socket installed for sends.
+///
+/// **Asks the bridge, because that is where the socket lives and asking anywhere
+/// else would test the wrong thing.** The first version of this helper read
+/// `MessageList::has_transport`, which existed only because the feature first put a
+/// `WsTransport` in the view — a design `tests/layer_boundary.rs` rejects, because
+/// `AGENTS.md` §3.2 gives `network/` to the seam. With the socket behind
+/// [`sh_nexus::state::bridge`], "can this client send?" has exactly one honest
+/// answer and this asks it.
+///
+/// **A send that leaves here does not prove it arrived.** `bridge::try_send_message`
+/// hands the frame to the worker thread's queue and returns; whether a server
+/// acknowledges it is a different claim, and
+/// `ws_transport::the_shell_s_channel_is_one_the_server_accepts` is the test that
+/// makes that one against a real server.
+fn bridge_has_transport(cx: &VisualTestContext) -> bool {
+    cx.read(sh_nexus::state::bridge::has_transport)
+}
+
+/// How the send carrying `body` ended up: its delivery state and its failure code.
+///
+/// **Addressed by body rather than by identity, and that is forced rather than
+/// convenient.** The composer mints each `client_msg_id` itself and stamps each row
+/// with its own clock, so a test can neither name a row in advance nor order two
+/// rows against each other — [`BODY_NO_SOCKET`]'s documentation gives both reasons,
+/// and the second one is the one that bites: `ordering::compare` breaks a
+/// timestamp tie on `client_msg_id`, so two sends in the same tick could come back
+/// in either order. **The body is the only pairing the composer ever recorded.**
+///
+/// A closure parameter rather than a written type, so this reads the state without
+/// naming it — see [`first_sent`]'s documentation for why that is the shape a file
+/// outside `state/` can use.
+fn sent_named(
+    cx: &VisualTestContext,
+    shell: &Entity<Shell>,
+    body: &str,
+) -> Option<(Option<DeliveryState>, Option<String>)> {
+    shell.read_with(cx, |_shell, app| {
+        bridge::try_read(app, |state| {
+            state
+                .messages(STARTUP_CHANNEL)
+                .iter()
+                .find(|message| message.content == body)
+                .map(|message| {
+                    (
+                        state.delivery(&message.client_msg_id),
+                        state
+                            .failure(&message.client_msg_id)
+                            .map(|failure| failure.code().to_owned()),
+                    )
+                })
+        })
+        .flatten()
+    })
+}
+
+/// Types `body` into the focused composer and presses `Enter`.
+///
+/// **The user's gesture rather than a call to `MessageList::begin_send`,** for the
+/// reason this file's module docs give for every keystroke it simulates: a test that
+/// reaches past the field proves something about the view it reached past. Here the
+/// point is sharper than usual — the send path has three links (typing reaches the
+/// draft, `Enter` reaches the list, and the frame leaves the list) and this is the
+/// only way to drive the last one through the first two.
+///
+/// **Focus is the caller's job, as it is everywhere else in this file**, because
+/// `focus_composer`'s documentation explains why the paint frame matters and this
+/// helper has no business repeating it.
+fn type_and_send(cx: &mut VisualTestContext, body: &str) {
+    cx.simulate_input(body);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1171,181 @@ fn the_optimistic_row_is_on_screen_before_any_ack(cx: &mut TestAppContext) {
     );
 }
 
+/// `begin_send` puts the frame on the wire when a transport is published.
+///
+/// **The defect this guards had no failing test to write, which is exactly why it
+/// needs one.** Before the send path was wired, `MessageList::begin_send` put a row
+/// on screen and stopped: the socket lived in `Shell::transport`, nobody published
+/// it anywhere a view could reach, and `WsTransport::send_message` had **zero
+/// production callers**. Every assertion above that says "the message was sent" was
+/// therefore only ever saying "a row appeared" — so a user could type into the
+/// field, watch the row go up as `sending...`, and wait for ever for an ack that
+/// could not come, with no error on screen and none in the state.
+///
+/// **So the assertion is that the frame leaves the view, and the observable is the
+/// transport's own answer.** `MessageList::enqueue` cannot invent an outcome: it
+/// either hands the frame to `WsTransport::send_message`, and that either queues it
+/// or refuses it. **A refusal comes back as `MessageSendFailed` and
+/// `actions::fail_send` moves the row to `Failed`**, which means a row in `Failed`
+/// carrying this crate's own code is reachable *only* through the wiring, and a row
+/// in `Pending` with no transport is reachable *only* without it. Both halves are
+/// asserted below from the same gesture, with the transport as the only difference,
+/// and that is what makes this evidence rather than two facts that happen to sit in
+/// one test.
+///
+/// **Three sends, and the middle one is the honest one.** The first has no socket,
+/// so nothing can be offered. The second has a socket that has not connected, and
+/// its row is `Pending` for the ordinary reason — nothing has acknowledged it — so
+/// it is asserted *together with* `frames_sent == 0`: the frame was accepted by the
+/// outbound queue and has been written nowhere. The third goes to a socket this test
+/// has stopped, which is the refusal the rollback exists for. **Stopping the socket
+/// is what makes that refusal deterministic rather than lucky:**
+/// `WsTransport::shutdown` sets the closed flag synchronously and
+/// `WsTransport::queue` reads it before it touches the channel, so there is no
+/// window in which the third send could be accepted.
+///
+/// **No server, and that is the point rather than a limitation.** `send_message` is
+/// a hand-off to an `mpsc` queue; the worker writes the socket only after it has
+/// connected to something. So the endpoint above has nothing on it and every
+/// assertion still holds — deterministically, with no polling and no `sleep()`.
+/// `the_shell_s_channel_is_one_the_server_accepts` in `tests/ws_transport.rs` is the
+/// other half of the pair: it names the shell's channel at a real server process
+/// and requires a `message.ack`.
+///
+/// **What this cannot show, stated rather than implied.** It cannot show that a
+/// frame was written to a socket, and `frames_sent == 0` is asserted precisely so
+/// that limit is on the record instead of discovered by a reader who assumed
+/// otherwise: nothing ever connected, by design. Nor does it say anything about
+/// delivery to another user, about reconnection, or about the retry gesture — a send
+/// this test fails is a send the user can retry, which
+/// [`escape_chains_from_the_composer_to_the_log_and_its_retry`] already drives
+/// through the keyboard.
+#[gpui::test]
+fn begin_send_puts_the_frame_on_the_wire_when_a_transport_is_published(cx: &mut TestAppContext) {
+    /// The namespace `MessageList::enqueue` gives this machine's own refusals.
+    ///
+    /// **Asserted rather than matched loosely, and the reason it is namespaced at all
+    /// is the reason to pin it.** A send can fail because a server rejected it or
+    /// because this machine's outbound queue would not take it, and whoever reads the
+    /// badge has to be able to tell those apart. A test that asserted only `Failed`
+    /// would pass whichever had happened — including if a server had answered.
+    const ENQUEUE_FAILED_CODE: &str = "transport.enqueue_failed";
+
+    let (shell, cx) = shell(cx);
+
+    // --- 1. Offline: the row goes up, and there is nowhere to offer it. -----
+    assert!(
+        !bridge_has_transport(cx),
+        "the shell is built offline and the list must say so before anything is \
+         claimed about a send: `Shell::new` publishes no transport, so a `true` here \
+         would mean something started one"
+    );
+
+    focus_composer(cx, &shell);
+    type_and_send(cx, BODY_NO_SOCKET);
+
+    assert_eq!(
+        sent_named(cx, &shell, BODY_NO_SOCKET),
+        Some((Some(DeliveryState::Pending), None)),
+        "with no socket the frame has nowhere to go, so the row is `Pending` and \
+         carries no reason — `MessageList::enqueue`'s documented `None` arm, and the \
+         state every other send test in this file already asserted"
+    );
+
+    // --- 2. Published: the shell holds it, and so does the log. ------------
+    let settings = ConnectionSettings::from_parts_for_test(DEAD_ENDPOINT, NO_TOKEN);
+    shell
+        .update(cx, |shell, cx| shell.start_transport(&settings, cx))
+        .expect("starting a worker thread is not a network operation");
+
+    assert!(
+        shell.read_with(cx, |shell, _| shell.transport().is_some()),
+        "`start_transport` must leave the shell holding the socket it started: that \
+         field exists so the connection outlives any one frame, and dropping it \
+         would tear the socket down with no event and no log"
+    );
+    assert!(
+        bridge_has_transport(cx),
+        "**and the log must be told, which is the half this whole test exists \
+         for.** The shell holding a socket the composer cannot reach is precisely \
+         the defect: `Shell::transport` answers `Some`, the user is looking at a \
+         message log that looks alive, and nothing they type can leave the machine — \
+         a state every other assertion in this file would pass"
+    );
+
+    focus_composer(cx, &shell);
+    type_and_send(cx, BODY_ON_THE_WIRE);
+
+    assert_eq!(
+        sent_named(cx, &shell, BODY_ON_THE_WIRE),
+        Some((Some(DeliveryState::Pending), None)),
+        "the frame reached a transport that accepted it, and the row is `Pending` \
+         for the ordinary reason: nothing has acknowledged it. Publishing a socket \
+         must not disturb the send before it either — that one is still `Pending` \
+         with no reason, and is asserted separately"
+    );
+    assert_eq!(
+        sent_named(cx, &shell, BODY_NO_SOCKET),
+        Some((Some(DeliveryState::Pending), None)),
+        "the earlier send is untouched by the one after it, so the second send \
+         reaching the transport did not reach back and change anything already on \
+         screen"
+    );
+
+    // --- 3. Refused: a row that could not have existed before. -------------
+    let transport = shell
+        .read_with(cx, |shell, _| shell.transport().cloned())
+        .expect("the socket was published two steps ago and nothing has replaced it");
+    transport.shutdown();
+    assert!(
+        transport.is_closed(),
+        "the closed flag is set synchronously, which is what makes the send below a \
+         determinate outcome rather than a race with the worker thread"
+    );
+
+    focus_composer(cx, &shell);
+    type_and_send(cx, BODY_AT_A_STOPPED_SOCKET);
+
+    assert_eq!(
+        sent_named(cx, &shell, BODY_AT_A_STOPPED_SOCKET),
+        Some((
+            Some(DeliveryState::Failed),
+            Some(ENQUEUE_FAILED_CODE.to_owned())
+        )),
+        "**the row is `Failed`, and only the wiring can put it there.** A stopped \
+         socket refuses the frame, `MessageList::enqueue` turns that refusal into a \
+         `MessageSendFailed`, and `actions::fail_send` moves the row. Before the \
+         send path was wired, `begin_send` never asked the transport anything, so \
+         this row would have sat at `Pending` for ever with nothing able to move it — \
+         which is the whole regression, visible as one enum value"
+    );
+
+    // The refusal is the one thing this test changes about a row, and it changed it
+    // in place: three sends, three rows, no send having removed another's.
+    assert_eq!(
+        showing(cx, &shell),
+        3,
+        "three sends leave three rows, and `PLAN.md` §7 is explicit that a failed send \
+         stays visible for retry rather than being dropped"
+    );
+
+    // And the honest limit of this file's reach, asserted rather than implied.
+    let stats = transport.stats();
+    assert_eq!(
+        stats.frames_sent, 0,
+        "no frame was written, because no socket was ever established: the endpoint \
+         has nothing listening on it. `send_message` is a hand-off to the outbound \
+         queue, which is why the rows above moved at all — {stats}"
+    );
+    assert_eq!(
+        stats.connects, 0,
+        "and this test never reached a server, which is deliberate — it is the half \
+         of the pair that runs on a machine with none. `tests/ws_transport.rs` is \
+         the half that needs one, and the two between them say the same sentence \
+         about two different links — {stats}"
+    );
+}
+
 /// `Escape` in the field hands focus to the shell, and does **not** fire its
 /// gesture.
 ///
@@ -1439,15 +1728,24 @@ fn the_draft_is_bounded_by_the_message_ceiling(cx: &mut TestAppContext) {
 // 6. What the shell's constants are, asserted rather than trusted
 // ---------------------------------------------------------------------------
 
-/// The window is chat-sized, and the startup channel is a named placeholder.
+/// The window is chat-sized.
 ///
-/// **Two claims that would otherwise be prose, and both have a failure mode that
-/// is silent.** A window at the spike's 480x320 would render four rows, so every
-/// frame-time figure taken against it would be about a different program — the
-/// mistake `benches/frame_time.rs`'s `WINDOW_HEIGHT` documentation records in
-/// writing. And a startup channel id that looked like a real id would let a
-/// fixture quietly address the channel the application opens, at which point the
-/// placeholder stops being findable.
+/// **A claim that would otherwise be prose, with a failure mode that is silent.** A
+/// window at the spike's 480x320 would render four rows, so every frame-time figure
+/// taken against it would be about a different program — the mistake
+/// `benches/frame_time.rs`'s `WINDOW_HEIGHT` documentation records in writing.
+///
+/// **This test used to also assert that `STARTUP_CHANNEL` was a named placeholder,
+/// and that assertion is deliberately gone rather than updated.** Its premise died
+/// with the server: `STARTUP_CHANNEL` is now the channel the server seeds, because a
+/// placeholder id that no server has heard of is rejected at runtime. What replaced it
+/// is not a third copy of the literal here but
+/// `the_shell_s_channel_is_one_the_server_accepts` in `tests/ws_transport.rs`, which
+/// sends through the constant against a real server process and requires a
+/// `message.ack`. String equality in a crate that cannot see the server proves the two
+/// sides agree *today* only by coincidence; the behavioural test proves they agree.
+/// Duplicating the literal a third time would have read like coverage while
+/// guaranteeing nothing.
 ///
 /// **The size check is a compile-time assertion, and that is clippy being right
 /// rather than clippy being in the way.** Both operands are `const`, so a runtime
@@ -1457,18 +1755,11 @@ fn the_draft_is_bounded_by_the_message_ceiling(cx: &mut TestAppContext) {
 /// message and formats nothing, which is why the reason for the number is in the
 /// constant's own documentation in `app.rs` and not repeated here.)
 #[test]
-fn the_shell_window_is_chat_sized_and_the_startup_channel_is_a_named_placeholder() {
+fn the_shell_window_is_chat_sized() {
     const _: () = assert!(
         app::WINDOW_WIDTH >= 1024.0 && app::WINDOW_HEIGHT >= 768.0,
         "the shell's window must be chat-sized: rows per frame scale with viewport \
          height, so a spike-sized window publishes a number that says nothing \
          about a chat client"
-    );
-
-    assert_eq!(
-        STARTUP_CHANNEL, "c_startup",
-        "the startup channel is a placeholder and must say so in its name, so that \
-         a fixture cannot address it by accident and so that `grep` finds every \
-         place that has to be replaced when a real channel list arrives"
     );
 }

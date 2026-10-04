@@ -174,22 +174,35 @@ pub const DRAIN_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The channel the shell shows when it opens.
 ///
-/// **A placeholder, and the same shape of placeholder as
-/// [`crate::UNSIGNED_IN_USER`]: a name that says what it is rather than one that
-/// looks real.** The shell cannot ask which channel to open, because nothing
-/// populates the channel list — `actions::set_channels` has no door until a
-/// `DomainEvent` carries one (`bridge.rs` §5) — and `PLAN.md`'s channel rail, the
-/// view that would choose, arrives after Phase 4 supplies the data. Naming one is
-/// what lets the list render at all, because `MessageList::show_channel` shows
-/// the channel it is *told* to show whether or not the state has a record of it,
-/// and a list with no channel shows nothing by construction.
+/// **This was `c_startup`, a self-declared placeholder, and it was wrong the moment
+/// a server existed.** The shell names this channel in every `message.send`, because
+/// `MessageList::begin_send` fills `channel_id` from the channel the list was shown,
+/// and the server refuses a send naming a channel it has not seeded
+/// (`Store::accept_message` returns `UnknownChannel`). A placeholder id that no
+/// server has ever heard of therefore fails at runtime, not at build time: PR #43
+/// wired the socket and the first message typed into the window was rejected.
 ///
-/// **The cost of the placeholder, stated rather than hidden:** a message delivered
-/// for any other channel id is invisible, and the unread badge for this one is
-/// over-reported while [`crate::UNSIGNED_IN_USER`] is the author. Both are the
-/// safe direction — content nobody sees is missed, a badge nobody can trust is
-/// one the user stops reading — and both disappear with the channel rail.
-pub const STARTUP_CHANNEL: &str = "c_startup";
+/// **The id is spelled here rather than imported, deliberately.** `sh_nexus` cannot
+/// depend on `sh_nexus_server` -- that would put `axum` and `rusqlite` into the
+/// client's dependency graph -- and the shared `sh_nexus_wire` crate is the wrong
+/// home for it too: a protocol crate should describe frame shapes, not the name a
+/// particular deployment gave its first channel. `tests/ws_transport.rs` reaches the
+/// same conclusion for its own copy of this literal and says why. Two literals and a
+/// test that fails when they disagree beats one constant that hides the coupling.
+///
+/// **What enforces the agreement, since nothing does by construction:**
+/// `the_shell_s_channel_is_one_the_server_accepts` in `tests/ws_transport.rs` sends
+/// through this very constant against a real server process and requires a
+/// `message.ack`. A rename on either side turns that test red instead of turning
+/// production red.
+///
+/// **What is still a placeholder, and stated rather than hidden:** *which* channel to
+/// open. Nothing populates the channel list -- `actions::set_channels` has no door
+/// until a `DomainEvent` carries one (`bridge.rs` §5) -- so this is the seeded
+/// channel, not a chosen one, and `PLAN.md`'s channel rail arrives after Phase 4
+/// supplies the data. The unread badge is over-reported while
+/// [`crate::UNSIGNED_IN_USER`] is the author, which is the safe direction.
+pub const STARTUP_CHANNEL: &str = "c_general";
 
 /// The built-in theme the shell applies.
 ///
@@ -566,11 +579,29 @@ impl Shell {
     /// - [`MissingSetting`] — half the configuration was given. Reported before any
     ///   window opens rather than surfacing later as an opaque 401.
     /// - [`TransportError`] — the worker thread could not be started.
-    pub fn start_transport(&mut self, settings: &ConnectionSettings) -> Result<(), StartError> {
-        self.transport = Some(WsTransport::start(
-            settings.transport_config(),
-            self.sender.clone(),
-        )?);
+    ///
+    /// The `cx` is taken because installing a transport is not a field write: the
+    /// message list is a **child view**, and reaching it needs a context. It was
+    /// added to this signature when the send path was wired, and it is the honest
+    /// arity — a method that starts a socket and leaves the composer unable to reach
+    /// it is the defect this parameter exists to prevent.
+    pub fn start_transport(
+        &mut self,
+        settings: &ConnectionSettings,
+        cx: &mut Context<Self>,
+    ) -> Result<(), StartError> {
+        let transport = WsTransport::start(settings.transport_config(), self.sender.clone())?;
+        // **Published into the bridge, not held by a view.** This is the only thing
+        // PR #43 got wrong about sending: the socket existed, `Shell::transport`
+        // returned it, and `WsTransport::send_message` had zero production callers,
+        // because nothing connected the composer to it. The bridge is where
+        // `network/` is reachable from — `AGENTS.md` §3.2 and
+        // `tests/layer_boundary.rs` both say so, and the first attempt at publishing
+        // this into `MessageList` failed that test. One owner, one publication point:
+        // if a second path could install a transport, two sockets could exist and a
+        // send would land on whichever was installed last.
+        bridge::install_transport(cx, Some(transport.clone()));
+        self.transport = Some(transport);
         Ok(())
     }
 
@@ -930,7 +961,9 @@ pub fn open(cx: &mut App) -> crate::errors::Result<WindowHandle<Shell>> {
             // not a banner — there is no connection to describe.
             Ok(None) => {}
             Ok(Some(settings)) => {
-                if let Err(error) = shell.update(cx, |shell, _| shell.start_transport(&settings)) {
+                if let Err(error) =
+                    shell.update(cx, |shell, cx| shell.start_transport(&settings, cx))
+                {
                     tracing::error!(error = %error, "the client has no socket");
                 }
             }

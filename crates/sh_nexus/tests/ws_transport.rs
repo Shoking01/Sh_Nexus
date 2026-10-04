@@ -20,6 +20,7 @@
 //! | [`an_unsupported_major_version_is_refused_rather_than_silently_continued`] | §7.4's explicit rejection, both directions |
 //! | [`a_shut_down_transport_refuses_further_frames`] | `AGENTS.md` §2.1, and §7.5 through `Debug` |
 //! | [`the_suites_socket_path_is_the_servers_own_constant`] | the duplication `tests/support/mod.rs` admits to is watched |
+//! | [`the_shell_s_channel_is_one_the_server_accepts`] | the one duplicated constant that a behavioural test can watch, in place of a third copy of the literal |
 //!
 //! # Why the server is a child process
 //!
@@ -52,6 +53,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::TestAppContext;
+use sh_nexus::app::STARTUP_CHANNEL;
 use sh_nexus::core::models::events::{ConnectionState, DomainEvent};
 use sh_nexus::core::models::user::UserStatus;
 use sh_nexus::network::ws::{
@@ -1193,6 +1195,123 @@ fn the_duplicated_socket_path_is_still_a_path() {
         "{WS_PATH:?} must be an absolute path"
     );
     assert_eq!(WS_PATH, "/ws");
+}
+
+/// The shell's startup channel is one the server actually accepts.
+///
+/// **This is a behavioural assertion where a string comparison would have been
+/// cheaper, and the reason it is not one is a dependency direction.** `sh_nexus`
+/// cannot name `sh_nexus_server`'s seeded channel: a `[dev-dependencies]` entry
+/// would put `axum` and `rusqlite` — SQLite's C amalgamation included — into the
+/// client's dependency graph, which is the mistake ADR-002 exists to prevent and
+/// the argument `tests/support/mod.rs` gives in full. Moving the name into the
+/// shared `sh_nexus_wire` crate would be worse than useless, because that crate
+/// describes frame shapes and the name one deployment gave its first channel is
+/// not a frame shape.
+///
+/// **So both sides hold a literal — `sh_nexus::app::STARTUP_CHANNEL` and [`CHANNEL`]
+/// above — and `assert_eq!` between them would be theatre.** A crate that cannot
+/// see the server has no way to learn that two literals mean the same thing; it can
+/// only report that they are the same string today, which is a fact about two files
+/// rather than about a client and a server agreeing. What is actually wanted is the
+/// sentence *"the server accepts a message naming this channel"*, and the only way
+/// to learn it is to name the channel at a server that is running and insist on an
+/// answer. A rename on either side then turns this test red instead of turning the
+/// first message a user typed red — which is precisely how it went wrong once, when
+/// the constant was a placeholder no deployment had ever seeded.
+///
+/// **The ack is the assertion, and not merely the absence of an error.** An
+/// unknown channel is refused rather than ignored, so a test that watched only for
+/// errors would still pass on a server that rejected the message and said so
+/// clearly. Requiring a `message.ack` for that identity means the server *stored*
+/// the message, which is the only outcome in which this constant names a channel
+/// rather than a label.
+///
+/// **A failure here can mean two things, and both are the same bug.** `await_server_id`
+/// reads [`CHANNEL`], not the imported constant, so a red says either that the
+/// shell's constant has drifted from the server or that this file's own copy has.
+/// That is deliberate rather than incidental: a suite copy nobody compares against
+/// anything is a copy that rots in silence, which is exactly what
+/// [`the_suites_socket_path_is_the_servers_own_constant`] exists to prevent for the
+/// path.
+///
+/// **What this does not cover, stated rather than implied.** It proves the id is one
+/// the server has seeded. It does not prove that id is the only channel a
+/// deployment will ever have, and nothing here constrains the server's own seed
+/// list. It does not prove the shell *opens* that channel — `STARTUP_CHANNEL` is
+/// still the seeded channel rather than a chosen one, because no `DomainEvent`
+/// carries a channel list and `state/bridge.rs` §5 assigns that gap its own entry;
+/// the constant's own documentation says which half of it is still a placeholder.
+/// And it does not exercise the composer: the frame is written by hand through
+/// [`WsTransport::send_message`] with the constant as the channel, which is what
+/// makes the claim about the *value*. That the shell's composer routes through this
+/// same value is
+/// `begin_send_puts_the_frame_on_the_wire_when_a_transport_is_published` in
+/// `tests/app_shell.rs`, and the two are deliberately one sentence each: this one
+/// that the server accepts the name, that one that the client sends it.
+#[gpui::test]
+fn the_shell_s_channel_is_one_the_server_accepts(cx: &mut TestAppContext) {
+    let server = ServerProcess::start("startup-channel");
+    let token = server.token();
+    let sender = install(cx, ME);
+
+    let transport = WsTransport::start(
+        TransportConfig::new(server.endpoint()).with_token(token),
+        sender,
+    )
+    .expect("a thread");
+    await_connected(cx);
+
+    // The optimistic row and then the frame, in the order
+    // `MessageList::begin_send` puts them, and against the production constant
+    // rather than this file's own copy: the row is on screen before the server has
+    // seen anything (`AGENTS.md` §8.1), and the channel is filled in from the very
+    // constant `Shell::new` showed the list. `AGENTS.md` §3.2 gives `state/` no
+    // clock, so the timestamp is the caller's, exactly as `InputBar::send` supplies.
+    let client_msg_id = Uuid::new_v4();
+    cx.update(|cx| {
+        bridge::try_begin_send(cx, STARTUP_CHANNEL, BODY, client_msg_id, at(0))
+            .expect("the state is installed")
+    });
+    transport
+        .send_message(client_msg_id, STARTUP_CHANNEL, BODY)
+        .expect("the send is queued");
+
+    // The server stored it under this identity. Nothing else in this file can say
+    // that: every other assertion here is about a frame this client wrote.
+    await_server_id(cx, &client_msg_id);
+
+    let rows = cx.read(|app| {
+        bridge::try_read(app, |state| {
+            state
+                .messages(STARTUP_CHANNEL)
+                .iter()
+                .filter(|held| held.client_msg_id == client_msg_id)
+                .count()
+        })
+        .unwrap_or(0)
+    });
+    assert_eq!(
+        rows, 1,
+        "the acknowledged send is one row, in the channel the send named: the ack \
+         reconciled the optimistic row rather than arriving as somebody else's second \
+         copy"
+    );
+
+    let stats = transport.stats();
+    assert_eq!(
+        stats.frames_dropped, 0,
+        "the server answered in frames this build speaks, so the ack above was read \
+         rather than discarded: {stats}"
+    );
+    assert_eq!(
+        stats.events_refused, 0,
+        "and nothing was refused on the way in, or the row could not have been \
+         reconciled: {stats}"
+    );
+
+    transport.shutdown();
+    drop(server);
 }
 
 /// How long these suites are willing to wait for something that should happen.

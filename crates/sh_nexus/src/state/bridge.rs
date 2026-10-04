@@ -186,6 +186,7 @@ use uuid::Uuid;
 
 use crate::core::markdown::Document;
 use crate::core::models::events::DomainEvent;
+use crate::network::ws::WsTransport;
 use crate::state::actions::{self, ApplyOutcome, SendOutcome};
 use crate::state::app_state::AppState;
 
@@ -447,7 +448,112 @@ pub fn install(cx: &mut App, self_user_id: impl Into<String>) -> Result<EventSen
         state: AppState::new(self_user_id),
         inbox,
     });
+    cx.set_global(OutboundGlobal { transport: None });
     Ok(EventSender { sender })
+}
+
+/// The socket this application sends through, or `None`.
+///
+/// **Its own global rather than a field on [`AppStateGlobal`], and the reason is
+/// that the state is domain data with a documented shape while a socket handle is
+/// not domain data at all.** `AGENTS.md` §3.1 describes `state/` as channels,
+/// presence, unread counts and cursors; an `mpsc::Sender` in the middle of that
+/// would be a field no reader of `AppState` could interpret, and §7.1's ban on
+/// unbounded in-memory state would be argued about by anyone who found it.
+///
+/// **This global is the blessed edge from `network/` into the application.**
+/// `tests/layer_boundary.rs::ui_reaches_gpui_and_the_bridge_and_nothing_below_them`
+/// forbids `ui/` from importing `network/` and names this module as the only way
+/// through, which is what §3.2 means by *"network/ is reached through
+/// state/bridge.rs or not at all"*. The first attempt at this feature held a
+/// `WsTransport` in `MessageList` instead, and that test caught it — the UI layer
+/// reached three layers down to build a frame it had no business naming.
+#[derive(Default)]
+pub struct OutboundGlobal {
+    transport: Option<WsTransport>,
+}
+
+impl Global for OutboundGlobal {}
+
+/// What happened to a send handed to [`try_send_message`].
+///
+/// **Named `EnqueueOutcome`, not `SendOutcome`, because this module already imports
+/// `actions::SendOutcome`** for the other half of the gesture — whether the *state*
+/// took the optimistic row. Two different answers to two different questions, and
+/// giving them one name would invite a caller to match the wrong one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    /// The frame is on the transport's outbound queue.
+    Queued,
+    /// There is no socket, so nothing was enqueued.
+    ///
+    /// **Not a failure, and the distinction is the whole point.** `AppState`'s
+    /// `can_send` already requires `ConnectionState::Connected`, so a user cannot
+    /// reach this by typing. An outbox is `PLAN.md` §7's Phase 3 work, and
+    /// `AGENTS.md` §7.1 forbids the unbounded growth one would need.
+    NoTransport,
+    /// The socket refused the frame synchronously — closed, or its queue full.
+    ///
+    /// The reason is carried because it is shown to the user on the failed row's
+    /// badge, and a badge reading "failed" with no cause is the thing `AGENTS.md`
+    /// §5.2's "clear, actionable error" is written against.
+    Refused(String),
+}
+
+/// Publishes the socket sends go through, or takes it away again.
+///
+/// **Called by [`crate::app::Shell::start_transport`] and nowhere else.** One
+/// owner and one publication point: if a second path could install a transport,
+/// two sockets could exist and a send would land on whichever one happened to be
+/// installed last.
+///
+/// Passing `None` is what a stopped socket looks like, and it is **not** a
+/// teardown — the worker thread belongs to the shell, and dropping a handle here
+/// only stops new sends from being enqueued.
+pub fn install_transport(cx: &mut App, transport: Option<WsTransport>) {
+    if !is_installed(cx) {
+        return;
+    }
+    cx.update_global::<OutboundGlobal, _>(|global, _| global.transport = transport);
+}
+
+/// Whether a send would reach a socket right now.
+///
+/// **Read-only, and it exists so a caller can ask the question without sending
+/// anything to ask it.** The obvious alternative — calling [`try_send_message`] and
+/// matching on the outcome — enqueues a real `message.send` as a side effect of a
+/// question, which is a probe that costs a frame on the server and can fail for
+/// reasons that have nothing to do with the presence of a socket.
+pub fn has_transport(cx: &App) -> bool {
+    cx.has_global::<OutboundGlobal>() && cx.global::<OutboundGlobal>().transport.is_some()
+}
+
+/// Puts one `message.send` on the wire.
+///
+/// **The door the composer uses, and the reason it lives here rather than in the
+/// view is the layer boundary.** `MessageList::begin_send` has the channel, the
+/// content and the `client_msg_id`, so it is the natural place to *decide* to send;
+/// naming `WsTransport` to do it is what §3.2 forbids. A send is still the view's
+/// decision — this function takes the arguments the view already has and applies
+/// no policy of its own beyond reporting what happened.
+///
+/// Synchronous, and that is what keeps it safe to call from a key handler: it hands
+/// the frame to the worker thread's queue and returns. No socket work happens here,
+/// so no frame budget is spent and §2.3's "no blocking on the main thread" holds.
+pub fn try_send_message(
+    cx: &mut App,
+    client_msg_id: Uuid,
+    channel_id: &str,
+    content: &str,
+) -> EnqueueOutcome {
+    let transport = cx.update_global::<OutboundGlobal, _>(|global, _| global.transport.clone());
+    let Some(transport) = transport else {
+        return EnqueueOutcome::NoTransport;
+    };
+    match transport.send_message(client_msg_id, channel_id, content) {
+        Ok(()) => EnqueueOutcome::Queued,
+        Err(error) => EnqueueOutcome::Refused(format!("the socket refused the send: {error}")),
+    }
 }
 
 /// Whether the application state is installed.
