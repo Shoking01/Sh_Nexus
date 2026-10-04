@@ -1,10 +1,10 @@
 //! The views this layer renders.
 //!
 //! `AGENTS.md` §3.1 lists sidebar, chat view, thread panel and input bar here.
-//! Two of them exist so far — the message list and a row of it — and the rest
-//! are **absent rather than declared empty**, for the reason `src/lib.rs` gives
-//! about `ui/` itself: a module that exists and does nothing reads as finished
-//! work.
+//! Three of them exist so far — the message list, a row of it, and a line that says
+//! what the connection is doing — and the rest are **absent rather than declared
+//! empty**, for the reason `src/lib.rs` gives about `ui/` itself: a module that
+//! exists and does nothing reads as finished work.
 //!
 //! # What the split is between list and row
 //!
@@ -31,7 +31,23 @@
 //! is a finding about the framework rather than a preference**: `gpui` at
 //! `rev e683fd7` has no text-input element and no `InputState`. Its module docs
 //! record the verified evidence and the dependency that was rejected instead.
+//!
+//! # And where the banner sits relative to both
+//!
+//! [`connection_banner`] is a *sibling* of both rather than part of either, and the
+//! reason is that it is the only thing in this module that reads the connection's
+//! state rather than a channel's. It sits between the log and the composer because
+//! that is the strip a user's eye crosses on its way to the field, and a client that
+//! cannot send has to be able to learn why *before* they type.
+//!
+//! **It is the only module here that renders nothing for the common case**, which
+//! is why it is a function returning `Option<AnyElement>` rather than an
+//! `Entity` — `Render` cannot return nothing, and a permanently-on health indicator
+//! would be a permanent distraction. Its own module docs carry that reasoning in
+//! full; the short form is that presence (`Shell::transport`) and content
+//! (`ConnectionState`) are two different questions with two different owners.
 
+pub mod connection_banner;
 pub mod input_bar;
 pub mod message_list;
 pub mod message_row;

@@ -35,6 +35,7 @@ ADR-005.
 | [ADR-008](#adr-008--adopting-rstest-for-parameterized-tests) | Adopting `rstest` for parameterized tests | **Accepted** |
 | [ADR-009](#adr-009--one-main-thread-by-construction-rather-than-by-lock) | One main thread, by construction rather than by lock | **Accepted** |
 | [ADR-010](#adr-010--self-hosted-per-team-instances-with-sqlite) | Self-hosted per-team instances, with SQLite | **Accepted** |
+| [ADR-011](#adr-011--connection-visibility-a-banner-in-the-window-and-stderr-for-the-terminal) | Connection visibility: a banner in the window, and stderr for the terminal | **Accepted** |
 
 ---
 
@@ -1369,4 +1370,132 @@ separate operations, named separately, so neither implies the other.
   accident.
 - **Rate limiting and abuse controls** — a real need for an instance reachable from a
   network, and a separate decision with its own context.
+
+### ADR-011 — Connection visibility: a banner in the window, and stderr for the terminal
+
+**Status:** Accepted · 2026-10-03
+
+#### Context
+
+A user who cannot send could not tell why. The socket failed in a worker thread, the failure
+was announced with `tracing::error!`, and **nothing received it** — `sh_nexus` depended on
+`tracing` but on no subscriber, so every event the crate emitted was a no-op. Meanwhile the
+composer's send was refused by the state and the log simply stopped changing. Three separate
+gaps, all of them invisible:
+
+1. **`Shell::is_connected()` answered a different question than its name.** It returned
+   `transport.is_some()` — *a worker thread was started* — which is true the instant
+   `start_transport` returns and stays true while the client backs off against a server that
+   does not exist. PR #43's own test asserted it `true` against `ws://127.0.0.1:1/ws`, so the
+   lie had been written into the suite. The honest answer already existed and was already
+   maintained — `DomainEvent::ConnectionStateChanged` → `actions::apply_event` →
+   `AppState::set_connection`, read through `bridge::try_read` — and
+   [`AppState::can_send`](crates/sh_nexus/src/state/app_state.rs) is the composer's gate on it.
+2. **Nothing rendered the state.** `ConnectionState` carries two payloads that exist *only* for
+   a UI and that nothing read: `Reconnecting { attempt }` is documented as *"carried so the UI
+   can show it"*, and `Rejected { code, detail }` as *"shown to the user, because 'the
+   connection failed' with no reason is unactionable"*.
+3. **No log sink existed at all**, for the client. `tracing-subscriber` was already a workspace
+   dependency with `env-filter` for `sh_nexus_server`; the client simply did not name it.
+
+Two questions have to be answered separately before a view can be built, and the framework
+makes the second one harder than it looks.
+
+#### Decision
+
+**1. A wrong accessor is removed, not corrected.** `Shell::is_connected` is deleted rather than
+renamed or reimplemented. `AppState::can_send` answers "are we connected"; `bridge::try_read`
+exposes it; a second accessor that can drift from the first is the hazard `state/bridge.rs` §5
+is written about — *the number of ways to do something is the audit trail*. What survives is
+`Shell::transport`, and its documentation now says what the field knows: **a connection was
+attempted.** That is a different, also-useful, and honest claim.
+
+**2. Banner presence and banner content are two questions with two owners.**
+
+| Question | Owner | Why not the other one |
+|---|---|---|
+| *Is there a banner at all?* | `Shell::transport.is_some()` | A client launched with no `SH_NEXUS_URL` is in **local mode by design** — `ConnectionSettings::from_env` treats both variables absent as offline, not as a misconfiguration. A banner there would be a permanent red strip apologising for a choice the user made. |
+| *What does it say?* | `ConnectionState`, via `bridge::try_read` | It is the only place the answer is maintained. |
+
+The merge is refused in both directions. "Draw whatever the state says" makes the offline shell
+permanently broken-looking; "draw whenever a transport was started" makes a healthy client
+permanently decorated.
+
+**3. A connected client renders nothing at all — no element, not an empty one.** This is a
+framework consequence, not a preference: `Render::render` returns `impl IntoElement` and there
+is no `Option`, so a view composed unconditionally always contributes an element. The banner is
+therefore **a function returning `Option<AnyElement>`**, added with `when_some` — the same shape
+`crate::ui::markdown::document()` already uses — and a connected client genuinely has no such
+element in the tree. `Render` cannot return nothing; a `Render` that must always return
+something cannot be absent.
+
+| State | Drawn | Colour |
+|---|---|---|
+| `Connected` | **nothing at all** | — |
+| `Disconnected` | `Disconnected` | `text_muted` |
+| `Connecting` | `Connecting…` | `accent` |
+| `Reconnecting { attempt }` | `Reconnecting (attempt N)…` | `accent` |
+| `Rejected { code, detail }` | the server's `detail`, with `code` | `danger` |
+
+`Connected` is the state a user spends their day in, and the strip sits where the eye crosses on
+its way to the composer. It also buys the strongest test available: *"no banner while connected"*
+is one assertion that fails loudly the moment somebody adds one.
+
+**4. `Rejected` speaks the server's words, and `Reconnecting` shows the number.** Both payloads
+exist for a UI and neither is decorative. `danger` is reserved for `Rejected` because the enum
+documents that variant as terminal; `Connecting` and `Reconnecting` are `accent`, this palette's
+*interactive* colour and the same one the failed-send retry affordance uses, because progress is
+not failure.
+
+**5. `tracing` gets a subscriber, on stderr, installed before `run()`.** The ordering is the
+fix: `run` is what opens a window and starts a transport, and a failure inside it is exactly the
+message that needs somewhere to go. The filter comes from `RUST_LOG`, defaulting to `info` —
+`AGENTS.md` §7.5's own floor — and installation is `try_init`, never `init`: a logger whose
+failure mode is a panic in its initialiser would crash the process it exists to make
+diagnosable.
+
+**6. Stderr is explicitly *not* the user-facing log surface, and no log file is written.** A GUI
+client launched from Explorer has no console: writing to stderr is honest for a developer's
+terminal and useless to the person who needs to know why their message will not send. **The
+banner is that surface.** A file would need a location, a size bound, a rotation policy and a
+redaction rule (§7.5 forbids logging message content and tokens, and a file outlives the process
+that would have honoured it) — four decisions, none of them taken here.
+
+#### Consequences
+
+- **`ui/` gained a module that is deliberately not an `Entity`.** `connection_banner.rs` is a
+  function plus a returned `Announcement`, and the consequence is concrete: because the banner
+  is rebuilt by the shell's own frame rather than cached by GPUI, **`Shell::apply_inbox` now
+  notifies the shell** when a tick applied something and a transport exists. It is gated on
+  `transport.is_some()` so an offline shell pays nothing for a repaint that cannot change a
+  pixel, and it sits inside the existing `applied() == 0` early return, so a quiet tick still
+  asks for no frame.
+- **The removed accessor is a compile error for anything that used it**, which is the point. The
+  two tests that called it now read the state through the seam; the one that asserted `true`
+  against a dead port asserts that the state is an *attempt* and never `Connected`, polled to a
+  deadline because the answer is produced on another thread.
+- **`Rejected` text is server-controlled**, so it is server-controlled *width and content*: a
+  very long detail will lay out across the strip rather than be clipped. No truncation is applied
+  and none should be — a paraphrased error is the failure this decision exists to prevent — but
+  the strip's height is bounded by wrapping, not by the text.
+- **`tracing-subscriber` is now linked into the client.** It is not a new dependency: the
+  workspace already pinned it with `env-filter` and the audit is in the root manifest. The
+  client's compile graph gains a crate it was already compiling for the server's binary.
+- **A window still has no durable log.** An operator whose client failed to start and who did not
+  launch it from a terminal has the process's exit code and nothing else. That is accepted, not
+  overlooked; the exit code is the deliberate answer and a log file is the decision it is waiting
+  for.
+
+#### Alternatives considered
+
+| Option | Why not chosen |
+|---|---|
+| **Correct `is_connected` to read the state** | The accessor was never the defect; the *second answer* was. `can_send` already answers the question, and a corrected copy would be a third thing to keep in step with a state a view can read directly. Removed instead. |
+| **Let the banner always be present, empty when connected** | `Render` cannot return nothing, so "empty" means a real element of whatever height its padding gives — a permanent strip in the column, and a test that could not tell it from a one-word banner. |
+| **A banner inside the message list** | The list is a `gpui::List` of message rows, virtualized and recycled. A status strip is not a message, and `tests/ui_message_list.rs`'s item-count and row-identity assertions would have to learn about an element that is not a row. |
+| **Disable the composer instead of explaining** | `AGENTS.md` §3.3 requires network failures to surface as a recoverable state rather than as silence, and a greyed-out field says *"something is wrong"* where the state knows precisely what. The optimistic-send path also stays reachable: the outbox is not this work's decision. |
+| **A modal dialog on rejection** | `Rejected` is terminal and the user may be mid-conversation; a modal takes the window for a sentence they already needed. A strip between the log and the composer is readable without being disruptive. |
+| **A tray icon or a title-bar suffix** | Both are outside `AGENTS.md` §3.1's tree, and both put a platform-specific integration in front of a problem a line of text solves. |
+| **`tracing-subscriber::fmt().with_writer(file)`** | Four decisions this ADR does not take (§6 above), and §7.1's ban on unbounded in-memory state has a file-shaped cousin in an unbounded file. |
+| **`tracing::subscriber::set_global_default`** | It **panics** when a default already exists. A test harness or an embedder that initialised `tracing` first would crash this client on the path that was supposed to make crashes diagnosable. `try_init` reports instead. |
 
