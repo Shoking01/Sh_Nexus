@@ -30,16 +30,17 @@
 //!
 //! # Schema
 //!
-//! Four tables and one migration, and two of them are not exercised by this
-//! milestone. That is the interesting part, so it is stated rather than implied:
+//! Five tables and two migrations, and two of them are not exercised by every
+//! caller. That is the interesting part, so it is stated rather than implied:
 //!
 //! | Table | Exercised here | Why it exists anyway |
 //! |---|---|---|
-//! | `users` | one seeded row | Auth is ADR-010's next PR. `messages.user_id` has a foreign key, so the row has to exist for the milestone's own foreign keys to mean anything. |
+//! | `users` | one seeded row plus every real account | `messages.user_id` has a foreign key, so the row has to exist for the milestone's own foreign keys to mean anything. |
 //! | `channels` | one seeded row | Channel provisioning is the REST milestone's job. A send naming an unknown channel is refused, not silently created. |
 //! | `messages` | the whole round trip | The one working path. |
+//! | `sessions` | every WebSocket handshake | A revoked session has to be distinguishable from a live one without reading the token, which is why the row is keyed on the hash. |
 //! | `read_cursors` | **no** | Required by ADR-010 "from the first migration". |
-//! | `channel_members` | **no** | Membership is an authorization concern, which is the auth milestone. |
+//! | `channel_members` | yes, by `message.rs`'s authorization check | Membership is an authorization concern, and this is the milestone that reads it. |
 //!
 //! **`read_cursors` is the one to read the ADR for.** ADR-010's decision is
 //! per-`(user, channel)` read state, and its stated reason is that the client's
@@ -53,21 +54,50 @@
 //! nothing queries is not a feature; it is the shape of the decision, taken at
 //! the only moment it is cheap.
 //!
-//! # The author of every message in this milestone
+//! # The reserved author, and why the row outlives the role
 //!
-//! [`UNATTRIBUTED_USER_ID`] is the author `messages.user_id` points at, because
+//! [`UNATTRIBUTED_USER_ID`] used to be the author of *every* message, because
 //! `PLAN.md` §6's `message.send` carries only `channel_id` and `content` and
-//! authorship is meant to come from an authenticated session -- which is the
-//! milestone ADR-010 defers. So the server has no identity to record and this is
-//! the honest value: a reserved row that no human can be, named
-//! `unattributed`, so a transcript rendered from this milestone's file says
-//! plainly that the server does not know who wrote it.
+//! authorship was meant to come from an authenticated session. There is one now,
+//! so the placeholder is **no longer the author of anything**: [`Store::accept_message`]
+//! takes the author's id from the connection's session and stores that.
 //!
-//! The alternative -- a blank `user_id` -- was rejected for a concrete reason
-//! rather than taste: `WireMessage`'s own boundary
-//! (`crates/sh_nexus/src/network/mapping.rs`) rejects a blank `user_id`, so a
-//! blank one makes this server emit a `message.ack` its own client refuses to
-//! decode, and the resulting bug would present as a client defect.
+//! **The row itself is still seeded, and that is a decision with a reason rather
+//! than an oversight.** ADR-010 decides that *"message authorship is retained
+//! when a user is removed"* -- teams want the audit trail, and deleting a person
+//! must not silently rewrite history. A database migrated from schema 1 holds
+//! `messages` rows whose `user_id` points at this row, and `foreign_keys` is on.
+//! Stopping the seed would leave those files with a dangling reference that the
+//! next `INSERT INTO messages` in the same transaction would not even notice,
+//! and the transcript would render a blank author -- which is the one outcome
+//! `network/mapping.rs` documents as worse than the message not arriving.
+//!
+//! So the row is kept as a **historical author and nothing else**: it has no
+//! `password_hash` (migration 2's column is nullable for exactly this row), so it
+//! can never log in, and no new message is ever attributed to it.
+//!
+//! The alternative that was rejected -- deleting the row -- fails ADR-010's
+//! retention rule outright, and the alternative before that -- a blank `user_id`
+//! -- was rejected for a concrete reason rather than taste: `WireMessage`'s own
+//! boundary (`crates/sh_nexus/src/network/mapping.rs`) rejects a blank
+//! `user_id`, so a blank one makes this server emit a `message.ack` its own
+//! client refuses to decode, and the resulting bug would present as a client
+//! defect.
+//!
+//! # Why `sessions` is keyed on a hash and not on the token
+//!
+//! The key of the `sessions` table is `token_hash`, a SHA-256 digest, and never
+//! the token. That single choice is what makes ADR-010's revocation requirement
+//! cheap: a backup of `sh_nexus.db` is a file copy, so a file copy that contained
+//! live tokens would be a file copy that contained every session on the
+//! instance. With the hash as the key, a leaked file yields digests, and a digest
+//! cannot be presented in an `Authorization` header.
+//!
+//! It also means the lookup is a single indexed `SELECT` rather than a
+//! "compare every row" pass, which is what lets the same fast hash be used for
+//! every WebSocket handshake. `auth.rs` gives the full argument for why that hash
+//! is `sha2` and not `argon2`, which is the opposite of the answer for a
+//! password.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,12 +118,12 @@ use crate::time;
 /// out of step with the schema it describes -- a `schema_version` table can be,
 /// because a transaction that inserts the version and the schema it stamps is
 /// still two statements someone can interrupt.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
-/// The id every message is attributed to while there is no authentication.
+/// The id every message was attributed to before this build had authentication.
 ///
-/// See the module docs. Not a user, not an account, and not a fallback for a
-/// real one: a value that means "the server does not know".
+/// See the module docs on why the row outlives the role. **Not a user, not an
+/// account, and not a login**: no message is attributed to it by this build.
 pub const UNATTRIBUTED_USER_ID: &str = "u_unattributed";
 
 /// The login handle of [`UNATTRIBUTED_USER_ID`].
@@ -103,8 +133,9 @@ pub const UNATTRIBUTED_USERNAME: &str = "unattributed";
 ///
 /// Renders in a transcript as a word rather than as an empty bubble, because
 /// `network/mapping.rs` documents an empty display name as "a message attributed
-/// to nobody, which is worse than the message not arriving".
-pub const UNATTRIBUTED_DISPLAY_NAME: &str = "Unattributed (no authentication yet)";
+/// to nobody, which is worse than the message not arriving". **Only a transcript
+/// that contains a message from before schema 2 will ever show it.**
+pub const UNATTRIBUTED_DISPLAY_NAME: &str = "Unattributed (written before authentication)";
 
 /// The id of the one channel this milestone seeds.
 ///
@@ -194,6 +225,102 @@ CREATE TABLE channel_members (
 ) STRICT;
 "#;
 
+/// Migration 2: credentials and sessions. **Strictly additive.**
+///
+/// # What it adds, and the two columns that carry all the weight
+///
+/// ```text
+/// ALTER TABLE users ADD COLUMN password_hash TEXT;   -- nullable
+/// ALTER TABLE users ADD COLUMN is_admin      INTEGER NOT NULL DEFAULT 0
+///                                           CHECK (is_admin IN (0, 1));
+/// CREATE TABLE sessions (
+///     token_hash         TEXT    NOT NULL PRIMARY KEY,
+///     user_id            TEXT    NOT NULL REFERENCES users (id),
+///     created_at_unix_ms INTEGER NOT NULL,
+///     expires_at_unix_ms INTEGER NOT NULL,
+///     revoked_at_unix_ms INTEGER,
+///     CHECK (expires_at_unix_ms > created_at_unix_ms)
+/// ) STRICT;
+/// CREATE INDEX sessions_user  ON sessions (user_id);
+/// CREATE INDEX sessions_expiry ON sessions (expires_at_unix_ms);
+/// ```
+///
+/// # What it does to an existing database, exactly
+///
+/// **Nothing is rewritten, nothing is deleted, and every row survives.** Both
+/// `ALTER`s are `ADD COLUMN`, which SQLite applies in place by appending to the
+/// row format's null-bitmap; a table that was `STRICT` stays `STRICT`, and the
+/// `CHECK` constraints migration 1 declared still apply to every column that
+/// existed before this one. Concretely, on a file migrated from schema 1:
+///
+/// - `users.password_hash` is `NULL` for all existing rows, so **no existing
+///   account can log in until an administrator sets its password.** That is the
+///   correct outcome rather than a gap: there is no password to recover, and
+///   inventing one would let anybody who guessed a username in.
+/// - `users.is_admin` is `0` for all existing rows, so a file that had accounts
+///   before this migration has **no administrator** unless an operator is made
+///   one. `auth::bootstrap` does not help there -- it only runs on an instance
+///   with no account at all -- which is why [`Store::promote_to_administrator`]
+///   exists and why its existence is stated here rather than discovered.
+/// - `sessions` starts empty, and no `messages` row changes. The reserved
+///   [`UNATTRIBUTED_USER_ID`] row is untouched, which is what keeps the
+///   transcripts of a pre-auth instance readable (see the module docs).
+///
+/// **The version stamp is written last, inside the same transaction**, so a
+/// crash between the two `ALTER`s leaves the file at schema 1 and the next start
+/// retries the whole migration rather than half-applying it. That is what
+/// [`migrate`]'s per-migration conditionals are for.
+///
+/// # Why `is_admin` is here at all, since it was not asked for by name
+///
+/// ADR-010 decides "an administrator creates accounts; the first account is
+/// created at startup or from an operator-supplied environment variable". An
+/// administrator that has to be **inferred** -- the earliest `created_at`, or
+/// the row named `admin`, or whichever account logged in first -- is a privilege
+/// rule that cannot be audited by opening the file, and ADR-010's strongest
+/// argument for this whole design is precisely that a team can verify the server's
+/// behaviour by reading `sh_nexus.db` (its Context section calls this "a
+/// stronger property than any policy statement"). So the flag is a stored column,
+/// defaulted to the least-privileged value, and it is checkable with one query:
+///
+/// ```sql
+/// SELECT id, username FROM users WHERE is_admin = 1;
+/// ```
+///
+/// The alternative -- "the first account created is the administrator, inferred
+/// from `MIN(created_at_unix_ms)`" -- was rejected for a concrete reason: two
+/// accounts created inside the same millisecond tie, and a tie broken by `id` is
+/// a privilege grant decided by a UUID. The rule would also be unrecoverable: an
+/// administrator could not transfer the role, because transferring it would mean
+/// deleting the row that *is* the rule.
+///
+/// # Why `CHECK (expires_at_unix_ms > created_at_unix_ms)`
+///
+/// A session that expires the instant it was created is not a session, it is a
+/// bug that reads as a login failure for every user. The constraint turns that
+/// class of mistake into a `SQLITE_CONSTRAINT` at the only place it can be
+/// introduced -- the insert -- rather than into a support question later. It is
+/// enforced by SQLite rather than by a convention, which is the same argument
+/// `STRICT` makes for the id columns in migration 1.
+const MIGRATION_2: &str = r#"
+ALTER TABLE users ADD COLUMN password_hash TEXT;
+
+ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1));
+
+CREATE TABLE sessions (
+    token_hash         TEXT    NOT NULL PRIMARY KEY,
+    user_id            TEXT    NOT NULL REFERENCES users (id),
+    created_at_unix_ms INTEGER NOT NULL,
+    expires_at_unix_ms INTEGER NOT NULL,
+    revoked_at_unix_ms INTEGER,
+    CHECK (expires_at_unix_ms > created_at_unix_ms)
+) STRICT;
+
+CREATE INDEX sessions_user ON sessions (user_id);
+
+CREATE INDEX sessions_expiry ON sessions (expires_at_unix_ms);
+"#;
+
 /// What [`Store::accept_message`] did with a send.
 ///
 /// Two outcomes, not one, because the caller has to behave differently for each:
@@ -252,6 +379,21 @@ impl StoredMessage {
     }
 }
 
+/// What a send's target channel allows.
+///
+/// Three answers, and the split between the first two is a *user-facing* decision
+/// rather than a security one: see [`Store::channel_access`] for why existence is
+/// checked first and what asking in that order does and does not reveal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelAccess {
+    /// The channel exists and the user is a member of it. The send may proceed.
+    Allowed,
+    /// The channel exists and the user is not a member of it.
+    NotAMember,
+    /// No channel on this instance has that id.
+    UnknownChannel,
+}
+
 /// A message row, read by `client_msg_id`.
 ///
 /// The read is keyed on `client_msg_id` and not on the id this call just minted,
@@ -260,6 +402,117 @@ impl StoredMessage {
 /// second message.
 const SELECT_BY_CLIENT_MSG_ID: &str = "SELECT id, client_msg_id, channel_id, user_id, \
      content, accepted_at_unix_ms FROM messages WHERE client_msg_id = ?1";
+
+/// One account that can log in.
+///
+/// **Not the reserved [`UNATTRIBUTED_USER_ID`] row**, which has no
+/// `password_hash` and is therefore not an account by this definition. The
+/// distinction is the reason this is a struct rather than a row type: the
+/// `users` table holds one kind of row that is a historical artefact and another
+/// that is a person, and the difference is a nullable column rather than a table.
+///
+/// `Serialize` is derived, and it is safe because every field here is either
+/// server-issued or already public on the instance: the only field that would not
+/// be is `password_hash`, and that one is deliberately **not** on this type -- it
+/// lives on [`Credential`], which is the crate's one hand-written `Debug`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Account {
+    /// The `users.id` value, server-issued and stable.
+    pub id: String,
+    /// The login handle. Unique, case-sensitively, by `users_username_unique`.
+    pub username: String,
+    /// The name to render in a transcript.
+    pub display_name: String,
+    /// Whether this account may create other accounts.
+    ///
+    /// One bit, and deliberately the only privilege this milestone models: ADR-010
+    /// records "no OAuth, no SSO" and closed registration, so the entire
+    /// authorization question for a new account is "may this one create it".
+    pub is_admin: bool,
+}
+
+/// What a login needs to decide, read by username.
+///
+/// A separate type from [`Account`] on purpose: this is the **only** struct in the
+/// server that holds a password hash, so it is the only one whose `Debug` has to
+/// be hand-written, and `Account` is then free to derive one because it has
+/// nothing sensitive in it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credential {
+    /// The account the password belongs to.
+    pub account: Account,
+    /// The stored PHC string, or `None` for a row that cannot log in.
+    ///
+    /// `Option` rather than an empty string, because the two are different facts:
+    /// "this row was never given a password" (the reserved historical author) and
+    /// "this row was given an empty password" are not the same statement, and
+    /// [`crate::auth::verify_password`] is written so that only one of them can be
+    /// true.
+    pub password_hash: Option<String>,
+}
+
+impl std::fmt::Debug for Credential {
+    /// **Prints whether a hash exists and never what it is.**
+    ///
+    /// Hand-written for the same reason [`Store`]'s is, and with more at stake: an
+    /// `Argon2` PHC string is not a secret in the way a password is, but it is
+    /// enough to mount an offline dictionary attack against whatever the person
+    /// chose, and a `Debug` impl that can reach a `warn!` is an impl that has to
+    /// be trusted not to. Trusting a derive here would be trusting a format
+    /// change.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Credential")
+            .field("account", &self.account)
+            .field(
+                "password_hash",
+                &self.password_hash.as_ref().map(|_| "<argon2>"),
+            )
+            .finish()
+    }
+}
+
+/// What a presented session token turned out to be.
+///
+/// Four outcomes, not two, and the split is what makes the *logs* honest without
+/// making the *response* distinguishable: [`crate::auth`] answers all four with
+/// one 401, because a client that can tell "your token expired" from "your token
+/// was revoked" learns something about a token it presented, and
+/// `AGENTS.md` §7.5's rule is that this server does not explain itself to a peer.
+/// The operator gets the distinction in a log line carrying an id and a reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionState {
+    /// The token names a session that is neither revoked nor past its expiry.
+    Live {
+        /// The authenticated user. This is what a message is attributed to.
+        user_id: String,
+        /// Whether that user may create accounts.
+        is_admin: bool,
+        /// When the session stops being live, for the log line and for nothing else.
+        expires_at_unix_ms: i64,
+    },
+    /// The token names a session that was explicitly revoked.
+    ///
+    /// **Checked before expiry, and that order is the point.** A revoked session
+    /// dies immediately, which is the whole reason ADR-010 rejected a
+    /// self-contained token format: expelling a member has to kill the socket they
+    /// are holding, and a token that only stopped working when it aged out would
+    /// leave it alive for the rest of its lifetime.
+    Revoked {
+        /// When it was revoked, so a log line can say how long it survived.
+        revoked_at_unix_ms: i64,
+    },
+    /// The token names a session that is past `expires_at_unix_ms`.
+    Expired {
+        /// When it stopped being live.
+        expires_at_unix_ms: i64,
+    },
+    /// No session has this token hash.
+    ///
+    /// Also the answer for a token that was never valid, and the two are the same
+    /// outcome on purpose: there is nothing an operator can do about either.
+    Absent,
+}
 
 /// The handle every other module holds to the database.
 ///
@@ -397,17 +650,28 @@ impl Store {
     ///   malformed id into a different one would key the dedupe on something the
     ///   sender never sent.
     /// * `channel_id` - the target channel. Must already exist.
+    /// * `user_id` - the author, **from the connection's session and never from
+    ///   the frame**. `PLAN.md` §6's `message.send` carries no author, so the only
+    ///   value available here is the one `ws.rs` got from the handshake's
+    ///   `Authorization` header; taking it from the frame instead would make
+    ///   attribution a claim rather than a fact, which is the entire difference
+    ///   between an authenticated server and an anonymous one. The foreign key
+    ///   enforces that it names a real row, so a connection whose session named
+    ///   nobody cannot get this far.
     /// * `content` - the message body, stored verbatim.
     ///
     /// # Errors
     ///
     /// [`ServerError::UnknownChannel`] if `channel_id` names no channel, and
-    /// [`ServerError::Sqlite`] for a driver failure. [`ServerError::LockPoisoned`]
-    /// if an earlier panic left the connection unusable.
+    /// [`ServerError::Sqlite`] for a driver failure -- including the foreign-key
+    /// violation an unknown `user_id` produces.
+    /// [`ServerError::LockPoisoned`] if an earlier panic left the connection
+    /// unusable.
     pub fn accept_message(
         &self,
         client_msg_id: &str,
         channel_id: &str,
+        user_id: &str,
         content: &str,
     ) -> Result<AcceptOutcome> {
         let mut connection = self.lock()?;
@@ -436,7 +700,7 @@ impl Store {
                 &id,
                 client_msg_id,
                 channel_id,
-                UNATTRIBUTED_USER_ID,
+                user_id,
                 content,
                 accepted_at
             ],
@@ -465,6 +729,432 @@ impl Store {
             })
     }
 
+    // -----------------------------------------------------------------------
+    // Accounts
+    //
+    // Every method below is synchronous and blocking, for the same reason the
+    // message path is: `db.rs`'s module docs. `auth.rs` puts them on a blocking
+    // thread with `spawn_blocking`, which is the whole reason `Store`'s methods
+    // are not `async`.
+    // -----------------------------------------------------------------------
+
+    /// How many accounts on this instance can log in.
+    ///
+    /// **Counted as "has a `password_hash`", not as "rows in `users`".** That is
+    /// what makes the bootstrap decision work on a database migrated from schema
+    /// 1: such a file has the reserved [`UNATTRIBUTED_USER_ID`] row and nothing
+    /// else, and counting rows would report an account that cannot log in and skip
+    /// the bootstrap forever. Counting the rows that *can* log in is the property
+    /// the bootstrap actually needs -- "this instance has nobody to administer
+    /// it" -- and it is the same question on a fresh file and on a migrated one.
+    pub fn account_count(&self) -> Result<i64> {
+        let connection = self.lock()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM users WHERE password_hash IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Creates an account, refusing rather than overwriting a taken username.
+    ///
+    /// `INSERT` and not `INSERT OR IGNORE` and not `INSERT OR REPLACE`, and all
+    /// three refusals are load-bearing:
+    ///
+    /// - `OR IGNORE` would make a taken username a **silent no-op**, and
+    ///   [`crate::auth`]'s bootstrap would then report success for an
+    ///   administrator it did not create.
+    /// - `OR REPLACE` deletes the conflicting row, which on `users` cascades into
+    ///   `messages.user_id`, `sessions.user_id` and `read_cursors.user_id`. That is
+    ///   ADR-010's "never destroy user data silently" violated in one clause.
+    /// - The existence check below is what turns the unique-index violation into a
+    ///   **typed** [`ServerError::UsernameTaken`] rather than a raw
+    ///   `SQLITE_CONSTRAINT`. It runs inside the same transaction as the `INSERT`,
+    ///   and the `INSERT`'s own constraint remains the authority: if the check and
+    ///   the insert ever disagreed, the insert would lose and the caller would get
+    ///   [`ServerError::Sqlite`] -- which is a server fault, and is what a lost race
+    ///   genuinely is. The alternative -- matching on the driver's extended error
+    ///   code -- would make this function's error vocabulary depend on a SQLite
+    ///   constant number.
+    ///
+    /// The `is_admin` argument rather than an implicit rule is the reason
+    /// `MIGRATION_2`'s comment can claim the privilege is auditable with one
+    /// query: there is exactly one place in the server that writes the flag, and
+    /// it is this function's parameter.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::UsernameTaken`] if `username` already exists, and
+    /// [`ServerError::Sqlite`] for anything else the driver reports.
+    pub fn create_account(
+        &self,
+        username: &str,
+        display_name: &str,
+        password_hash: &str,
+        is_admin: bool,
+    ) -> Result<Account> {
+        let now = time::now_unix_millis();
+        let id = mint_user_id(now);
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let taken: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM users WHERE username = ?1",
+                [username],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if taken.is_some() {
+            return Err(ServerError::UsernameTaken {
+                username: username.to_owned(),
+            });
+        }
+
+        transaction.execute(
+            "INSERT INTO users
+                 (id, username, display_name, avatar_url, created_at_unix_ms,
+                  password_hash, is_admin)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+            params![&id, username, display_name, now, password_hash, is_admin],
+        )?;
+
+        transaction.commit()?;
+        Ok(Account {
+            id,
+            username: username.to_owned(),
+            display_name: display_name.to_owned(),
+            is_admin,
+        })
+    }
+
+    /// Raises an existing account to administrator.
+    ///
+    /// # Why this exists, when `create_account` could have been used
+    ///
+    /// Migration 2 gives every pre-existing row `is_admin = 0`, so an instance
+    /// that had accounts before this build has no administrator and no way to
+    /// become one through the API -- the API that makes accounts is the API only
+    /// administrators may call. This is the break-glass door, and it is a
+    /// separate named function rather than a flag on `create_account` so that
+    /// "an operator granted themselves the role on the command line" is a thing
+    /// the code says out loud.
+    ///
+    /// It is idempotent, so running it twice is one promotion.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::UnknownAccount`] if no row has this username, and
+    /// [`ServerError::Sqlite`] for anything else.
+    pub fn promote_to_administrator(&self, username: &str) -> Result<()> {
+        let connection = self.lock()?;
+        let promoted = connection.execute(
+            "UPDATE users SET is_admin = 1 WHERE username = ?1",
+            [username],
+        )?;
+        if promoted == 0 {
+            return Err(ServerError::UnknownAccount {
+                username: username.to_owned(),
+            });
+        }
+        info!(
+            username_len = username.len(),
+            "granted the administrator role to an existing account"
+        );
+        Ok(())
+    }
+
+    /// Reads one account's credential by login handle.
+    ///
+    /// `None` for a username that does not exist, which
+    /// [`crate::auth::verify_password`] is careful to make indistinguishable from
+    /// a wrong password: see its docs for the work it does to equalise the two.
+    ///
+    /// `username` is matched **exactly**, including case. `users_username_unique`
+    /// is a `BINARY` index and matching the way the unique index does is the only
+    /// way a login can be sure that the account it authenticated is the account
+    /// the uniqueness rule protects -- case-insensitive login on a case-sensitive
+    /// index means two spellings that are distinct rows but one handle.
+    pub fn credential_for_username(&self, username: &str) -> Result<Option<Credential>> {
+        let connection = self.lock()?;
+        let found = connection
+            .query_row(
+                "SELECT id, username, display_name, password_hash, is_admin
+                 FROM users WHERE username = ?1",
+                [username],
+                |row| {
+                    Ok(Credential {
+                        account: Account {
+                            id: row.get(0)?,
+                            username: row.get(1)?,
+                            display_name: row.get(2)?,
+                            is_admin: row.get::<_, i64>(4)? != 0,
+                        },
+                        password_hash: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    // -----------------------------------------------------------------------
+    // Sessions
+    // -----------------------------------------------------------------------
+
+    /// Records a session, keyed on `token_hash`.
+    ///
+    /// The hash is the primary key, so two logins can never collide by accident
+    /// and `INSERT` is enough -- no upsert, no `OR REPLACE`, nothing that could
+    /// quietly extend an existing session's life. A caller that wants a new
+    /// session mints a new token.
+    ///
+    /// `expires_at_unix_ms` must be strictly greater than `created_at_unix_ms`;
+    /// migration 2's `CHECK` says so, so a caller that passes equal instants gets
+    /// a [`ServerError::Sqlite`] naming the constraint rather than a session that
+    /// is born dead.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Sqlite`] for a driver failure, including the foreign key a
+    /// session for an unknown `user_id` would violate.
+    pub fn insert_session(
+        &self,
+        token_hash: &str,
+        user_id: &str,
+        created_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<()> {
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO sessions
+                 (token_hash, user_id, created_at_unix_ms, expires_at_unix_ms, revoked_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, NULL)",
+            params![token_hash, user_id, created_at_unix_ms, expires_at_unix_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Decides what a presented session token hash is worth.
+    ///
+    /// **One indexed read, and the order of the checks is the security property.**
+    /// A revoked session is reported as [`SessionState::Revoked`] even when its
+    /// `expires_at_unix_ms` is also in the past, so the log line names the reason
+    /// an operator actually acted on rather than the one that happened to fire
+    /// first. `revoked_at_unix_ms IS NULL` is therefore the first predicate.
+    ///
+    /// `now_unix_millis` is an argument rather than a call to
+    /// [`crate::time::now_unix_millis`] so a test can place itself on either side
+    /// of an expiry without a `sleep()`, which `AGENTS.md` §4.3 forbids and which
+    /// a session TTL measured in days would otherwise make unavoidable.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Sqlite`] for a driver failure. A foreign-key-broken session
+    /// row is reported as [`SessionState::Absent`], because a session pointing at
+    /// a user that is not there is not a session.
+    pub fn lookup_session(&self, token_hash: &str, now_unix_millis: i64) -> Result<SessionState> {
+        let connection = self.lock()?;
+        let found = connection
+            .query_row(
+                "SELECT s.user_id, s.created_at_unix_ms, s.expires_at_unix_ms,
+                        s.revoked_at_unix_ms, u.is_admin
+                 FROM sessions AS s
+                 JOIN users AS u ON u.id = s.user_id
+                 WHERE s.token_hash = ?1",
+                [token_hash],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, i64>(4)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((user_id, created_at, expires_at, revoked_at, is_admin)) = found else {
+            return Ok(SessionState::Absent);
+        };
+
+        // Reported even when the session has also expired: an operator who revoked
+        // a session wants to know that, and the session outliving its own
+        // expiry is a fact about the revocation, not about the clock.
+        if let Some(revoked_at) = revoked_at {
+            debug!(
+                user_id = %user_id,
+                lifetime_ms = revoked_at.saturating_sub(created_at),
+                "a revoked session was presented"
+            );
+            return Ok(SessionState::Revoked {
+                revoked_at_unix_ms: revoked_at,
+            });
+        }
+        if now_unix_millis >= expires_at {
+            return Ok(SessionState::Expired {
+                expires_at_unix_ms: expires_at,
+            });
+        }
+        Ok(SessionState::Live {
+            user_id,
+            is_admin,
+            expires_at_unix_ms: expires_at,
+        })
+    }
+
+    /// Marks a session revoked, and says whether there was one to revoke.
+    ///
+    /// **A row is kept rather than deleted, and that is what makes the operation
+    /// idempotent and auditable.** Deleting would make a second `logout` for the
+    /// same token indistinguishable from a token that was never valid -- which is
+    /// a property, but it also destroys the only record that the session existed.
+    /// Writing `revoked_at_unix_ms` keeps both: the answer is still "this session
+    /// is not live" and there is still a row saying when it stopped being so.
+    ///
+    /// Idempotent, because `WHERE revoked_at_unix_ms IS NULL` makes a second call
+    /// a no-op that returns `true` -- the session was revoked, by this call or an
+    /// earlier one, and both answers are the same answer.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Sqlite`] for a driver failure.
+    pub fn revoke_session(&self, token_hash: &str, now_unix_millis: i64) -> Result<bool> {
+        let connection = self.lock()?;
+        let revoked = connection.execute(
+            "UPDATE sessions SET revoked_at_unix_ms = ?1
+             WHERE token_hash = ?2 AND revoked_at_unix_ms IS NULL",
+            params![now_unix_millis, token_hash],
+        )?;
+        Ok(revoked > 0)
+    }
+
+    /// Removes every session that is past its expiry.
+    ///
+    /// **Not called from a request path and not called on a timer**, deliberately:
+    /// an expired session is already refused by [`Store::lookup_session`], so
+    /// deleting it changes nothing a peer can observe, and a sweep implies a
+    /// background task this server does not have. It exists so an operator -- or
+    /// the tests -- can say how much of the file is dead weight, and so the
+    /// retention story is a function somebody can call rather than a hope.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Sqlite`] for a driver failure.
+    pub fn purge_expired_sessions(&self, now_unix_millis: i64) -> Result<usize> {
+        let connection = self.lock()?;
+        let removed = connection.execute(
+            "DELETE FROM sessions WHERE expires_at_unix_ms <= ?1",
+            [now_unix_millis],
+        )?;
+        Ok(removed)
+    }
+
+    // -----------------------------------------------------------------------
+    // Channel membership
+    // -----------------------------------------------------------------------
+
+    /// Whether `user_id` may write in `channel_id`.
+    ///
+    /// `channel_members` was created by migration 1 and left empty by every build
+    /// before this one, so on a database migrated from schema 1 **every send is
+    /// refused** until somebody inserts a membership row. That is stated here
+    /// rather than discovered: it is the correct answer (an empty membership table
+    /// means nobody has been granted anything) and
+    /// [`crate::auth::bootstrap`] is what puts the first administrator into
+    /// [`DEFAULT_CHANNEL_ID`].
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Sqlite`] for a driver failure.
+    pub fn user_can_reach_channel(&self, user_id: &str, channel_id: &str) -> Result<bool> {
+        let connection = self.lock()?;
+        let found: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM channel_members WHERE user_id = ?1 AND channel_id = ?2",
+                params![user_id, channel_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Whether a send may proceed, and why not when it may not.
+    ///
+    /// **Existence is decided before membership, and the order is the whole
+    /// design of this function.** A user who types a channel that does not exist
+    /// has made a typo; a user who types a channel they are not a member of has
+    /// made a request they cannot satisfy. Both need *different* sentences -- one
+    /// sends them to fix an id, the other sends them to an administrator -- so
+    /// asking the membership question first would answer "ask an administrator for
+    /// access" about a channel that does not exist.
+    ///
+    /// It leaks nothing to ask in this order. An authenticated peer that learns
+    /// "no such channel" learns a fact every other client will get from `GET
+    /// /channels` the moment the REST milestone lands, and it does **not** learn
+    /// whether any particular other user is a member of a channel that does exist:
+    /// that question is answered with [`ChannelAccess::NotAMember`] either way.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - the authenticated account, from the handshake.
+    /// * `channel_id` - as untrusted text from the frame.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Sqlite`] for a driver failure, which the caller reports as a
+    /// server fault and not as a refusal: a check that could not run is not an
+    /// answer.
+    pub fn channel_access(&self, user_id: &str, channel_id: &str) -> Result<ChannelAccess> {
+        let connection = self.lock()?;
+        let exists: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM channels WHERE id = ?1",
+                [channel_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Ok(ChannelAccess::UnknownChannel);
+        }
+
+        let member: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM channel_members WHERE user_id = ?1 AND channel_id = ?2",
+                params![user_id, channel_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(if member.is_some() {
+            ChannelAccess::Allowed
+        } else {
+            ChannelAccess::NotAMember
+        })
+    }
+
+    /// Grants `user_id` membership of `channel_id`.
+    ///
+    /// `INSERT OR IGNORE`, because membership is a set and re-granting one is not
+    /// an event. **Not** `OR REPLACE`: the table's primary key is the pair and
+    /// there is no column an upsert would have to overwrite, so an upsert here
+    /// would be the same `OR REPLACE` reflex `create_account` rejects, with the
+    /// same cascade.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Sqlite`] for a driver failure, including the foreign keys on
+    /// either id.
+    pub fn add_channel_member(&self, user_id: &str, channel_id: &str) -> Result<()> {
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT OR IGNORE INTO channel_members (user_id, channel_id) VALUES (?1, ?2)",
+            params![user_id, channel_id],
+        )?;
+        Ok(())
+    }
+
     /// Inserts the two rows the round trip needs, if they are not already there.
     ///
     /// `INSERT OR IGNORE` rather than `INSERT OR REPLACE`, and the difference is
@@ -472,6 +1162,13 @@ impl Store {
     /// the conflicting row and inserts a new one, which on `users` would cascade
     /// into `messages.user_id` and on `channels` would reset
     /// `last_message_at` -- the resume cursor -- on a restart.
+    ///
+    /// **The seeded user is not an account.** The insert names no
+    /// `password_hash`, so migration 2's nullable column stays `NULL` and there
+    /// is nothing anybody could present to log in as it. The module docs give the
+    /// reason the row is still created at all: ADR-010 retains message authorship
+    /// after a removal, and a database migrated from schema 1 has `messages` rows
+    /// pointing at it under an enforced foreign key.
     fn seed(&self) -> Result<()> {
         let now = time::now_unix_millis();
         let mut connection = self.lock()?;
@@ -533,9 +1230,22 @@ fn configure(connection: &Connection) -> Result<()> {
 /// - `user_version` above [`SCHEMA_VERSION`]: a newer build wrote this file.
 /// - `user_version` of zero with tables already present: this is not a file this
 ///   build created, so migration 1 is not the thing that should run against it.
-/// - Otherwise: apply every migration the file has not had, in one transaction,
-///   stamping the version last so a crash mid-migration leaves the file at the
-///   version it had reached rather than at a version it did not.
+/// - Otherwise: apply every migration the file has **not** had, in one
+///   transaction, stamping the version last so a crash mid-migration leaves the
+///   file at the version it had reached rather than at a version it did not.
+///
+/// **The per-migration conditionals are what make an upgrade additive rather than
+/// a replay.** A file at version 1 runs only [`MIGRATION_2`], so migration 1's
+/// `CREATE TABLE users` is not executed a second time; a fresh file runs both. The
+/// alternative -- always running the whole batch -- worked only while there was
+/// one migration, and would have failed loudly on the second, which is
+/// [`MIGRATION_1`]'s `no IF NOT EXISTS` rule working as intended rather than as an
+/// obstacle.
+///
+/// Note what is *not* here: nothing rewrites, backfills, or deletes an existing
+/// row. `MIGRATION_2` is two `ALTER TABLE ... ADD COLUMN`s and one `CREATE TABLE`.
+/// A row that existed before authentication existed is still exactly the row it
+/// was, with two new columns holding their defaults.
 fn migrate(connection: &mut Connection) -> Result<()> {
     let found = read_user_version(connection)?;
 
@@ -553,7 +1263,12 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     }
 
     let transaction = connection.transaction()?;
-    transaction.execute_batch(MIGRATION_1)?;
+    if found < 1 {
+        transaction.execute_batch(MIGRATION_1)?;
+    }
+    if found < 2 {
+        transaction.execute_batch(MIGRATION_2)?;
+    }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -616,26 +1331,20 @@ fn read_by_client_msg_id(
 
 /// Mints the server-assigned `id` for an accepted message.
 ///
-/// **Not** `Uuid::new_v4()`, and the reason is the same one `time.rs` gives for
-/// not using `Utc::now()`: `crates/sh_nexus_server/Cargo.toml` declares `uuid`
-/// with the workspace default, and the workspace default is features `["std"]` --
-/// `v4` is added by `crates/sh_nexus/Cargo.toml`. A `Uuid::new_v4()` here would
-/// compile under `cargo build --workspace` and fail under
-/// `cargo build -p sh_nexus_server`, which is the deployment command.
+/// **Not** `Uuid::new_v4()`, and the reason changed when this milestone added
+/// authentication. `uuid/v4` *is* enabled for this crate now -- `auth.rs` needs
+/// operating-system entropy for session tokens and `uuid/v4` is the only entropy
+/// source already in the tree that costs no new crate -- so the old argument ("the
+/// workspace default is `features = ["std"]` and `v4` would not compile under
+/// `cargo build -p sh_nexus_server`") no longer holds and is not repeated here.
 ///
-/// So the id is built from two numbers this process already has: the acceptance
-/// instant in milliseconds, and a per-process sequence that increases on every
-/// insert. That gives what the protocol actually asks for -- "server-assigned",
-/// non-blank, and unique -- plus two properties worth having: ids sort in
-/// acceptance order, which makes `ORDER BY id` a tie-break that agrees with
-/// `ORDER BY accepted_at`, and they are reproducible, so a test can assert on one.
-///
-/// Not a secret and not an authorization token: without authentication there is
-/// nothing to authorize with, and ADR-010 puts local accounts behind a credential
-/// this milestone does not have. The uniqueness argument is 41 bits of wall clock
-/// plus 64 bits of counter, which is wider than any of this milestone's flows
-/// need and is documented as the first thing to revisit when a real id generator
-/// arrives.
+/// The reason is the one that survives: a v4 id's high bits are random, so
+/// `ORDER BY id` would **disagree** with `ORDER BY accepted_at`. `messages_channel_order`
+/// is `(channel_id, accepted_at_unix_ms, id)` and `persistence.rs` asserts that
+/// five messages inserted inside one millisecond come back in insertion order --
+/// which is only true because the id's high bits are the clock. An id nobody can
+/// predict is not worth losing that for: message ids are not secrets, and this
+/// server does not use them as authorization material.
 fn mint_message_id(accepted_at_unix_millis: i64, sequence: u64) -> String {
     // `unsigned_abs` rather than a cast: the value cannot be negative for a clock
     // this server can be running on, and a total function that is wrong for an
@@ -644,4 +1353,21 @@ fn mint_message_id(accepted_at_unix_millis: i64, sequence: u64) -> String {
     Uuid::from_u128((millis << 64) | u128::from(sequence))
         .hyphenated()
         .to_string()
+}
+
+/// Mints the server-assigned `id` for a new account.
+///
+/// **Milliseconds alone, and the reason is different from
+/// [`mint_message_id`]'s.** A message id is followed by a per-insert counter
+/// because several messages can be accepted in the same millisecond and the tie
+/// has to break in acceptance order. An account id has no such neighbour: one
+/// account creation per millisecond on a per-team instance is not a load this
+/// server will see, and if it somehow were, `users.id`'s primary key would reject
+/// the collision rather than silently merge two people.
+///
+/// It is `u_`-prefixed like every other id in the protocol, so it is the same
+/// shape as a client-side `u_me` and nothing has to learn a second spelling.
+fn mint_user_id(created_at_unix_millis: i64) -> String {
+    let millis = u128::from(created_at_unix_millis.unsigned_abs());
+    format!("u_{millis:013x}")
 }

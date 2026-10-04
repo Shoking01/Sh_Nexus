@@ -1,13 +1,31 @@
-//! The message path: validate, persist, acknowledge, broadcast.
+//! The message path: authorize, validate, persist, acknowledge, broadcast.
 //!
 //! # One working path, on purpose
 //!
 //! `AGENTS.md` §8.1 lists ten mandatory integration flows. This milestone
-//! implements one of them -- the Real-time Flow -- and ADR-010 names the rest
-//! (auth, REST, presence, typing, reactions, resync) as the next PR. There is no
-//! `todo!()` for them here, and that is a decision rather than an omission: a
-//! `todo!()` compiles, looks like coverage, and panics on the first user who
-//! reaches it. A frame type that is simply not handled is visible.
+//! implements two of them -- the Real-time Flow and the login half of the Auth
+//! Flow -- and ADR-010 names the rest (REST, presence, typing, reactions, resync)
+//! as the next PR. There is no `todo!()` for them here, and that is a decision
+//! rather than an omission: a `todo!()` compiles, looks like coverage, and panics
+//! on the first user who reaches it. A frame type that is simply not handled is
+//! visible.
+//!
+//! # Where authorization sits, and why it is not in `db.rs`
+//!
+//! **Channel membership is checked here and nowhere else**, and the placement is
+//! argued rather than convenient: `AGENTS.md` §2.1 makes the wire/domain boundary
+//! the place where untrusted text becomes trusted data, and `ws.rs` decides the
+//! *connection's* authorization from the handshake's `Authorization` header. What
+//! it cannot decide is whether this particular account may write in this particular
+//! channel, because the frame names a channel and the connection does not -- one
+//! socket serves every channel the client can type into. `db.rs` then checks only
+//! what it alone can know, which is whether the channel and the user exist.
+//!
+//! **A non-member's send is a `message.error`, not a 401**, and the two must not
+//! be confused: the connection's authorization already succeeded, so ending it --
+//! or telling the client its *session* was refused -- would be a statement about
+//! something that was fine. The client keeps the optimistic row and marks it
+//! failed, which is what `AGENTS.md` §8.1's Optimistic Send Flow requires.
 //!
 //! # What a refusal looks like, and why it is a `message.error`
 //!
@@ -23,18 +41,10 @@
 //! A **bare `error` frame is not used for any of this.** `network/mapping.rs`
 //! maps `ServerFrame::Error` onto `ConnectionState::Rejected`, i.e. the client
 //! treats it as a statement about the connection. Sending one for a blank
-//! `channel_id` would tell the client its connection was rejected over a typo in
-//! a field. `error` is reserved for what it is for: a statement about the
-//! connection, such as the version rejection in `ws.rs`.
-//!
-//! # Why validation happens here and not in `db.rs`
-//!
-//! `AGENTS.md` §2.1 makes the wire/domain boundary the place where untrusted text
-//! becomes trusted data, and `sh_nexus::network::mapping` is the client's version
-//! of it. This module is the server's, and it holds all three checks -- blank id,
-//! blank channel, empty body -- in one `match` so that the reason a send was
-//! refused is decided in exactly one file. The store checks only what it alone
-//! can know: whether the channel exists.
+//! `channel_id` would tell the client its connection had been rejected over a typo
+//! in a field. `error` is reserved for what it is for: a statement about the
+//! connection, such as the version rejection in `ws.rs` and the `401` on the
+//! handshake.
 //!
 //! # Why `content` is never echoed
 //!
@@ -49,7 +59,7 @@
 
 use sh_nexus_wire::{ServerEnvelope, ServerFrame, WireMessage};
 
-use crate::db::AcceptOutcome;
+use crate::db::{AcceptOutcome, ChannelAccess};
 use crate::error::ServerError;
 use crate::hub::ConnectionId;
 use crate::AppState;
@@ -69,6 +79,22 @@ pub const EMPTY_CONTENT: &str = "empty_content";
 
 /// `message.send` named a channel this instance does not have.
 pub const UNKNOWN_CHANNEL: &str = "unknown_channel";
+
+/// `message.send` named a channel the authenticated account is not a member of.
+///
+/// **The authorization refusal, and the only one in the message path.** It exists
+/// because `PLAN.md` §6's `message.send` carries a `channel_id` and nothing else
+/// about *where* the sender may write, and the socket does not either: one
+/// connection carries sends for every channel the client can type into. So the
+/// check belongs here, on the one frame that names a channel.
+///
+/// It is a `message.error` rather than a `401` on the handshake, and the reason is
+/// in the module docs: the connection's authorization succeeded, so telling the
+/// client its *session* was refused would be a statement about something that was
+/// fine. It is also not [`UNKNOWN_CHANNEL`], because "you are not a member" and
+/// "that channel does not exist" are different facts and a user who needs to ask
+/// an administrator for access must be able to tell which one they hit.
+pub const NOT_A_MEMBER: &str = "not_a_member";
 
 /// The server could not persist the send.
 ///
@@ -138,16 +164,19 @@ impl Outcome {
 /// 1. **Validate.** A blank field is refused before any storage is touched, so a
 ///    refused send cannot leave a row, cannot move a channel's resume cursor, and
 ///    cannot be half-applied.
-/// 2. **Persist**, on a blocking thread. The store is synchronous
+/// 2. **Authorize.** The account must be a member of the channel. Refused before
+///    storage for the same reason, and separately from validation because it is a
+///    different question with a different answer for the user.
+/// 3. **Persist**, on a blocking thread. The store is synchronous
 ///    (`db.rs`'s module docs), and this is a tokio worker, so
 ///    `spawn_blocking` is where the call belongs. `AGENTS.md` §2.3's rule is that
 ///    blocking work does not run on a thread with something else to do.
-/// 3. **Acknowledge the sender**, including for a duplicate. A replay after a
+/// 4. **Acknowledge the sender**, including for a duplicate. A replay after a
 ///    reconnect has to be answered or the client leaves the message pending
 ///    forever; `AGENTS.md` §8.1's Optimistic Send Flow requires the ack to be the
 ///    point where a message becomes real, and a client that reconnects mid-send
 ///    gets no other signal.
-/// 4. **Broadcast, only for a new message.** This is the property `AGENTS.md`
+/// 5. **Broadcast, only for a new message.** This is the property `AGENTS.md`
 ///    §7.4 asks for and the one this milestone most needs to get right: a
 ///    replayed `message.send` reaching other clients twice would put the same
 ///    message in a transcript twice, and the receiving clients have no
@@ -161,6 +190,10 @@ impl Outcome {
 ///
 /// * `state` - the store and the hub. Cheap to pass by reference.
 /// * `origin` - the sending connection, so the broadcast can skip its own echo.
+/// * `user_id` - the authenticated account, from the handshake. **Not from the
+///   frame**, which has no author field, and not from anything a peer supplied.
+/// * `is_admin` - whether that account may create others. Carried for the
+///   authorization step's log line; a message send never creates an account.
 /// * `client_msg_id` - the envelope's id, as untrusted text.
 /// * `channel_id` - the envelope's target channel.
 /// * `content` - the envelope's body. Never logged.
@@ -172,6 +205,8 @@ impl Outcome {
 pub async fn accept(
     state: &AppState,
     origin: ConnectionId,
+    user_id: &str,
+    is_admin: bool,
     client_msg_id: &str,
     channel_id: &str,
     content: &str,
@@ -180,17 +215,98 @@ pub async fn accept(
         return Outcome::Refused(refusal);
     }
 
-    // `spawn_blocking` needs `'static` data, so the three untrusted strings are
-    // moved across. Cloning here is the cost of not blocking a runtime worker,
-    // and it is bounded by the frame ceiling `ws.rs` sets -- see that module on
-    // why this is the only content policy this milestone has.
+    // Authorization is a *read*, so it does not need the write transaction
+    // `accept_message` opens, and it is asked before that transaction exists --
+    // which is what makes "a refused send leaves nothing behind" true of the
+    // authorization refusal too and not only of the validation ones. One
+    // `spawn_blocking` for both halves of the decision, because `db.rs` is the only
+    // component that knows what a channel is.
+    let store = state.store.clone();
+    let owner = user_id.to_owned();
+    let target = channel_id.to_owned();
+    let access = tokio::task::spawn_blocking(move || store.channel_access(&owner, &target)).await;
+
+    match access {
+        Ok(Ok(ChannelAccess::Allowed)) => {}
+        Ok(Ok(ChannelAccess::UnknownChannel)) => {
+            tracing::info!(
+                user_id = %user_id,
+                channel_id = %channel_id,
+                client_msg_id_len = client_msg_id.len(),
+                "refused a send naming a channel that does not exist"
+            );
+            return Outcome::Refused(Refusal {
+                code: UNKNOWN_CHANNEL,
+                detail: format!("there is no channel with the id {channel_id:?} on this server"),
+            });
+        }
+        Ok(Ok(ChannelAccess::NotAMember)) => {
+            // The channel id is **not** quoted, unlike `unknown_channel`: the user
+            // already has this channel in their sidebar, and `not_a_member` is a
+            // statement they can act on without being told which id they typed.
+            tracing::info!(
+                user_id = %user_id,
+                administrator = is_admin,
+                channel_id_len = channel_id.len(),
+                client_msg_id_len = client_msg_id.len(),
+                "refused a send into a channel the sender is not a member of"
+            );
+            return Outcome::Refused(Refusal {
+                code: NOT_A_MEMBER,
+                detail: String::from(
+                    "your account is not a member of that channel; ask an administrator \
+                     for access",
+                ),
+            });
+        }
+        // A driver failure here is a server fault, not a peer's, and it lands in
+        // the same arm as a storage failure -- but its `Display` is not discarded
+        // into the log, because "the membership check could not run" and "the
+        // database refused the message" have different fixes.
+        Ok(Err(error)) => {
+            tracing::error!(
+                user_id = %user_id,
+                channel_id_len = channel_id.len(),
+                error = %error,
+                "could not check channel access"
+            );
+            return Outcome::Refused(Refusal {
+                code: STORAGE_FAILURE,
+                detail: String::from("the server could not store this message; please retry"),
+            });
+        }
+        Err(join_error) => {
+            tracing::error!(
+                user_id = %user_id,
+                channel_id_len = channel_id.len(),
+                error = %join_error,
+                "the channel access check's storage task did not complete"
+            );
+            return Outcome::Refused(Refusal {
+                code: STORAGE_FAILURE,
+                detail: String::from("the server could not store this message; please retry"),
+            });
+        }
+    }
+
+    // `spawn_blocking` needs `'static` data, so the three untrusted strings and the
+    // server-issued author are moved across. Cloning here is the cost of not
+    // blocking a runtime worker, and it is bounded by the frame ceiling `ws.rs`
+    // sets -- see that module on why this is the only content policy this
+    // milestone has.
     let store = state.store.clone();
     let client_msg_id_owned = client_msg_id.to_owned();
     let channel_id_owned = channel_id.to_owned();
     let content_owned = content.to_owned();
+    let author = user_id.to_owned();
 
     let stored = tokio::task::spawn_blocking(move || {
-        store.accept_message(&client_msg_id_owned, &channel_id_owned, &content_owned)
+        store.accept_message(
+            &client_msg_id_owned,
+            &channel_id_owned,
+            &author,
+            &content_owned,
+        )
     })
     .await;
 
@@ -222,8 +338,13 @@ pub async fn accept(
                     message: message.clone(),
                 }),
             );
+            // The author id **by value**, and this is the one place in the server
+            // where a user id reaches a log line. It is not a credential, it is
+            // server-issued and bounded, and `AGENTS.md` §7.5 asks for ids. Content
+            // is still only ever a byte count.
             tracing::info!(
                 message_id = %message.id,
+                user_id = %user_id,
                 channel_id_len = channel_id.len(),
                 content_bytes = content.len(),
                 recipients = reached,

@@ -313,3 +313,107 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 #   dependency).
 # ---------------------------------------------------------------------------
 pulldown-cmark = { version = "0.13", default-features = false }
+
+# ===========================================================================
+# PHASE 3 -- the AUTH milestone's two dependencies
+# ===========================================================================
+#
+# `argon2` and `sha2` are, unlike almost every entry above, GENUINELY NEW TO
+# `Cargo.lock`. The record matters because it is the honest counterweight to the
+# `tokio-tungstenite` entry above, which claimed "no new download" because axum's
+# `ws` feature had already pulled it in. Neither crate here is in anyone's tree:
+# `Cargo.lock` held no `argon2`, no `sha2`, no `jsonwebtoken`, no `ring`, no
+# `rustls` and no `openssl` before this milestone. **That is why criterion 5
+# below is a real figure and not "no new compile units", and why it is stated
+# here rather than left to be discovered in a CI timings diff.**
+#
+# Both are RustCrypto crates under MIT OR Apache-2.0, both are pure Rust with no
+# C dependency, no build script and no proc-macro, and both are the crates the
+# whole Rust ecosystem already depends on for exactly these two jobs. ADR-010
+# names `argon2` explicitly, in its Decision section, so criterion 1 for it is a
+# citation rather than an argument.
+
+# argon2 0.6.0 | MIT OR Apache-2.0 | actively maintained (RustCrypto
+#   `password-hashes`, 0.6.0 is the current release) | tens of millions of
+#   downloads/month | MSRV 1.85 against our 1.99.0.
+#
+#   Criterion 1: `docs/ARCHITECTURE.md` ADR-010's Decision section says, in as
+#   many words, "Local accounts with `argon2`, and closed registration", and its
+#   Alternatives section rejects "rolling our own password hashing" as the
+#   roll-your-own-crypto failure mode. `std` has no memory-hard KDF, and a
+#   GPU-parallel SHA-256 loop is not one either. There is no std-library answer
+#   to this and there is not meant to be.
+#
+#   Criterion 5: a REAL new subtree. `argon2` pulls `password-hash` 0.6 (the PHC
+#   string format, which is what makes a stored hash self-describing and therefore
+#   re-parameterisable without a migration), `base64ct`, `blake2`, and
+#   `crypto-common`. All pure Rust. The subtree is small -- `password-hash` is
+#   the format layer, not a second crypto library -- and it is deliberately
+#   bought: ADR-010's argument is that a per-team self-hosted instance's adversary
+#   is *outside* the team, so the credential store is the thing that has to hold.
+#
+#   Why the PHC string format is worth the extra dependency: `users.password_hash`
+#   stores the algorithm, the version, the cost parameters AND the salt inside one
+#   TEXT column. That means re-tuning Argon2's memory or iteration count later is
+#   a change to which hash new passwords get -- existing hashes keep verifying
+#   with the parameters they were made with, and a user is re-hashed on their next
+#   successful login. Storing `(hash, salt, m, t, p)` in five columns would make
+#   that a data migration over live rows, which is the expensive version of an
+#   idea this format makes free.
+#
+#   Feature choice: DEFAULTS (`alloc`, `getrandom`, `password-hash`). All three
+#   are load-bearing and none is optional for this milestone:
+#     - `password-hash` is the PHC encoder/decoder -- without it there is no
+#       self-describing string, only a raw digest.
+#     - `alloc` is required by `password-hash/alloc` for the string form.
+#     - `getrandom` is what draws the per-password salt. A fixed salt would be
+#       worse than no salt: one precomputed table would then break every password
+#       on the instance at once.
+#   `parallel` (rayon), `kdf` (PBKDF2/HKDF, an interop surface nothing here needs)
+#   and `zeroize` are all OFF: this server keeps no long-lived secret in a buffer
+#   that would need wiping, and `rayon` would put a thread pool inside a request
+#   path that `AGENTS.md` 2.3 says must not block a runtime worker.
+argon2 = "0.6"
+
+# sha2 0.11.0 | MIT OR Apache-2.0 | actively maintained (RustCrypto `hashes`,
+#   0.11.0 is the current release) | hundreds of millions of downloads/month |
+#   MSRV 1.85 against our 1.99.0.
+#
+#   Criterion 1: nothing else in this workspace can produce a 32-byte digest.
+#   `std` has no cryptographic hash at all, and `sha2`'s output is used here for
+#   exactly one thing -- turning a high-entropy session token into the key the
+#   `sessions` table is keyed on. See the note below on why that is SHA-256 and
+#   not `argon2`, because the answer is counter-intuitive and the wrong choice is
+#   the expensive one.
+#
+#   WHY SHA-256 AND NOT ARGON2 FOR SESSION TOKENS, since both are right here and
+#   picking wrongly is a real performance bug:
+#
+#   The two inputs have opposite threat models. A *password* is low-entropy and
+#   chosen by a human, so the hash must be deliberately expensive -- that cost is
+#   the entire defence against an offline dictionary attack on a leaked
+#   `users.password_hash`. A *session token* is 256 bits of `getrandom`, so there
+#   is no dictionary to search: recovering the token from its hash is not a
+#   cracking problem, it is a preimage problem over 2^256. Slowing that down buys
+#   nothing and costs a great deal, because this hash runs on **every WebSocket
+#   handshake** -- and `AGENTS.md` 6.2's budget for that whole path is under
+#   16 ms. An Argon2 verification there is ~50 ms of memory-hard work per
+#   reconnect, per client, on a thread that is holding a socket. SHA-256 of a
+#   64-byte token is a single compression pass: sub-microsecond, and constant
+#   time regardless of how much of the token matched.
+#
+#   So: `argon2` for the thing a human chose, `sha2` for the thing the machine
+#   chose, and the split is drawn at "is the input already high-entropy" rather
+#   than at "is this a credential". The property that makes the fast path safe is
+#   the one `sessions.token_hash` exists for: the database stores the HASH, so a
+#   leaked `sh_nexus.db` yields no usable token -- it yields 32-byte digests that
+#   cannot be played back into an `Authorization` header.
+#
+#   Feature choice: `default-features = false` with `alloc`, and the one thing
+#   turned off is `oid`. The default set is `["alloc", "oid"]`, and `oid` is the
+#   object-identifier registry -- it exists so a hash can be named in an X.509
+#   structure. This server names the algorithm in Rust (`Sha256`), and a stored
+#   session row names it in a column name. Turning `oid` off is the difference
+#   between declaring a hash function and declaring a hash function *as a
+#   standard*, and only the first is true here.
+sha2 = { version = "0.11", default-features = false, features = ["alloc"] }

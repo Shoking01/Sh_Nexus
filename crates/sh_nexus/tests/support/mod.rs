@@ -20,6 +20,24 @@
 //! lookup below panics with that exact sentence rather than skipping, because a
 //! socket test that quietly does nothing is worse than one that is not run.
 //!
+//! # Why every suite here logs in first
+//!
+//! **Because the server refuses an unauthenticated handshake**, and that is the
+//! auth milestone's whole point: `sh_nexus_server::ws::handler` answers a missing,
+//! malformed, expired or revoked `Authorization: Bearer` with a 401 and no socket.
+//!
+//! [`ServerProcess::start_on`] therefore exports `SH_NEXUS_ADMIN_USERNAME` and
+//! `SH_NEXUS_ADMIN_PASSWORD` to the child, so the instance has an administrator;
+//! and [`ServerProcess::token`] performs a real `POST /auth/login` over a real
+//! socket and hands back the token, which the suite puts in
+//! [`TransportConfig::with_token`].
+//!
+//! **A real login rather than a token written into the database**, and the reason
+//! is that this is the client's suite: it should exercise the same request the
+//! product will make, against the same endpoint, with the same JSON. A test that
+//! inserted a session row behind the server's back would be testing a server that
+//! does not exist.
+//!
 //! # Why the port is probed and then handed to the server
 //!
 //! `SH_NEXUS_BIND` takes a full `host:port` and its default is
@@ -28,8 +46,8 @@
 //! operator asked for is not the port the server got, which is exactly why that
 //! binary logs `listener.local_addr()` rather than echoing the configuration.
 //! So the harness binds an ephemeral port itself, drops the listener, and starts
-//! the server on that number. **There is a race window between the two**, which
-//! is why [`ServerProcess::start_on`] retries the readiness probe for
+//! the server on that number. **There is a race window between the two**, which is
+//! why [`ServerProcess::start_on`] retries the readiness probe for
 //! [`READY_BUDGET`] rather than connecting once.
 //!
 //! # Why the temporary directory is hand-rolled
@@ -50,6 +68,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
 /// How long a suite waits for something that should arrive on its own.
 ///
 /// Generous on purpose: the alternative is a tight bound that turns a slow machine
@@ -58,6 +78,30 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// is `AGENTS.md` §4.3's distinction between a `sleep()` standing in for a
 /// condition and a condition actually being polled.
 pub const READY_BUDGET: Duration = Duration::from_secs(20);
+
+/// The login handle exported to the child server.
+///
+/// A fixture value rather than something imported from the server crate, for the
+/// reason the module docs give for the WebSocket path: naming `sh_nexus_server`
+/// would put `axum` and `rusqlite` into this crate's dependency graph. The
+/// administrator's handle is an *operator* decision (`SH_NEXUS_ADMIN_USERNAME`), so
+/// a test that imported a constant would be asserting that this particular string
+/// is the right one.
+pub const ADMIN_USERNAME: &str = "root";
+
+/// The password exported to the child server.
+///
+/// Over the twelve-character minimum in the server's `auth::MIN_PASSWORD_CHARS`, and
+/// recognisable as a fixture: a log line or a panic that ever printed it would be
+/// obviously wrong rather than plausibly a real credential.
+pub const ADMIN_PASSWORD: &str = "fixture-admin-passphrase";
+
+/// The path login is served on.
+///
+/// Spelled here rather than imported, for the same reason [`WS_PATH`] is: a test
+/// suite that hard-codes a path it depends on fails loudly when the server moves it,
+/// which is the trade `WS_PATH`'s own docs describe.
+pub const LOGIN_PATH: &str = "/auth/login";
 
 /// The prefix every directory this module creates starts with.
 ///
@@ -202,6 +246,13 @@ pub fn wait_until(what: &str, budget: Duration, mut condition: impl FnMut() -> b
 pub struct ServerProcess {
     child: Option<Child>,
     port: u16,
+    /// The SQLite file the child was told to open.
+    ///
+    /// Stored rather than recomputed so [`ServerProcess::restart`] can hand the
+    /// same path to a new process: a session token is bound to one database file,
+    /// and a test that stops and restarts the server has to keep the same file or
+    /// the token it holds stops meaning anything.
+    database: PathBuf,
     _directory: TempDir,
 }
 
@@ -246,6 +297,11 @@ impl ServerProcess {
         let mut child = Command::new(server_binary())
             .env("SH_NEXUS_BIND", &bind)
             .env("SH_NEXUS_DB", &database)
+            // The auth milestone's bootstrap pair. **Exported to every child**, so
+            // every suite gets an administrator and therefore a usable token, and
+            // so `main.rs`'s "read both or neither" rule has both present.
+            .env("SH_NEXUS_ADMIN_USERNAME", ADMIN_USERNAME)
+            .env("SH_NEXUS_ADMIN_PASSWORD", ADMIN_PASSWORD)
             // Nulled rather than inherited: `sh_nexus_server` logs at `info` by
             // default, so an inherited stdout would put four lines of server log in
             // the middle of every test's output and make a real failure harder to
@@ -281,6 +337,7 @@ impl ServerProcess {
         Self {
             child: Some(child),
             port,
+            database,
             _directory: directory,
         }
     }
@@ -302,6 +359,187 @@ impl ServerProcess {
     pub fn url(&self) -> String {
         format!("ws://127.0.0.1:{}{}", self.port, WS_PATH)
     }
+
+    /// The database file this server owns.
+    pub fn database(&self) -> &Path {
+        self.database.as_path()
+    }
+
+    /// Stops the child process but keeps its port, its database and its directory.
+    ///
+    /// **Exists for one shape of test: one that must observe a transport failing
+    /// before the server is there, and then observe that same transport succeed.**
+    /// A session token is only obtainable from a *running* server, and a token is
+    /// bound to one database file -- so the only way to hold a valid token across a
+    /// gap is to take it from the running server, stop the server, and start it
+    /// again against the same file.
+    ///
+    /// Idempotent, and safe to call on a server that has already stopped. Dropping
+    /// still works afterwards, so a suite that panics between `stop` and `restart`
+    /// leaves nothing behind.
+    pub fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Starts the child process again, on the same port and against the same file.
+    ///
+    /// # Panics
+    ///
+    /// If the process cannot be started, or exits before accepting. The exit status
+    /// is in the panic message, for the reason [`ServerProcess::start_on`] gives.
+    pub fn restart(&mut self) {
+        assert!(
+            self.child.is_none(),
+            "restart() after a running server would leave two children on one port"
+        );
+        let bind = format!("127.0.0.1:{}", self.port);
+        let mut child = Command::new(server_binary())
+            .env("SH_NEXUS_BIND", &bind)
+            .env("SH_NEXUS_DB", self.database())
+            // Exported again even though the database already has an administrator:
+            // `main.rs` reads both or neither, and exporting one of the pair on a
+            // restart would be a startup failure this test would have to explain.
+            .env("SH_NEXUS_ADMIN_USERNAME", ADMIN_USERNAME)
+            .env("SH_NEXUS_ADMIN_PASSWORD", ADMIN_PASSWORD)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the sh_nexus_server binary to start again");
+
+        let address: SocketAddr = format!("127.0.0.1:{}", self.port)
+            .parse()
+            .expect("a loopback socket address this suite just formatted");
+        let mut exited = None;
+        wait_until("the server to accept a connection", READY_BUDGET, || {
+            if TcpStream::connect(address).is_ok() {
+                return true;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exited = Some(status.to_string());
+                    true
+                }
+                _ => false,
+            }
+        });
+        if let Some(status) = exited {
+            let _ = child.kill();
+            panic!("the restarted sh_nexus_server exited before accepting ({status})");
+        }
+        self.child = Some(child);
+    }
+
+    /// A live session token for the bootstrapped administrator.
+    ///
+    /// **A real `POST /auth/login` over a real socket**, blocking, because these
+    /// suites are `#[gpui::test]` and have no runtime of their own before the
+    /// transport starts its own worker. `std::net::TcpStream` is the right tool
+    /// here precisely because it needs none.
+    ///
+    /// # Panics
+    ///
+    /// If the request cannot be sent, the server answers anything other than 200,
+    /// or the response carries no token. The response body is included in the panic
+    /// because the most likely cause by far is a fixture password that does not
+    /// match, and "expected 200, got 401 with `invalid_credentials`" says that;
+    /// "the login failed" would not.
+    pub fn token(&self) -> String {
+        let address = format!("127.0.0.1:{}", self.port);
+        let mut stream = TcpStream::connect(&address)
+            .unwrap_or_else(|error| panic!("could not reach the server on {address}: {error}"));
+
+        let body = serde_json::json!({
+            "username": ADMIN_USERNAME,
+            "password": ADMIN_PASSWORD,
+        })
+        .to_string();
+        let request = format!(
+            "POST {LOGIN_PATH} HTTP/1.1\r\n\
+             Host: {address}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            body.len()
+        );
+
+        use std::io::{Read, Write};
+        stream
+            .write_all(request.as_bytes())
+            .expect("the login request to be written");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("the login response to be read");
+        drop(stream);
+
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "the fixture's own login must succeed; the server said {:?}",
+            response.lines().next().unwrap_or_default()
+        );
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("the login response had no body: {response:?}"));
+        let parsed: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|error| panic!("the login body was not JSON ({error}): {body:?}"));
+        parsed["token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the login response carried no token: {head:?}"))
+            .to_owned()
+    }
+
+    /// A [`TransportConfig`] pointed at this server, carrying a live token.
+    ///
+    /// The two halves are one call because a suite that forgot the token would fail
+    /// with a 401 and a message about authentication, which sends the reader to the
+    /// wrong file; there is no reason for a test to be able to forget it by accident.
+    pub fn authenticated_config(&self) -> sh_nexus::network::ws::TransportConfig {
+        sh_nexus::network::ws::TransportConfig::new(self.url()).with_token(self.token())
+    }
+
+    /// The URL this server's WebSocket endpoint is on.
+    ///
+    /// For the suites that open their own socket rather than going through a
+    /// [`sh_nexus::network::ws::WsTransport`], so that a rejected handshake can be
+    /// observed instead of mapped onto a connection state.
+    pub fn endpoint(&self) -> String {
+        self.url()
+    }
+
+    /// A handshake request carrying `token`, for `tokio_tungstenite::connect_async`.
+    ///
+    /// # Panics
+    ///
+    /// If the endpoint does not parse or the token cannot be a header value. Both
+    /// are fixture faults: the endpoint is one this fixture built.
+    pub fn handshake_request(
+        &self,
+        token: Option<&str>,
+    ) -> tokio_tungstenite::tungstenite::http::Request<()> {
+        let mut request = self
+            .url()
+            .parse::<tokio_tungstenite::tungstenite::http::Uri>()
+            .expect("this fixture's own endpoint parses as a URI")
+            .into_client_request()
+            .expect("this fixture's own endpoint builds a handshake request");
+        if let Some(token) = token {
+            let mut value = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!(
+                "Bearer {token}"
+            ))
+            .expect("a fixture token is a usable header value");
+            value.set_sensitive(true);
+            request.headers_mut().insert(
+                tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+                value,
+            );
+        }
+        request
+    }
 }
 
 impl Drop for ServerProcess {
@@ -319,6 +557,51 @@ impl Drop for ServerProcess {
         }
     }
 }
+
+/// Revokes `token` through the server's own logout endpoint.
+///
+/// Blocking for the same reason [`ServerProcess::token`] is: these suites are
+/// `#[gpui::test]` and have no runtime before the transport starts its own worker.
+///
+/// # Panics
+///
+/// If the request cannot be sent or the server answers anything other than 204.
+/// A revocation that silently failed would make the test that follows it pass for
+/// the wrong reason -- or fail, confusingly, at the handshake.
+pub fn revoke(server: &ServerProcess, token: &str) {
+    let address = format!("127.0.0.1:{}", server.port());
+    let mut stream = TcpStream::connect(&address)
+        .unwrap_or_else(|error| panic!("could not reach the server on {address}: {error}"));
+    let request = format!(
+        "POST {LOGOUT_PATH} HTTP/1.1\r\n\
+         Host: {address}\r\n\
+         Authorization: Bearer {token}\r\n\
+         Content-Length: 0\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+
+    use std::io::{Read, Write};
+    stream
+        .write_all(request.as_bytes())
+        .expect("the logout request to be written");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("the logout response to be read");
+    drop(stream);
+
+    assert!(
+        response.starts_with("HTTP/1.1 204"),
+        "a logout must be answered with 204; the server said {:?}",
+        response.lines().next().unwrap_or_default()
+    );
+}
+
+/// The path logout is served on.
+///
+/// Spelled here rather than imported, for the reason [`LOGIN_PATH`] is.
+pub const LOGOUT_PATH: &str = "/auth/logout";
 
 /// The path this suite believes the server serves WebSockets on.
 pub const WS_PATH: &str = "/ws";

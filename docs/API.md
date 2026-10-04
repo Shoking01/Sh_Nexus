@@ -266,7 +266,7 @@ it did not exist when it was written.
 
 ### 2.1 The endpoint
 
-One route, and it is the whole HTTP surface:
+Two kinds of route: one WebSocket, and the HTTP routes §3 adds for authentication.
 
 ```
 GET /ws HTTP/1.1
@@ -274,24 +274,31 @@ Upgrade: websocket
 Connection: Upgrade
 Sec-WebSocket-Key: <base64 of 16 bytes>
 Sec-WebSocket-Version: 13
+Authorization: Bearer <session token>
 ```
 
-The upgrade response is axum's `101`. **No subprotocol is negotiated** and no
-`Sec-WebSocket-Protocol` is echoed, because every frame carries its own `v` and the
-version lives on the envelope rather than in a handshake header — which is the
-decision `sh_nexus_wire`'s frame module documents and the reason there is no
-negotiation step at all.
+**The `Authorization` header is required.** A handshake without a valid one is
+refused with **`401` before the upgrade**, so it costs no subscription, no task and
+no row — see §3.2. The upgrade response for an authenticated peer is axum's `101`.
+**No subprotocol is negotiated** and no `Sec-WebSocket-Protocol` is echoed, because
+every frame carries its own `v` and the version lives on the envelope rather than in
+a handshake header — which is the decision `sh_nexus_wire`'s frame module documents
+and the reason there is no negotiation step at all.
 
-The server's configuration is two environment variables, both optional:
+The server's configuration is four environment variables, all optional:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `SH_NEXUS_BIND` | `127.0.0.1:8484` | The socket address to bind, as `host:port`. A malformed value is refused at startup, naming the variable — never silently replaced by the default. |
 | `SH_NEXUS_DB` | `sh_nexus.db` | The SQLite file. The parent directory must already exist. |
+| `SH_NEXUS_ADMIN_USERNAME` | — | The login handle for the instance's first administrator. Read **only** when no account can log in. |
+| `SH_NEXUS_ADMIN_PASSWORD` | — | That account's password. **Never logged, never echoed, and never required on a second start.** |
 
-The bind default is **loopback**, not `0.0.0.0`. This milestone has no
-authentication, so an instance reachable from the network would be a readable one;
-an operator who wants it exposed says so explicitly. ADR-010 records the bind
+The bind default is **loopback**, not `0.0.0.0`, and it stayed loopback when
+authentication arrived: a `401` is not encryption, and a self-hosted instance exposed
+to a network without TLS has its bearer tokens readable on the wire. The loopback
+default is what makes the current state defensible, and an operator who wants it
+exposed has to say so **and** terminate TLS in front of it. ADR-010 records the bind
 interface as a decision it does **not** make, which is why the startup log names
 the interface actually bound rather than the one that was configured.
 
@@ -378,15 +385,16 @@ to the milestone that has accounts to attribute one to.
 
 ### 2.5 What the server stores
 
-SQLite, WAL, one file, schema version 1 in `PRAGMA user_version`.
+SQLite, WAL, one file, **schema version 2** in `PRAGMA user_version`. Version 2 is
+this milestone's migration and is additive; §3.1 names the two tables it adds.
 
 | Table | Exercised | Note |
 |---|---|---|
-| `users` | one seeded row | `u_unattributed`. `PLAN.md` §6's `message.send` carries no author and there is no authentication yet, so every message this milestone stores is attributed to a reserved row named `unattributed`. |
-| `channels` | one seeded row | `c_general`. A send naming any other channel is **refused**, not silently created — channel provisioning is the REST milestone's job. |
-| `messages` | the whole round trip | `client_msg_id` is globally `UNIQUE`, which is what makes dedupe a single lookup. |
+| `users` | yes | **A real account, authenticated.** `password_hash` is an Argon2id hash; `is_admin` is what "administrator" means, rather than creation order — inferring it from the earliest `created_at` would make a privilege grant depend on a tie-break, and a tie broken by id is a privilege decided by a UUID. The reserved `u_unattributed` row is **retained**: ADR-010 keeps authorship on removal, and a database migrated from schema 1 has message rows pointing at it under a foreign key. It carries no `password_hash`, so it can never log in. |
+| `channels` | one seeded row | `c_general`. A send naming any other channel is **refused**, not silently created — channel provisioning is a later milestone. |
+| `messages` | the whole round trip | `client_msg_id` is globally `UNIQUE`, which is what makes dedupe a single lookup. `user_id` is now the authenticated account, never a frame-supplied value. |
 | `read_cursors` | **no** | ADR-010 requires per-`(user, channel)` read state "from the first migration". Deliberately unread here. |
-| `channel_members` | **no** | Membership is an authorization concern, which is the authentication milestone. |
+| `channel_members` | yes | Checked on the send. A non-member is refused with `not_a_member`; the socket stays open, because one socket serves every channel the client can type into. |
 
 Opening a file whose `user_version` is above this build's, or that has tables but
 no version stamp, is **refused** rather than migrated. Both refusals are
@@ -414,3 +422,66 @@ decode and are then **logged at `warn!` with the connection kept open**, which i
 `presence.update` and any future one — are defined in `sh_nexus_wire` and
 unreachable from this build, which is a property the type system holds rather than
 a convention.
+
+## 3. Authentication
+
+Added with the server's auth milestone. ADR-010 decided the shape; this section is
+what actually got built.
+
+### 3.1 Why opaque tokens and not a JWT
+
+`PLAN.md` assumed `jsonwebtoken`. **This is not that.** Two reasons, one practical and
+one that would have been a defect:
+
+- **A JWT cannot be revoked.** In a per-team chat, expelling a member must kill their
+  session immediately. A signature that is valid until it expires means the only way
+  to stop it is to wait. The revocation column exists here for that reason.
+- **A JWT needs a crypto backend.** `ring` and `rustls` are not anywhere in this
+  workspace's tree, so a JWT would have dragged a signature-verification stack into a
+  project with no crypto dependency at all, on a crate the client never links.
+
+Tokens are opaque and random, and **only their hash is stored** — `sha2` of the token,
+as the `sessions` primary key. A stolen database file therefore yields no usable
+session. `argon2` is used for passwords only, where slowness is the feature.
+
+The **client** holds no crypto dependency and never hashes or mints anything: it
+sends the token it was given.
+
+### 3.2 The 401 happens before the upgrade
+
+An unauthenticated handshake is refused at `authenticate`, which runs **before**
+`WebSocketUpgrade` is consumed. So a refused peer costs **no subscription, no task and
+no row** in the connection count — not merely a closed socket. `ws.rs` calls
+`hub.connect()` only after the identity resolves, and that ordering is asserted
+twice in `tests/auth.rs`: the status line reads `401` and never `101`, and
+`connection_count()` does not move.
+
+One deliberate placement decision: **"this user may not post in this channel" is
+enforced on the send, not the handshake.** One socket serves every channel a client
+can type into, so a handshake has no channel to be refused *for*. A non-member's send
+is a `message.error` with code `not_a_member` and the socket stays open. An unknown
+channel is a different refusal — `unknown_channel` — so a typo never reads as "ask an
+administrator".
+
+### 3.3 Registration is closed
+
+There is no `POST /auth/register`. An administrator creates accounts. The **first**
+administrator is bootstrapped from `SH_NEXUS_ADMIN_USERNAME` /
+`SH_NEXUS_ADMIN_PASSWORD`, and only when the instance has no account that can log in.
+A second start with an account present re-reads nothing and overwrites nothing.
+
+"Cannot log in" means `password_hash IS NOT NULL`, not "a row exists in `users`" —
+because a database migrated from schema 1 holds the reserved historical-author row,
+and counting rows would refuse to bootstrap exactly the instances that most need it.
+
+### 3.4 What is deliberately not here
+
+- **No keychain.** The client accepts a token and loses it at process exit. `platform/`
+  does not exist yet, so nothing writes a token to disk — and saying so is better than
+  a plaintext file that a later milestone has to unpick.
+- **No TLS.** Hence the loopback bind default in §2.1.
+- **No rate limiting**, which ADR-010 explicitly does not decide.
+- **Revocation does not kill a live socket.** The next handshake is refused; `PLAN.md`
+  §6 has no frame for terminating an established connection.
+- **A "revoke every session for this user" operation** is not built. The mechanism
+  (`sessions.revoked_at_unix_ms`) is.

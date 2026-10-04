@@ -31,7 +31,51 @@ tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
+
+# uuid, WITH `v4` -- the one feature this crate previously left off, and the
+# reason is the auth milestone's, not cosmetics.
+#
+# `auth.rs` mints session tokens and needs operating-system entropy. `v4` implies
+# `rng`, which is a `getrandom` call, and `getrandom` is ALREADY in `Cargo.lock`
+# through the workspace's other members -- so enabling this feature adds ZERO new
+# crates, which is the same argument the root Cargo.toml records for
+# `tokio-tungstenite` and the opposite of what `argon2`/`sha2` above can claim.
+#
+# The alternative was declaring `rand` or `getrandom` directly for one function,
+# and that is a third new dependency in the lock for sixteen bytes at a time. See
+# `auth::SESSION_TOKEN_BYTES` for how the 32-byte token is assembled from two
+# 16-byte draws, and for why that trade is the right one.
+#
+# `db.rs::mint_message_id` deliberately does NOT use it -- its doc says why, and
+# the short version is that a random id would make `ORDER BY id` disagree with
+# `ORDER BY accepted_at`.
+uuid = { workspace = true, features = ["v4"] }
+
+# argon2: ADR-010's Decision section names it -- "Local accounts with `argon2`,
+# and closed registration" -- and its Alternatives section rejects hand-rolled
+# password hashing as the roll-your-own-crypto failure mode. Passwords are
+# hashed with Argon2id at the crate's own defaults because the cost is the
+# defence: a leaked `users.password_hash` has to be expensive to attack offline.
+#
+# DECLARED IN THE SERVER ONLY, and that is load-bearing. The client
+# (`crates/sh_nexus/Cargo.toml`) must not grow it: `crates/sh_nexus/tests/
+# layer_boundary.rs` and `cargo tree -p sh_nexus` both exist to keep the client
+# free of server concerns, and a client that could hash a password would be a
+# client that had a password to hash. The client sends an opaque token it was
+# handed; it never sees a password.
+argon2 = { workspace = true }
+
+# sha2: the other half of the credential split, and the reason it is NOT argon2.
+# Session tokens are 256 bits of OS entropy, so there is no dictionary to search
+# and SHA-256 is the right primitive -- while this hash runs on every WebSocket
+# handshake, where `AGENTS.md` 6.2 budgets the whole path under 16 ms and an
+# Argon2 verification would spend ~50 ms of memory-hard work there. The database
+# stores the HASH, so a leaked SQLite file yields digests that cannot be replayed
+# into an `Authorization` header. Full criterion-by-criterion audit, including
+# why the two crates are genuinely new to `Cargo.lock` unlike `tokio-tungstenite`,
+# is in the root `Cargo.toml` under "PHASE 3 -- the AUTH milestone's two
+# dependencies".
+sha2 = { workspace = true }
 
 # The protocol contract. This is the reason the server is a workspace member
 # rather than a separate repository: both sides compile against the same frame

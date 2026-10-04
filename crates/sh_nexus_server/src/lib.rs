@@ -1,38 +1,41 @@
 //! # `sh_nexus_server` -- the self-hosted instance described by ADR-010
 //!
-//! One working path: a `message.send` from a client is validated, persisted,
-//! acknowledged to its sender, and broadcast to every other connected client.
-//! Everything else `PLAN.md` describes is ADR-010's next PR and is **not**
-//! written here -- not as a `todo!()`, which would compile and then panic on the
-//! first user who reached it, but as frames this server decodes, logs at `warn!`,
-//! and drops.
+//! Two working paths: a `message.send` from an **authenticated** client is
+//! validated, persisted, acknowledged to its sender, and broadcast to every other
+//! connected client; and a `POST /auth/login` exchanges a username and password
+//! for a session token that the WebSocket handshake then requires. Everything else
+//! `PLAN.md` describes is a later PR and is **not** written here -- not as a
+//! `todo!()`, which would compile and then panic on the first user who reached it,
+//! but as frames this server decodes, logs at `warn!`, and drops.
 //!
 //! ## What is deliberately absent, and why
 //!
 //! | Not built | Named as |
 //! |---|---|
-//! | Authentication, tokens, login, registration | ADR-010's next PR |
-//! | REST endpoints, channel and user provisioning | ADR-010's next PR |
+//! | Open self-registration | ADR-010 decides it is **never**: on a self-hosted instance, a signup endpoint is a read-access hole. |
+//! | REST endpoints for channels and for granting channel membership | ADR-010's next PR. `channel_members` is written by the bootstrap and by nothing else, so **a database migrated from schema 1 refuses every send** until somebody inserts a membership row. |
 //! | Presence, typing, reactions | ADR-010's next PR |
 //! | Resync, and the per-channel resume cursor's reader | ADR-010's next PR |
+//! | Expelling a member (revoking *all* of their sessions) | The revocation *mechanism* is built ([`auth::LOGOUT_PATH`]); the operation that enumerates a user's sessions is not. |
 //!
-//! One of those absences has a visible consequence worth naming here rather than
-//! in a comment three files down: **`message.send` carries no author.** The frame
-//! has `channel_id` and `content` and nothing else, because `PLAN.md` §6 meant
-//! authorship to come from an authenticated session. So every message this
-//! milestone stores is attributed to a reserved
-//! [`UNATTRIBUTED_USER_ID`](db::UNATTRIBUTED_USER_ID) row. `db.rs` has the
-//! reasoning, and it is not "the blank id would have been tidier": a blank
-//! `user_id` makes this server emit a `message.ack` that the client's own boundary
-//! rejects, so the blank version fails in a way that looks like a client bug.
+//! One of those absences used to have a visible consequence and no longer does:
+//! **`message.send` carries no author**, and the frame has `channel_id` and
+//! `content` and nothing else because `PLAN.md` §6 meant authorship to come from an
+//! authenticated session. There is one now -- it comes from the `Authorization`
+//! header on the WebSocket handshake -- so every message this server stores is
+//! attributed to a real account instead of the reserved
+//! [`UNATTRIBUTED_USER_ID`](db::UNATTRIBUTED_USER_ID) row, which survives only so
+//! that a transcript written before this milestone still renders an author. `db.rs`
+//! has the reasoning.
 //!
 //! ## The modules
 //!
 //! | Module | Role |
 //! |---|---|
-//! | [`db`] | SQLite, WAL, migrations, and the idempotent accept transaction. |
-//! | [`message`] | Validation, and the decision between ack, dedupe-ack and refusal. |
-//! | [`ws`] | The WebSocket loop, version negotiation, and frame limits. |
+//! | [`db`] | SQLite, WAL, migrations, accounts, sessions, and the idempotent accept transaction. |
+//! | [`auth`] | Passwords, session tokens, the HTTP auth routes, and the bootstrap. |
+//! | [`message`] | Validation, channel authorization, and the decision between ack, dedupe-ack and refusal. |
+//! | [`ws`] | The handshake's authentication, the WebSocket loop, version negotiation, and frame limits. |
 //! | [`hub`] | Fan-out to every other connection. |
 //! | [`time`] | The clock, and why it does not come from `chrono/clock`. |
 //! | [`error`] | [`ServerError`], and why it is neither `ShNexusError` nor `WireError`. |
@@ -44,6 +47,12 @@
 //! implementations, which is the guarantee ADR-002 exists to provide, and the wire
 //! crate's own `tests/dependency_direction.rs` asserts the same rule from the
 //! other side. The two crates meet at `sh_nexus_wire` and nowhere else.
+//!
+//! **`argon2` and `sha2` are declared here and in the client never**, and the
+//! asymmetry is a security property rather than a tidiness one: the client is
+//! handed an opaque token and sends it, so a client that could hash a password
+//! would be a client that had a password to hash. `cargo tree -p sh_nexus` is how
+//! that claim is checked.
 //!
 //! ## An example
 //!
@@ -95,6 +104,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod auth;
 pub mod db;
 pub mod error;
 pub mod hub;
@@ -111,7 +121,7 @@ pub use crate::hub::{ConnectionId, Hub};
 
 /// The path the WebSocket endpoint is served on.
 ///
-/// One route, and that is the whole HTTP surface of this milestone. It is a
+/// One route, and that is the whole WebSocket surface of this milestone. It is a
 /// constant rather than a string in the router so that `docs/API.md`, the test
 /// harness and the log line cannot disagree about it.
 pub const WS_PATH: &str = "/ws";
@@ -155,15 +165,30 @@ impl AppState {
 ///
 /// # Returns
 ///
-/// A router with exactly one route, [`WS_PATH`], upgrading to a WebSocket.
+/// A router with [`WS_PATH`] upgrading to a WebSocket and `auth::routes`'s three
+/// HTTP routes. Public and used by the integration tests, which bind a real
+/// listener against exactly this router: a test that assembled its own would be
+/// testing a different server.
 ///
-/// Public and used by the integration tests, which bind a real listener against
-/// exactly this router: a test that assembled its own would be testing a
-/// different server. There is deliberately no fallback route, no health endpoint
-/// and no method-not-allowed handler -- axum answers those, and hand-written ones
-/// would be untested code answering requests nobody sends during this milestone.
+/// There is deliberately no fallback route, no health endpoint and no
+/// method-not-allowed handler -- axum answers those, and hand-written ones would
+/// be untested code answering requests nobody sends during this milestone. An
+/// unauthenticated `GET /` is one of the requests somebody *does* send, and axum
+/// answers it with a 404, which is the honest answer for a server with one job.
+///
+/// **The two halves share one `AppState` and therefore one SQLite connection, and
+/// `with_state` is called once on the merged result.** That is not a style point:
+/// axum 0.8 has no `From<Router<S>>` conversion, so a `Router<AppState>` cannot be
+/// merged into a finished `Router`, and an `auth::router` that applied its own
+/// `with_state` would have nowhere to go.
+///
+/// That shared connection is why [`AppState`]'s fields are cheap to clone and why
+/// `auth.rs`'s handlers reach the store through `spawn_blocking`: an argon2
+/// verification is deliberately expensive, and running it on a runtime worker would
+/// be the exact thing `AGENTS.md` §2.3 forbids.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route(WS_PATH, get(ws::handler))
+        .merge(auth::routes())
         .with_state(state)
 }
