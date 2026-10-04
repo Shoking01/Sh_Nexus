@@ -754,10 +754,50 @@ impl Shell {
     /// opens; the alternative is a pump that dies on a condition it cannot fix
     /// and cannot report, which is the silent stall the whole module exists to
     /// prevent.
+    ///
+    /// ## The flush, and why it is not only on the transition to `Connected`
+    ///
+    /// [`bridge::try_flush_outbox`] runs on **every** tick, before the early
+    /// return. `PLAN.md` §7 asks for the outbox to be flushed *"on reconnect"*, and
+    /// the transition is where a caller would naturally put that — **but a
+    /// transition-only trigger strands one case this unit created.**
+    /// [`crate::state::actions::retry_send`] now puts a retried send at the back
+    /// of the queue, and the retry can happen while the connection is already up;
+    /// with a trigger on the transition there is nothing to drive it until the
+    /// *next* reconnect, which may be never. **So the trigger is "the queue is not
+    /// empty and the connection can carry it", and the transition is one way to
+    /// reach that condition rather than the only way.**
+    ///
+    /// **The cost is bounded and stated.** A tick with a non-empty queue costs one
+    /// `try_send` per queued entry until the server answers, and
+    /// [`DRAIN_INTERVAL`] sets the rate at twenty a second. That is the price of
+    /// §7's third bullet: re-driving is safe *because* the server deduplicates and
+    /// answers a duplicate, and every answer empties the queue. A tick that finds
+    /// the queue empty does one `can_send` check and stops — `actions::flush_outbox`
+    /// gates on it, so an offline shell copies nothing.
+    ///
+    /// **The report is logged rather than rendered, and that is the seam's
+    /// contract.** A refused frame is a recoverable condition about this machine's
+    /// own socket (`AGENTS.md` §7.5's "reconnect scheduled" family), and
+    /// [`bridge::FlushReport`] carries counts only — ids and sizes, never content.
+    /// Nothing about it changes a row, so it does not ask for a repaint either.
     fn apply_inbox(&mut self, cx: &mut Context<Self>) -> usize {
         let Some(report) = bridge::drain(cx) else {
             return 0;
         };
+
+        match bridge::try_flush_outbox(cx) {
+            Some(flush) if flush.refused() > 0 => {
+                tracing::warn!(
+                    driven = flush.driven(),
+                    refused = flush.refused(),
+                    held = flush.held(),
+                    "the outbox could not be driven in full; the entries stay queued"
+                );
+            }
+            Some(_) | None => {}
+        }
+
         if report.applied() == 0 {
             return 0;
         }

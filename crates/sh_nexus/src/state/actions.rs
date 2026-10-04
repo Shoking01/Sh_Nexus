@@ -135,6 +135,91 @@
 //! explicitly** rather than the whole directory — work unit 1E-2's
 //! `state/bridge.rs` will import `gpui` legitimately, and a guard that has to be
 //! relaxed is a guard nobody reads.
+//!
+//! # 7. The outbox: an entry leaves on the server's answer, never on a write
+//!
+//! `PLAN.md` §7 is the specification and this is the implementation of its first,
+//! second, third and fourth bullets.
+//!
+//! **The one idea, stated once:** a queued send is retired when the server
+//! **acknowledges** it or **refuses** it terminally — *never* because a write
+//! succeeded. `network/ws.rs`'s worker consumes an item off its outbound queue
+//! and returns without re-queueing it when `write_frame` fails, so
+//! `MAX_OUTBOUND_FRAMES` is backpressure between the enqueue and the write and
+//! **not a queue that survives a disconnection**. A successful write means the
+//! bytes left this process; it does not mean the server stored the row, and the
+//! code proves the round trip can fail after that point. **The three doors out are
+//! [`acknowledge`], [`fail_send`], and the `Acked` upgrade inside [`ingest`] — and
+//! all three are the server saying it stored or refused the row.** The third was
+//! not in the original design and the proptest in `tests/state_actions.rs` is what
+//! found it: a resync echo carries the server's *stored* copy of a queued send, so
+//! leaving the entry behind would re-drive a send the client can already see
+//! stored, on every reconnect, against an entry nothing else would ever retire.
+//!
+//! **Re-driving is safe, which is what licenses a blunt flush.** The server
+//! deduplicates on `client_msg_id` (`Store::accept_message`, `ON CONFLICT DO
+//! NOTHING`) and **answers a duplicate with a `message.ack`** — see
+//! `sh_nexus_server`'s `message::Outcome::into_envelope`, which maps `Duplicate`
+//! to the same frame as `Accepted` and explains that a replay "has to be
+//! answered or the client leaves the message pending forever". So every re-drive
+//! terminates: §7's third bullet is not merely tolerated, it is what guarantees
+//! the queue drains.
+//!
+//! ## 7.1 What is queued, and what is not
+//!
+//! **A send composed while [`AppState::can_send`] was false.** `begin_send`
+//! already computed that flag before this queue existed and returned it in
+//! `SendOutcome::Pending`; that is the entire hook, and no `ui/` change was
+//! needed to use it — `InputBar::send` only rejects an empty draft, so an
+//! offline send already produced a `Pending` row.
+//!
+//! **A connected send is deliberately not queued**, and the reason is the
+//! transport rather than the outbox: `MessageList::enqueue` hands that frame to
+//! the socket immediately, so queuing it too would put two `message.send` frames
+//! on the wire for one message. The server drops the second as a duplicate, so
+//! no transcript is harmed — but it is a doubled frame per send, for nothing.
+//!
+//! **The residual hole this leaves, stated rather than hidden.** A send handed to
+//! a *connected* transport whose write later fails is still not re-driven, because
+//! nothing puts it in the queue: `begin_send` runs before the frame is pushed, and
+//! its `offline` flag was already false. **Closing that hole means the composer
+//! must ask the outbox instead of the transport — a `ui/` change, and `ui/` is
+//! not this layer's.** What this unit fixes is the case `PLAN.md` §7 is about: a
+//! send composed *while disconnected*, which previously had no re-drive at all.
+//!
+//! ## 7.2 Order, and where a retry goes
+//!
+//! **Enqueue order, always.** §7 says the reconnect *"flushes the outbox in
+//! enqueue order"*, so the queue is a `VecDeque` and [`flush_outbox`] walks it
+//! front to back. **A retry goes to the BACK**: it is a new attempt at an old
+//! message, and putting it at the front would let one repeatedly-retried message
+//! starve everything queued behind it while reordering this client's history
+//! against every other client's.
+//!
+//! ## 7.3 The bound, and the accepted deviation
+//!
+//! **At [`MAX_OUTBOX_ENTRIES`] the enqueue is refused** and the row reads
+//! `Failed` with a reason naming the bound. Not the oldest dropped, not the
+//! newest: §7's *"failures are never silently dropped"* forbids both.
+//!
+//! **§7 says "the client resyncs per channel … then flushes the outbox", and the
+//! resync does not happen.** `request_resync` has no production caller — it is
+//! referenced only from doctests in `network/ws.rs`, and `resyncs_sent` is a
+//! counter nothing drives — so the flush runs without one. **This is safe rather
+//! than convenient:** the server does not echo to the sender, and
+//! `core::ordering` dedupes by `client_msg_id`, so resync-then-flush and
+//! flush-then-resync converge on the same held set with no duplicate and no gap.
+//! **What is therefore NOT provided is the ordering guarantee §7 asks for** —
+//! where this client's own message lands among other people's. Closing it belongs
+//! with the resync work.
+//!
+//! ## 7.4 Durability
+//!
+//! **This queue is in memory, and a client that exits before the connection
+//! returns loses what it held.** `PLAN.md` §7's outbox is persistence and
+//! persistence is `db/` in Phase 3; what lands here is the part that can be
+//! correct without I/O. The two are not the same guarantee and only one of them
+//! is made.
 
 use std::fmt;
 use std::sync::Arc;
@@ -148,8 +233,17 @@ use crate::core::models::events::DomainEvent;
 use crate::core::models::message::{Message, Reaction};
 use crate::core::ordering::{self, DifferingField, IngestOutcome};
 use crate::state::app_state::{
-    AppState, DeliveryState, DifferingFields, SendFailure, TypingUsers, MAX_TYPING_CHANNELS,
+    AppState, DeliveryState, DifferingFields, SendFailure, TypingUsers, MAX_OUTBOX_ENTRIES,
+    MAX_TYPING_CHANNELS,
 };
+
+/// The machine code a client-side outbox refusal carries.
+///
+/// **Namespaced to this client rather than to the server, and for the same reason
+/// `MessageList::enqueue` uses `transport.enqueue_failed`:** a badge that reads
+/// `server.rate_limited` when this machine's own queue was full sends the user
+/// looking at the server for a condition the server never saw.
+const OUTBOX_FULL_CODE: &str = "client.outbox_full";
 
 /// What an action did, and what it did not do.
 ///
@@ -266,6 +360,20 @@ pub enum IgnoreReason {
         /// The identity that is already outstanding.
         client_msg_id: Uuid,
     },
+    /// The outbox is at [`MAX_OUTBOX_ENTRIES`] and could not take this send.
+    ///
+    /// **Named for the bound rather than a `bool`, because "it did not work" is
+    /// not an answer a user can act on.** The reason this is an [`IgnoreReason`]
+    /// at all is that the *only* caller is `retry_send`: a first send at capacity
+    /// still produces its row — visible, and reading
+    /// [`DeliveryState::Failed`] with a [`SendFailure`] naming the bound — so it
+    /// reports through [`SendOutcome::Failed`] instead. This variant is what a
+    /// *retry* reports, where there is no new row to describe and the honest
+    /// answer is that nothing changed.
+    OutboxFull {
+        /// The identity that could not be queued.
+        client_msg_id: Uuid,
+    },
     /// The channel the user tried to select is not in the loaded list.
     ///
     /// **Selection is refused rather than accepted**, because accepting it would
@@ -335,6 +443,12 @@ impl fmt::Display for IgnoreReason {
             Self::AlreadyPending { client_msg_id } => {
                 write!(formatter, "the send {client_msg_id} is already outstanding")
             }
+            Self::OutboxFull { client_msg_id } => {
+                write!(
+                    formatter,
+                    "the outbox for {client_msg_id} is full at {MAX_OUTBOX_ENTRIES} queued sends"
+                )
+            }
             Self::UnknownChannel { channel_id } => {
                 write!(formatter, "the channel {channel_id} is not loaded")
             }
@@ -394,9 +508,24 @@ pub enum SendOutcome {
         /// shows "queued" rather than "sent". The row is created either way: the
         /// Optimistic Send Flow is connection-independent, and a client that hid
         /// the message until the socket was up would fail the flow it is named
-        /// for. The outbox itself is `db/` in Phase 3; this is the signal its
-        /// caller needs, not the queue.
+        /// for. **With the outbox in `AppState`, "owns it" is now a fact rather
+        /// than a signal**, and this flag is the composer's way of asking.
         offline: bool,
+    },
+    /// The message is on screen and [`DeliveryState::Failed`]: the outbox was at
+    /// [`MAX_OUTBOX_ENTRIES`] and could not take it.
+    ///
+    /// **A third variant rather than a `Pending` that quietly reads `Failed`.**
+    /// The row exists, so `Ignored` would be a lie about that; and the row does
+    /// *not* read `Pending`, so returning `Pending` would make
+    /// [`is_pending`](Self::is_pending) answer a question the state disagrees
+    /// with. `AGENTS.md` §5.2's "clear, actionable error" is what this carries:
+    /// the reason names the bound, and the user's retry is the way out.
+    Failed {
+        /// The identity of the row that is on screen and failed.
+        client_msg_id: Uuid,
+        /// Why it failed — the bound, in this module's only case.
+        reason: SendFailure,
     },
     /// Nothing was created, and this is why.
     Ignored(IgnoreReason),
@@ -411,6 +540,16 @@ impl SendOutcome {
     /// Whether the send is on screen but cannot be transmitted yet.
     pub fn is_offline(&self) -> bool {
         matches!(self, Self::Pending { offline: true, .. })
+    }
+
+    /// Whether a row was created, whatever state it is in.
+    ///
+    /// **The question `MessageList::begin_send` actually asks**, which it answers
+    /// from the state rather than from this enum — see that method's own note
+    /// about pattern-matching a refusal taxonomy to reach a boolean. Exposed here
+    /// so a caller that has the outcome does not have to spell the same `match`.
+    pub fn is_on_screen(&self) -> bool {
+        matches!(self, Self::Pending { .. } | Self::Failed { .. })
     }
 }
 
@@ -427,9 +566,103 @@ impl fmt::Display for SendOutcome {
                 client_msg_id,
                 offline: false,
             } => write!(formatter, "sent as {client_msg_id}"),
+            Self::Failed {
+                client_msg_id,
+                reason,
+            } => write!(formatter, "not queued: {client_msg_id} failed: {reason}"),
             Self::Ignored(reason) => write!(formatter, "not sent: {reason}"),
         }
     }
+}
+
+/// One of this client's queued sends, resolved into what a frame needs.
+///
+/// **The outbox holds identities; this is the resolution step.** `state/` has no
+/// socket and no frame type, so the thing a caller needs in order to transmit a
+/// queued send is three owned values and nothing else — and reading the body from
+/// the held row here, rather than storing it in the queue, is what keeps one copy
+/// of every queued message.
+///
+/// **Owned rather than borrowed because the seam cannot lend a borrow out.**
+/// `bridge::try_read` hands the state to a closure whose return type cannot
+/// borrow from it (see that function's documentation), so a flush that produced
+/// `Vec<(&Uuid, &str, &str)>` could not be returned from one at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedSend {
+    client_msg_id: Uuid,
+    channel_id: String,
+    content: String,
+}
+
+impl QueuedSend {
+    /// The identity the server will reconcile this send by.
+    ///
+    /// **The one field the server sees in the frame's envelope**, and therefore
+    /// the one the dedup keys on (`AGENTS.md` §7.4).
+    pub fn client_msg_id(&self) -> Uuid {
+        self.client_msg_id
+    }
+
+    /// The channel this send was composed in.
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+
+    /// The body to transmit, read from the held row at flush time.
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
+/// Everything the outbox would put on the wire this time, **in enqueue order**.
+///
+/// `PLAN.md` §7's *"flushes the outbox in enqueue order"*, made into a function
+/// a caller can assert on. **This does not transmit and does not dequeue** — it
+/// resolves identities into frames and hands them back, because `state/` may not
+/// reach `network/` and because the entry's whole meaning is that leaving is the
+/// server's decision, not the caller's.
+///
+/// # Refusals rather than errors
+///
+/// **Nothing here can fail.** A connection that cannot carry a send yields an
+/// empty list (see below), and an entry naming a row that is no longer held is
+/// dropped with its identity retired. See the module docs, §1: a policy outcome
+/// is a value.
+///
+/// # Why it produces nothing unless [`AppState::can_send`] holds
+///
+/// **The gate is a decision, and it belongs here rather than at the caller.** A
+/// flush triggered on every drain tick would otherwise rebuild and copy the whole
+/// queue once every [`DRAIN_INTERVAL`](crate::app::DRAIN_INTERVAL) on a client
+/// with no server — pure CPU on the main thread to produce frames nobody sends.
+/// The empty list *is* the report: nothing was driven, and the queue is untouched.
+///
+/// # Errors
+///
+/// None. See the module docs, §1.
+pub fn flush_outbox(state: &AppState) -> Vec<QueuedSend> {
+    if !state.can_send() {
+        return Vec::new();
+    }
+    state
+        .outbox_ids()
+        .into_iter()
+        .filter_map(|client_msg_id| {
+            let channel_id = state.outgoing_channel(&client_msg_id)?.to_owned();
+            // **A held row is a precondition, and the invariant says it holds.**
+            // The outbox skips nothing eviction may take, so every entry names a
+            // row that is `Pending` or `Failed` and therefore still present. The
+            // `?` is here so a future path that breaks the invariant costs one
+            // undriven send rather than a panic on the main thread -- and
+            // `AGENTS.md` §2.1 is what asks for the value over the `expect`.
+            let content = state.message(&channel_id, &client_msg_id)?.content.clone();
+            Some(QueuedSend {
+                client_msg_id,
+                channel_id,
+                content,
+            })
+        })
+        .collect()
 }
 
 /// The single entry point for everything the network delivers.
@@ -607,6 +840,24 @@ pub fn retry_send(state: &mut AppState, client_msg_id: Uuid) -> ApplyOutcome {
     if state.delivery(&client_msg_id) != Some(DeliveryState::Failed) {
         return ApplyOutcome::Ignored(IgnoreReason::NotFailed { client_msg_id });
     }
+    // **The outbox is asked before the delivery state moves, and a refusal leaves
+    // the row `Failed`.** Re-queuing is the point of the gesture, so promoting the
+    // row to `Pending` first would put it on screen reading `sending…` with
+    // nothing behind it — a lie a user would wait on. §7's ordering puts a retry at
+    // the **back** of the queue; see `AppState::enqueue_outbox`.
+    //
+    // **An identity already queued is accepted here rather than refused**, because
+    // `enqueue_outbox` reports one refusal for both conditions and this is the
+    // case where refusing would be wrong: a send can be `Failed` while still
+    // queued (a flush the transport refused keeps it), and the user asking again
+    // should not be told the outbox is full.
+    if state.outbox_holds(&client_msg_id) {
+        state.set_delivery(client_msg_id, channel_id, DeliveryState::Pending);
+        return ApplyOutcome::Applied;
+    }
+    if !state.enqueue_outbox(client_msg_id) {
+        return ApplyOutcome::Ignored(IgnoreReason::OutboxFull { client_msg_id });
+    }
     state.set_delivery(client_msg_id, channel_id, DeliveryState::Pending);
     ApplyOutcome::Applied
 }
@@ -666,6 +917,17 @@ pub fn discard_failed_send(state: &mut AppState, client_msg_id: Uuid) -> ApplyOu
     state.remove_message(&channel_id, &client_msg_id);
     state.clear_outgoing(&client_msg_id);
     state.forget_rendered(&client_msg_id);
+    // **Defence, and the reason it is not optional: the outbox's invariant is
+    // that every entry names a held row.** Nothing reaches this with a queued
+    // identity today -- a terminal `message.error` already retired it, and a
+    // capacity refusal never queued one -- so this call is unreachable as written.
+    // **It stays because the invariant is structural only if every path that
+    // removes a row also removes its entry**, and this is the path that removes a
+    // row. `AGENTS.md` §7.1 forbids a bound whose enforcement depends on every
+    // caller remembering, which is the same argument
+    // `AppState::insert_message` makes for applying the history cap itself rather
+    // than at its call sites.
+    state.dequeue_outbox(&client_msg_id);
     ApplyOutcome::Applied
 }
 
@@ -820,9 +1082,54 @@ pub fn begin_send(
         return SendOutcome::Ignored(IgnoreReason::AlreadyHeld { client_msg_id });
     }
     state.set_delivery(client_msg_id, channel_id.to_owned(), DeliveryState::Pending);
-    SendOutcome::Pending {
+
+    // **An offline send goes into the outbox here, and this is the whole hook.**
+    // `offline` is `!state.can_send()`, computed before the row existed and
+    // returned to the caller ever since -- `PLAN.md` §7's first bullet, waiting
+    // for a queue to exist. Module docs, section 7.
+    //
+    // **A connected send is deliberately NOT queued**, and the reason is the
+    // transport rather than the outbox: `MessageList::enqueue` hands that frame to
+    // the socket immediately, so queuing it too would put two `message.send`
+    // frames on the wire for one message. The server would answer the second as a
+    // duplicate and drop it (`AGENTS.md` §7.4), so nothing would be duplicated in
+    // any client's transcript -- but it would be a doubled frame per send, forever,
+    // for no gain. **The cost of that choice is stated in the module docs,
+    // section 7: a write that fails after the frame left the client is still not
+    // re-driven**, because closing that needs the composer to ask the outbox
+    // instead of the transport, which is a `ui/` change this layer does not own.
+    if !offline {
+        return SendOutcome::Pending {
+            client_msg_id,
+            offline: false,
+        };
+    }
+
+    if state.enqueue_outbox(client_msg_id) {
+        return SendOutcome::Pending {
+            client_msg_id,
+            offline: true,
+        };
+    }
+
+    // **At the bound: the row stays visible and reads `Failed`.** Dropping the
+    // oldest queued send would lose a message the user wrote and still believes
+    // is waiting, and dropping this one would make their latest words vanish while
+    // they watch. So the refusal is the same shape as any other terminal failure
+    // -- visible, explained, retryable -- and the explanation names the bound, per
+    // `AGENTS.md` §5.2's "clear, actionable error".
+    let reason = SendFailure::new(
+        OUTBOX_FULL_CODE,
+        format!(
+            "this machine already has {MAX_OUTBOX_ENTRIES} sends waiting for a \
+             connection; this one was not queued. Retry once the connection returns."
+        ),
+    );
+    state.record_failure(client_msg_id, reason.clone());
+    state.set_delivery(client_msg_id, channel_id.to_owned(), DeliveryState::Failed);
+    SendOutcome::Failed {
         client_msg_id,
-        offline,
+        reason,
     }
 }
 
@@ -877,6 +1184,25 @@ fn ingest(state: &mut AppState, incoming: Message) -> ApplyOutcome {
                 .message(&held_channel, &client_msg_id)
                 .is_some_and(|held| !held.id.is_empty());
             if reconciled_with_a_server_id {
+                // **The outbox entry retires here too, and this door was not in
+                // the original design.** The proptest in
+                // `tests/state_actions.rs` found the gap: a *resync echo* of a
+                // queued send — a `message.new` carrying a real server id —
+                // upgrades the row to `Acked` through this arm, and the entry
+                // was left behind. That is not a cosmetic inconsistency. A row
+                // the client can see holds the **server's stored copy**, so a
+                // queue entry pointing at it is a send the client *knows* is
+                // stored, and every reconnect would re-drive it, forever,
+                // against an entry that nothing else will ever retire.
+                //
+                // **It is still the server acknowledging the send**, which is
+                // what the rule is about: the evidence is the server's own id
+                // for the row, not a successful write. `PLAN.md` §7's first two
+                // bullets are satisfied and its last one ("the server
+                // deduplicates … so a flush that partially succeeded … does not
+                // duplicate messages") is what makes the replay this avoids
+                // having been harmless in the first place.
+                state.dequeue_outbox(&client_msg_id);
                 state.set_delivery(client_msg_id, held_channel, DeliveryState::Acked);
             }
         }
@@ -1022,6 +1348,18 @@ fn merge_into_held(
 ///
 /// A failed row is **upgraded**, not refused: module docs, §2.2.
 fn acknowledge(state: &mut AppState, client_msg_id: Uuid, stored: Message) -> ApplyOutcome {
+    // **One of the two doors out of the outbox, and it is a door rather than a
+    // side effect further down** so that both branches below get it. The entry
+    // leaves because the server holds the row, which is the only evidence that has
+    // ever justified dropping a queued send -- module docs, section 7.
+    //
+    // **Before the reconcile, not after.** `ingest` can be refused (a replay of a
+    // row the client already holds answers `AlreadyHeld`), and a refusal means the
+    // server's copy is still the later truth, so retiring the entry on the same
+    // evidence either way is right: the client has the row and the server has
+    // acknowledged the identity.
+    state.dequeue_outbox(&client_msg_id);
+
     // **"Held" means held *anywhere*, and the check is the verified one.** The
     // first version asked only whether the send map had an entry and whether the
     // row was in the channel the ACK named, and a foreign message already held in
@@ -1068,6 +1406,17 @@ fn fail_send(
     let Some(channel_id) = state.outgoing_channel(&client_msg_id).map(str::to_owned) else {
         return ApplyOutcome::Ignored(IgnoreReason::NotHeld { client_msg_id });
     };
+    // **The other of the two doors out of the outbox.** `PLAN.md` §7: *"A send
+    // that fails terminally transitions to `DeliveryState::Failed` and stays
+    // visible for retry."* Every `message.error` on this protocol is terminal --
+    // there is no retryable code and no backoff hint, and `retry_send` is the
+    // user's gesture for the next attempt -- so this event *is* the terminal one.
+    //
+    // **After the held check and only on the applied path**, so a `message.error`
+    // for a send this client does not hold retires nothing: there is nothing to
+    // retire, and taking the row's queue slot on the strength of a frame naming an
+    // identity the client never sent would be a way to lose a queued send.
+    state.dequeue_outbox(&client_msg_id);
     state.record_failure(client_msg_id, SendFailure::new(code, detail));
     state.set_delivery(client_msg_id, channel_id, DeliveryState::Failed);
     ApplyOutcome::Applied

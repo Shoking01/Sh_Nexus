@@ -36,6 +36,7 @@ ADR-005.
 | [ADR-009](#adr-009--one-main-thread-by-construction-rather-than-by-lock) | One main thread, by construction rather than by lock | **Accepted** |
 | [ADR-010](#adr-010--self-hosted-per-team-instances-with-sqlite) | Self-hosted per-team instances, with SQLite | **Accepted** |
 | [ADR-011](#adr-011--connection-visibility-a-banner-in-the-window-and-stderr-for-the-terminal) | Connection visibility: a banner in the window, and stderr for the terminal | **Accepted** |
+| [ADR-012](#adr-012--the-outbox-is-released-by-acknowledgement-not-by-a-successful-write) | The outbox is released by acknowledgement, not by a successful write | **Accepted** |
 
 ---
 
@@ -1499,3 +1500,163 @@ that would have honoured it) â€” four decisions, none of them taken here.
 | **`tracing-subscriber::fmt().with_writer(file)`** | Four decisions this ADR does not take (Â§6 above), and Â§7.1's ban on unbounded in-memory state has a file-shaped cousin in an unbounded file. |
 | **`tracing::subscriber::set_global_default`** | It **panics** when a default already exists. A test harness or an embedder that initialised `tracing` first would crash this client on the path that was supposed to make crashes diagnosable. `try_init` reports instead. |
 
+
+---
+
+### ADR-012 — The outbox is released by acknowledgement, not by a successful write
+
+**Status:** Accepted · 2026-10-04
+
+#### Context
+
+`PLAN.md` §7 opens with *"The outbox is what makes a chat app trustworthy"* and closes with
+*"Failures are never silently dropped"*. Neither was true. `actions::begin_send` computed
+`let offline = !state.can_send();`, returned it in `SendOutcome::Pending { offline }`, and **nothing
+read the flag** — the composer renders `Pending` either way, because the Optimistic Send Flow is
+connection-independent and should be. So a message typed while disconnected got a row and no
+mechanism to deliver it.
+
+The mechanism was believed to exist. `network/ws.rs`'s worker loop takes an item off its outbound
+queue, and when `write_frame` fails the arm returns **without putting the item back**:
+
+```rust
+Some(item) => {
+    let (id, frame, remember) = split_outbound(item);
+    // ...
+    if !write_frame(&mut socket, id, frame, counters).await {
+        return Outcome::Established;      // the item was consumed; the frame is gone
+    }
+```
+
+`MAX_OUTBOUND_FRAMES: 256` is therefore **backpressure between the enqueue and the write**, not a
+queue that survives a disconnection, and 256 is the number at which that illusion ends. Against
+`AGENTS.md` §1's second priority — *"no lost messages"* — a message the user could still see on
+screen had no path to the server and no way for the client to know that.
+
+Two properties of the server made the fix cheap, and both had to be read from the code rather than
+assumed:
+
+- `Store::accept_message` is `ON CONFLICT DO NOTHING` on `client_msg_id`, so a replay is a no-op.
+- **A replay is still acknowledged.** `sh_nexus_server`'s `message::Outcome::into_envelope` maps
+  `Duplicate` to the *same* `message.ack` frame as `Accepted`, and says why: *"A replay after a
+  reconnect has to be answered or the client leaves the message pending forever."*
+
+The second is what makes a blunt "send everything queued again" flush terminate. Without it the
+queue could not drain.
+
+#### Decision
+
+**1. An entry leaves the outbox when the server acknowledges or refuses the send. Never because a
+write succeeded.** A successful `write_frame` means the bytes left this process; it does not mean
+the server stored the row, and the code above is the proof that the round trip can fail after that
+point. Three doors out, and all three are the server speaking:
+
+| Door | Trigger | Why it is the server's answer |
+|---|---|---|
+| `actions::acknowledge` | `DomainEvent::MessageAcked` | the ACK carries the **stored** message |
+| `actions::fail_send` | `DomainEvent::MessageSendFailed` | §7 calls this failure *terminal*; there is no retryable code on the protocol, and `retry_send` is the user's next attempt |
+| `ingest`'s `Acked` upgrade | a **resync echo** — a `message.new` carrying a real server id | the client is now holding the server's stored copy of its own send |
+
+**The third door was not in the original design and the property test found its absence.**
+`an_arbitrary_sequence_of_events_leaves_the_state_internally_consistent` reported a queued identity
+sitting on an `Acked` row: a resync echo reconciles the optimistic row to `Acked` through `ingest`,
+and the entry had been left behind. That is not cosmetic — an entry on a row the client can see the
+server already holds would be re-driven on every reconnect, forever, against nothing that would ever
+retire it. It is the reason the property asserts a queued identity is `Pending` and not merely
+"not evicted".
+
+**2. The outbox is `VecDeque<Uuid>` in `AppState`, and it holds identities rather than content.**
+The body is read from the held row at flush time, so a queued send is stored exactly once.
+`AGENTS.md` §2.3's "no deep clones in hot paths" and §7.1's bound on memory both point the same way,
+and eviction already guarantees the rows outlive their entries: `oldest_candidate` skips anything
+`has_outstanding_send`, which covers `Pending` **and** `Failed`, so **the queue cannot outlive its
+own content**.
+
+*A consequence worth recording, because it removes a demonstration that looks available:* a queued
+row's body can never change while it is queued. The only writer that can change a held message's
+content is the server, and every server-delivered copy carries a real id — which retires the entry
+through the third door above. So "the queue holds identities so an edit while queued is transmitted"
+is a *reason* no test can demonstrate. The storage argument stands on its own.
+
+**3. At `MAX_OUTBOX_ENTRIES` the enqueue is refused, and the row reads `Failed` with a reason naming
+the bound.** `AGENTS.md` §7.1 forbids unbounded in-memory state; `PLAN.md` §7 forbids answering that
+by dropping something. **Not the oldest** — that discards a message the user wrote and still believes
+is queued. **Not the newest** — that makes their most recent words vanish while they are watching.
+So the refusal is the same shape as any other terminal failure: visible, explained, retryable, with
+the code namespaced `client.outbox_full` because the server never saw the send.
+
+**The number is 1024 and the number is precedent, not invention.** It is
+`bridge::MAX_PENDING_EVENTS`, the other client-side queue of client-originated items. A queue whose
+bound differs per queue is a bound somebody has to remember twice.
+
+**4. `retry_send` re-queues at the BACK.** §7 says the flush is in enqueue order, and a retry is a
+new attempt at an old message. At the front, one repeatedly-retried message would be re-driven ahead
+of everything queued behind it on every reconnect, and this client's history would be reordered
+against every other client's.
+
+**5. The flush is triggered by "the queue is not empty and the connection can carry it", not by the
+transition to `Connected`.** `Shell::apply_inbox` calls `bridge::try_flush_outbox` on every tick.
+§7's wording is *"on reconnect"*, and the transition is where the trigger obviously belongs — but a
+transition-only trigger **strands the retry**: `retry_send` can be pressed while the connection is
+already up, and there would then be nothing to drive the entry until the *next* reconnect, which may
+be never. The transition is one way to reach the condition, not the only way.
+
+The cost is bounded and stated: a tick with a non-empty queue costs one `try_send` per entry until
+the server answers, at `DRAIN_INTERVAL`'s twenty a second, and every answer empties the queue. A tick
+that finds the queue empty does one `can_send` check and stops.
+
+**6. The seam pushes frames and reports; it never retires a queued send.** `bridge.rs` gains exactly
+one door, `try_flush_outbox`, returning a `FlushReport` of three counts and **no identities** —
+`AGENTS.md` §7.5 forbids logging message content, so a type that could carry it does not. A door here
+that "cleared" the queue would be the exact defect this ADR removes, wearing a return type.
+
+#### Consequences
+
+- **A send composed while disconnected now survives a disconnection**, which is §7's first bullet and
+  was not true. `queued_sends_reach_the_server_when_the_connection_returns` asserts it end to end
+  against a real server process: three sends composed against a dead port, a flush on reconnect, and
+  three acknowledgements.
+- **A send composed while *connected* whose write later fails is still not re-driven.** This is stated
+  rather than hidden, and it is a real remaining hole. `begin_send` runs before the frame is pushed,
+  and its `offline` flag was already `false`; nothing puts that send in the queue. **Closing it means
+  the composer must ask the outbox instead of the transport — a `ui/` change**, and the alternative
+  (queueing every send) would put two `message.send` frames on the wire per send for nothing.
+- **§7's ordering guarantee is still NOT provided.** §7 says *"the client resyncs per channel from
+  each channel's last_message_at, then flushes the outbox"*, and **the resync does not happen**:
+  `request_resync` has no production caller — it is referenced only from doctests in
+  `network/ws.rs`, and `resyncs_sent` is a counter nothing drives. This is safe rather than
+  convenient: the server does not echo to the sender and `core::ordering` dedupes by `client_msg_id`,
+  so resync-then-flush and flush-then-resync converge on the same held set with no duplicate and no
+  gap. What is lost is where this client's own message lands among other people's — cosmetic, and it
+  belongs with the resync work.
+- **The outbox is in memory and a client that exits before the connection returns loses what it
+  held.** §7's outbox is *persistence*, and persistence is `db/` in Phase 3. What lands here is the
+  part that can be correct without I/O. **The two are not the same guarantee and only one of them is
+  made** — `state/mod.rs`'s "the outbox is `db/`" row is stale on the persistence half and still right
+  about the layer.
+- **Three `Display` surfaces became reachable and are now tested**, because a string nobody renders is
+  a string nobody checked: `IgnoreReason::OutboxFull`, `SendOutcome::Failed`, and
+  `impl Display for SendFailure`.
+- **`SendOutcome` grew a third variant.** `Failed { client_msg_id, reason }` is not
+  `Pending { offline: true }` — the row exists and does *not* read `Pending` — and not `Ignored`,
+  which claims nothing was created. A caller pattern-matching all three now has a case to write.
+- **The `discard_failed_send` affordance is unchanged and remains unreachable.** Work unit 3D decided
+  it gets no UI caller and no bridge door, because it deletes a message the user wrote and a
+  destructive action needs a confirmation or an undo that `ui/` does not have.
+  `the_destructive_discard_has_no_ui_caller` is untouched and green. A `Failed` row is never queued —
+  `fail_send` retires the entry before setting `Failed` — so §7's *"failures are never silently
+  dropped"* is satisfied by the row staying visible and retrying for real, with no discard button.
+
+#### Alternatives considered
+
+| Option | Why not chosen |
+|---|---|
+| **Re-queue the frame inside `network/ws.rs`'s worker on a failed write** | The obviously correct fix, and **out of scope**: it is `network/`, and the write unit's allowed surfaces excluded it. It is also the weaker half — a worker cannot know the server stored the row, so it could only ever preserve the frame, not release it. The queue this ADR adds is what turns preservation into a guarantee. |
+| **A `Db` outbox in `state/`, keyed by `client_msg_id`** | §3.2 gives this layer no I/O, and `state_app_state_and_actions_are_pure` fails the build on `std::fs` in either file. Persistence is `db/` in Phase 3, and it needs a reconciliation against what the server already holds. |
+| **Queueing every send, connected or not** | Two `message.send` frames per send, forever. The server drops the second as a duplicate so no transcript is harmed — but it is wasted traffic for nothing, and the answer to the real problem is a `ui/` change, not a duplicate frame. |
+| **Dropping the oldest entry at the bound** | Precisely what `PLAN.md` §7's closing line forbids: a silent loss of a message the user still believes is queued. |
+| **An unbounded outbox** | `AGENTS.md` §7.1 names message history first and bans unbounded growth; an offline client with a broken server is exactly where that would bite. |
+| **Retiring the entry when the frame is handed to the transport** | The defect this ADR exists to remove. `network/ws.rs` proves the frame can die after the hand-off. |
+| **A `resync`-then-`flush` ordering** | §7 asks for it and **`request_resync` has no production caller**, so wiring it here would have been a door nothing calls — `bridge.rs` §5's dead-code rule. It also needs a resync caller and a decision about per-channel cursors that this layer does not own. |
+| **Flushing on the `Connected` transition only** | Strands a retry pressed while already connected. The condition is the honest trigger; the transition is one way to reach it. |
+| **Unbounded retry, or an automatic retry policy with backoff** | §7 makes `retry_send` the user's gesture and this crate has no timer a view can own. A silent auto-retry would also hide a message the user can see failing, which is the opposite of §7's fourth bullet. |

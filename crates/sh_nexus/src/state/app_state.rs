@@ -201,10 +201,17 @@
 //! - **No `network/`, no `db/`, no `platform/`.** `AGENTS.md` §3.2 puts this
 //!   layer above `network/` and `core/`; `errors.rs` is a sibling, and §3.3's
 //!   direction of travel is module error → `ShNexusError`, never the reverse.
-//! - **No outbox.** `PLAN.md` §7's outbox is persistence, so it is `db/` in
-//!   Phase 3. A send made while disconnected still gets a `Pending` row here —
-//!   that is the Optimistic Send Flow and it is connection-independent — and
-//!   [`AppState::can_send`] tells the caller which case it is in.
+//! - **No *durable* outbox.** There is a bounded in-memory one —
+//!   [`MAX_OUTBOX_ENTRIES`] and [`AppState::outbox_len`] — because
+//!   `PLAN.md` §7's guarantee is about a *disconnection*, and a queue that
+//!   forgets everything when the process exits does not survive one. **What is
+//!   still `db/`'s in Phase 3 is the persistence:** an outbox that outlives a
+//!   restart needs a schema, a migration and a reconciliation against what the
+//!   server already holds, none of which this layer may have (no I/O, no
+//!   filesystem). **The honest statement of the limit is that a queued send is
+//!   lost if the client exits before the connection returns** — which is a
+//!   smaller hole than the one this queue closed and a different one, and
+//!   calling it a solved offline model would not be true.
 //! - **No backfill for what [`MAX_MESSAGES_PER_CHANNEL`] evicts, so eviction
 //!   loses it.** That is the one cost of the bound, and it is stated here rather
 //!   than left for somebody to discover: a channel past 10 000 rows has no
@@ -221,7 +228,8 @@
 //!   — not a message in flight, which is why eviction never takes one.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fmt;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -272,6 +280,41 @@ pub const MAX_TYPING_USERS_PER_CHANNEL: usize = 32;
 /// so the bound costs a missing indicator on the sixty-fifth busy channel and
 /// never a vanished one on a channel the user is already watching.
 pub const MAX_TYPING_CHANNELS: usize = 64;
+
+/// How many of this client's own sends the outbox will hold at once.
+///
+/// `AGENTS.md` §7.1 forbids unbounded growth of in-memory state and names
+/// *"message history"* first; the outbox is the second queue of client-originated
+/// messages, and this is its bound.
+///
+/// # 1024, and why that number
+///
+/// **The same figure as [`MAX_PENDING_EVENTS`](crate::state::bridge::MAX_PENDING_EVENTS),
+/// which is precedent rather than invention.** That constant bounds the events
+/// queued *for* the main thread; this one bounds the sends queued *by* the user.
+/// Both are "client-originated items waiting for the network", both are drained
+/// by the same reconnect, and a client with a thousand sends outstanding has a
+/// rendering problem long before it has a memory one. **A queue whose bound
+/// differs per queue is a bound somebody has to remember twice**, so the two
+/// agree and a future change to one should change the other.
+///
+/// # At capacity the enqueue is refused, and that is the whole policy
+///
+/// **Not the oldest entry dropped, and not the newest.** Both are the failure
+/// `PLAN.md` §7's *"failures are never silently dropped"* is written against:
+/// dropping the oldest discards a message the user wrote and still believes is
+/// queued, and dropping the newest makes their most recent words vanish at the
+/// moment they are watching them disappear. **So the refusal is reported and the
+/// row reads [`DeliveryState::Failed`] with a reason naming this bound** — the
+/// same shape as any other terminal failure, with the user's retry as the way out.
+///
+/// **The cost, stated rather than assumed:** a client that queues 1024 sends
+/// while offline sees its 1025th refused. That is a user typing into a client
+/// with no connection for a long time, and the alternative is either a dropped
+/// message or a bound with no number — neither of which `AGENTS.md` §7.1 permits.
+/// [`MAX_MESSAGES_PER_CHANNEL`] already accepts the same trade for history, and
+/// says why the over-cap case is preferable to a lost message.
+pub const MAX_OUTBOX_ENTRIES: usize = 1_024;
 
 /// How many messages one channel holds before its oldest row is evicted.
 ///
@@ -398,9 +441,12 @@ pub enum DeliveryState {
     ///
     /// **The state in which [`Message::id`] is empty** (module docs, §4). A
     /// pending row is the Optimistic Send Flow of `AGENTS.md` §8.1: the message
-    /// is on screen before the server has seen it, and it stays on screen in this
-    /// state if the connection drops, because the outbox that would re-send it is
-    /// `PLAN.md` §7's and belongs to `db/` in Phase 3.
+    /// is on screen before the server has seen it. **It stays on screen in this
+    /// state across a disconnection**, and that is now backed by the outbox
+    /// ([`MAX_OUTBOX_ENTRIES`]) rather than by optimism: a send composed while
+    /// [`AppState::can_send`] was false is queued there and re-driven on
+    /// reconnect. **The outbox's durability limit is stated in the module docs,
+    /// §6** — a queue that does not survive a process exit.
     Pending,
     /// The server accepted it, and the client holds the stored message.
     ///
@@ -452,6 +498,25 @@ impl SendFailure {
     /// The human-readable explanation, as the server reported it.
     pub fn detail(&self) -> &str {
         &self.detail
+    }
+}
+
+impl fmt::Display for SendFailure {
+    /// One line: the machine code, and the explanation when there is one.
+    ///
+    /// **The code leads, and the detail is omitted rather than left dangling when
+    /// it is empty.** A `message.error` may carry a code and no prose, and
+    /// `"validation_error: "` is a worse line than `"validation_error"` — it
+    /// reads as a sentence that lost its ending. Both halves are the *server's*
+    /// words (or, for a client-side refusal such as the outbox being full, words
+    /// this client chose), and `AGENTS.md` §7.5's ban is on **message content**:
+    /// a code and an explanation are exactly what it says the user is shown.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.detail.is_empty() {
+            formatter.write_str(&self.code)
+        } else {
+            write!(formatter, "{}: {}", self.code, self.detail)
+        }
     }
 }
 
@@ -707,6 +772,34 @@ pub struct AppState {
     /// would be O(rows x k) per frame. `AGENTS.md` §2.3's "no O(n) in the frame
     /// loop" is about n being the history, and here it is not.
     counted: BTreeSet<(String, Uuid)>,
+    /// This client's own sends waiting to be transmitted, in enqueue order.
+    ///
+    /// **`VecDeque<Uuid>` and nothing else, and the shape is the design.** An entry
+    /// is an *identity*, not a copy of the message: the content is read back from
+    /// the held row at flush time, so a queued send is stored exactly once and an
+    /// edit to the row between enqueue and flush is what gets transmitted. **The
+    /// alternative — holding `(Uuid, String, String)` — is a second copy of every
+    /// queued body**, and `AGENTS.md` §2.3's "no deep clones in hot paths" plus
+    /// §7.1's bound on memory both push the other way.
+    ///
+    /// **A `VecDeque` rather than a `HashMap` or a `BTreeMap` because the order is
+    /// the contract.** `PLAN.md` §7 says the reconnect *"flushes the outbox in
+    /// enqueue order"*, and a set or a sorted map would give an order chosen by a
+    /// hash rather than by the user's keystrokes. The back is where a retry goes,
+    /// for the reason `state/actions.rs` documents on `retry_send`.
+    ///
+    /// **The invariant, and it is what makes holding ids safe:** every entry
+    /// names a held row whose [`delivery`](Self::delivery) is
+    /// [`DeliveryState::Pending`] or [`DeliveryState::Failed`].
+    /// [`oldest_candidate`](Self::oldest_candidate) skips exactly those rows when
+    /// it evicts, so **the queue cannot outlive its own content** — an entry's
+    /// message is never evicted from under it. The two paths that could break
+    /// that invariant (a discard, and a removal) both retire the entry in the
+    /// same call, so the property is structural rather than maintained.
+    ///
+    /// **Bounded by [`MAX_OUTBOX_ENTRIES`], and the bound refuses rather than
+    /// drops.** See that constant for why neither alternative is available.
+    outbox: VecDeque<Uuid>,
     selected: Option<String>,
     presence: HashMap<String, UserStatus>,
     typing: HashMap<String, TypingUsers>,
@@ -736,6 +829,7 @@ impl AppState {
             outgoing: HashMap::new(),
             failures: HashMap::new(),
             counted: BTreeSet::new(),
+            outbox: VecDeque::new(),
             selected: None,
             presence: HashMap::new(),
             typing: HashMap::new(),
@@ -887,6 +981,54 @@ impl AppState {
             .collect();
         pending.sort_unstable();
         pending
+    }
+
+    /// How many of this client's own sends the outbox is holding.
+    ///
+    /// **The number a caller wants before deciding whether a send can be
+    /// queued**, and it is exposed rather than hidden behind a `bool` so a test
+    /// can assert the *count* — a bound that is only observable as a refusal is
+    /// a bound nobody can check has been reached.
+    pub fn outbox_len(&self) -> usize {
+        self.outbox.len()
+    }
+
+    /// Whether the outbox cannot take another send.
+    ///
+    /// A separate accessor rather than a caller's own comparison against
+    /// [`MAX_OUTBOX_ENTRIES`], for the reason [`MAX_TYPING_CHANNELS`]'s two
+    /// constants give: a bound the client re-derives is a bound that can be
+    /// re-derived wrongly, and the failure mode is a queue that grew past the
+    /// number the module documents.
+    pub fn outbox_is_full(&self) -> bool {
+        self.outbox.len() >= MAX_OUTBOX_ENTRIES
+    }
+
+    /// The queued identities, **in enqueue order** — oldest first.
+    ///
+    /// **`Vec<Uuid>` rather than a borrow, and that is the seam's constraint.**
+    /// [`bridge::try_read`](crate::state::bridge::try_read) lends the state to a
+    /// closure whose return type cannot borrow from it, so a read that wants to
+    /// hand the queue to a caller has to copy the identities. The copy is 16 bytes
+    /// per entry and bounded by [`MAX_OUTBOX_ENTRIES`], which is the same trade
+    /// [`pending_sends`](Self::pending_sends) already makes for a larger
+    /// collection.
+    ///
+    /// **The order is the contract, not an incidental consequence of the
+    /// representation.** `PLAN.md` §7 requires the reconnect to flush in enqueue
+    /// order, and this is the accessor that makes that order observable from
+    /// outside the layer.
+    pub fn outbox_ids(&self) -> Vec<Uuid> {
+        self.outbox.iter().copied().collect()
+    }
+
+    /// Whether this identity is queued.
+    ///
+    /// Exposed because the outbox's one invariant — an entry names a held row
+    /// that is still `Pending` or `Failed` — is a cross-structure claim, and a
+    /// test that cannot ask the question cannot check it.
+    pub fn outbox_holds(&self, client_msg_id: &Uuid) -> bool {
+        self.outbox.contains(client_msg_id)
     }
 
     /// How many unread messages a channel has, per the rule in module docs, §5.
@@ -1452,6 +1594,58 @@ impl AppState {
     pub(crate) fn clear_outgoing(&mut self, client_msg_id: &Uuid) {
         self.failures.remove(client_msg_id);
         self.outgoing.remove(client_msg_id);
+    }
+
+    /// Puts one of this client's sends at the **back** of the outbox, or refuses.
+    ///
+    /// **The back, always, and the reason is §7's ordering.** `PLAN.md` §7 says
+    /// the reconnect flushes *"in enqueue order"*, and a retry is a new attempt at
+    /// an old message: putting it at the front would let one repeatedly-retried
+    /// message starve everything queued behind it, and would reorder this
+    /// client's history against every other client's. The decision that a retry
+    /// goes to the back rather than the front is
+    /// [`actions::retry_send`](crate::state::actions::retry_send)'s; this is the
+    /// primitive it uses, and it has no opinion.
+    ///
+    /// **Refused at [`MAX_OUTBOX_ENTRIES`], and the refusal is a value rather
+    /// than a growth.** `VecDeque::push_back` would accept the entry and leave the
+    /// queue one over its own documented bound, which is how a bound stops being
+    /// one. `AGENTS.md` §7.1 forbids the unbounded version and §7 forbids the
+    /// silent one, so the caller has to be told — and
+    /// [`actions::begin_send`](crate::state::actions::begin_send) turns this
+    /// refusal into a `Failed` row with a reason naming the bound.
+    ///
+    /// **Idempotent for an identity already queued**, because a duplicate entry
+    /// would make one message flush twice and would break the invariant the field
+    /// documents. The `contains` is a linear walk of a queue bounded at 1024, on
+    /// the send path and not the frame path.
+    pub(crate) fn enqueue_outbox(&mut self, client_msg_id: Uuid) -> bool {
+        if self.outbox.contains(&client_msg_id) || self.outbox_is_full() {
+            return false;
+        }
+        self.outbox.push_back(client_msg_id);
+        true
+    }
+
+    /// Takes one identity out of the outbox, wherever it sits, and reports whether
+    /// it was there.
+    ///
+    /// **By identity rather than by position, because the three callers are three
+    /// different positions.** An ACK and a terminal failure usually name the head
+    /// or something near it, while a discard can name anything — and `VecDeque`
+    /// removal by index would make each caller responsible for knowing which.
+    ///
+    /// **This is the only door out of the queue, and that is the whole design.**
+    /// An entry leaves when the server acknowledges the send or refuses it
+    /// terminally, and *nowhere else*: a frame that reached the transport's
+    /// outbound queue is still queued, because a successful write means the bytes
+    /// left this process and not that the server stored the row. `state/actions.rs`
+    /// owns which of those two events has happened; this method only performs the
+    /// removal.
+    pub(crate) fn dequeue_outbox(&mut self, client_msg_id: &Uuid) -> bool {
+        let before = self.outbox.len();
+        self.outbox.retain(|queued| queued != client_msg_id);
+        self.outbox.len() != before
     }
 
     pub(crate) fn record_failure(&mut self, client_msg_id: Uuid, failure: SendFailure) {
