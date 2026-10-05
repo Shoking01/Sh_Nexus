@@ -824,3 +824,103 @@ the Phase 1 section draws about the stub: a number that looks like a budget
 figure and cannot test the budget is worse than no number. Work unit 2B has
 since taken the frame-time measurement itself, outside this harness, in §"Measured:
 scroll frame time at 10 000 messages".
+
+#### The end-to-end soak, against a real server, with real acknowledgements
+
+**Every run recorded above drove one optimistic send plus one *injected*
+`DomainEvent::MessageAcked` per cycle: no frame ever reached a socket,
+`WsTransport` never ran, `sh_nexus_server` was never started, and
+`actions::flush_outbox` was never called.** The send path that landed in #43–#47
+therefore had no sustained-load evidence at all, and that gap — not the numbers
+above — is what this section is for.
+
+The harness is `crates/sh_nexus/tests/soak_e2e.rs`, a single `#[ignore]`d
+integration test. It reuses `tests/support/mod.rs::ServerProcess` for the child
+process, the free port, the login and the restart, and drives the production
+doors (`bridge::install`, `bridge::install_transport`, `MessageList::begin_send`)
+while asserting four invariants against `AppState`: the outbox drains to zero
+after an outage, one row per `client_msg_id`, nothing left `Pending` that the
+server acknowledged, and messages composed during an outage arriving in enqueue
+order. It prints `SOAK-PHASE` markers and its own pid so an external sampler can
+slice the series the way every run above was sampled.
+
+##### Measured: 10 minutes, real server, real ACKs
+
+**`x86_64-pc-windows-msvc`, `release`, 2026-10-04. 716 external samples at 500 ms,
+pid 18652. Metric is working set, sampled externally. The harness reported
+`test result: ok. 1 passed ... finished in 364.68s`.**
+
+Run as `SH_NEXUS_SOAK_MINUTES=10 cargo test --release -p sh_nexus --test
+soak_e2e -- --ignored --nocapture`. The `--soak-minutes` flag cannot be passed
+through `libtest`, which rejects unknown options before any test body runs; the
+environment variable is the channel that works, and the harness reads it.
+
+| Phase | elapsed | cycle | what the marker said |
+|---|---|---|---|
+| `startup` | 0 s | 0 | server, real `POST /auth/login`, socket, state, window |
+| `steady` | 0–210 s | 0 → 4201 | sustained send + real ack, `cadence_ms=50` |
+| `offline` | 210 s | 4201 | server stopped, 24 messages composed anyway |
+| `reconnecting` | 213 s | 4201 | server restarted, backoff walked |
+| `flushing` | 214 s | 4201 | `driven=24 refused=0 held=0` |
+| `drained` | 214 s | 4201 | outbox at zero |
+| `idle_after` | 214–364 s | 4201 | 3000 drain passes, no sends |
+
+| Structure | Result | Verdict |
+|---|---|---|
+| cycles | 4201 in 210 s (**1201 cycles/min**) | — |
+| messages composed / acknowledged | 4225 / 4225 | **every send reconciled** |
+| outbox depth at end | **0** | **does not leak** — first evidence for the queue |
+| rows per `client_msg_id` | 4225 identities, 4225 rows | no duplicates under real ACKs |
+| left `Pending` / `Failed` | 0 / 0 | nothing stranded |
+| frames read / sent / delivered | 4295 / 4295 / 4295 | — |
+| frames refused / dropped | 0 / 0 | the main thread never fell behind |
+| transport connects | 2 | the socket was genuinely replaced |
+| retirement on eviction | **0** | **untested — see below** |
+
+**Working set: first 5.87 MB, last 15.84 MB, max 17.38 MB, mean 14.42 MB.** The
+final 60 s split into four consecutive quarters reads **15.84 / 15.84 / 15.84 /
+15.84 MB — zero variance**, so the last third is a plateau and not a climb.
+
+**CPU: 17.44 s in total; the last 61 s cost 1.39 s over 61 s wall = 2.27 % of one
+core.** That window includes `idle_after`, so it is an upper bound on the idle
+figure rather than the idle figure itself.
+
+##### Three things this run does NOT establish
+
+1. **It is not the 30-minute run.** `AGENTS.md` §6.2 asks for idle RAM over 30
+   minutes of active chatting; this is ten. It is evidence the new send path is
+   sound under sustained load, **not** that §6.2's row is satisfied.
+2. **Its working set is not comparable to the 75–76 MB figures above.** Those
+   seeded the channel to `MAX_MESSAGES_PER_CHANNEL` — 10 000 rows — and drove a real
+   renderer. This run held 4225 rows, painted nothing, and `retired=0`, so eviction
+   never fired. **15.84 MB against 75 MB is not an improvement; it is a different
+   measurement.** Setting them side by side would be the error §2.3's "measure,
+   don't guess" is written against.
+3. **Eviction and the retirement path are untested by it.** `retired=0`, because the
+   cap is 10 000 and the run never reached it. The server has no `resync`, so a
+   client cannot fetch history and cannot be seeded to the cap without injecting
+   through the inbox — which is the injection this harness exists to end.
+
+`SH_NEXUS_SOAK_MINUTES=30` on an uninterrupted machine closes item 1.
+
+##### Binary size, re-measured — `PLAN.md` §15 item 7
+
+| | Bytes | MB |
+|---|---|---|
+| Phase 0 baseline | 10 401 792 | 9.92 |
+| Phase 1 recorded | 10 430 464 | 9.95 |
+| **now** | **12 724 224** | **12.13** |
+
+**+2.21 MB (+22.3 %) against the Phase 0 baseline.** `AGENTS.md` §6.3 requires
+justification above 5 MB, so this is under the gate — but a fifth again the binary
+deserves accounting rather than a wave-through.
+
+**Established:** `tracing-subscriber`, added in #45, pulled `regex`,
+`regex-automata`, `matchers`, `nu-ansi-term`, `sharded-slab` and `thread_local`
+into the client graph, none of which were present at 9.95 MB. `regex` arrives
+through the `env-filter` feature.
+
+**Not established:** how much of the 2.21 MB is `regex`. Quantifying it means
+swapping `EnvFilter` for a fixed `Level`, and `sh_nexus_server` uses `EnvFilter`
+too, so it is a two-binary change rather than a measurement. **Not attempted, and
+left as a follow-up rather than guessed at.**
