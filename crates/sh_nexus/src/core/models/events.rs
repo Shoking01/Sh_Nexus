@@ -38,13 +38,23 @@
 //! # The variants, and why there are exactly these
 //!
 //! The set is derived from `PLAN.md` §6's server frames, one variant per frame
-//! plus two that no frame produces. Going from seven frames to eight events, and
+//! plus three that no frame produces. Going from seven frames to eight events, and
 //! then stopping, is the interesting part -- see "What is not here" below.
+//!
+//! # The three that no frame produces
+//!
+//! [`DomainEvent::ConnectionStateChanged`] is produced by the reconnect state
+//! machine from its own state, [`DomainEvent::ResyncRequested`] by the client from
+//! a cursor it already holds, and [`DomainEvent::SendUndelivered`] by
+//! `network/ws.rs` from its own knowledge that a write failed. **All three are
+//! facts about the local process rather than facts a peer sent**, and that is the
+//! common thread: each exists because the client genuinely knows something the
+//! wire cannot tell it. None of them is a server's opinion of the client.
 //!
 //! # What is *not* here, and why
 //!
 //! This is the half of the design that matters. Every variant below has a server
-//! frame that can produce it, and **no** variant exists without one (bar the two
+//! frame that can produce it, and **no** variant exists without one (bar the three
 //! noted above). A variant nothing can construct is not a harmless extension
 //! point: it is a shape that `state/`, the UI and the tests must all handle, a
 //! case every `match` must cover, and a promise that a payload will arrive. Four
@@ -117,6 +127,12 @@ pub enum DomainEvent {
     /// A failed optimistic send is therefore *visible*, which is the difference
     /// between a chat client and a guessing machine: the user can see that their
     /// message did not arrive.
+    ///
+    /// **The counterpart of [`DomainEvent::SendUndelivered`], and the two must not
+    /// be merged.** This one is the server's answer: it refused, so the row is
+    /// `Failed` and the user's next move is a retry. That one is a local write
+    /// that failed: nothing refused anything, so the row stays `Pending` and is
+    /// silently re-driven when the socket returns.
     MessageSendFailed {
         /// The `client_msg_id` of the `message.send` being rejected.
         client_msg_id: Uuid,
@@ -127,6 +143,42 @@ pub enum DomainEvent {
         code: String,
         /// Human-readable detail, shown to the user.
         detail: String,
+    },
+
+    /// A send that never left this process, and is therefore still owed.
+    ///
+    /// Produced by `network/ws.rs` when a `message.send` write fails. **That is a
+    /// fact about the local transport and not about the message at all** — the
+    /// server never refused anything, and never saw the frame; the bytes simply
+    /// did not reach the socket.
+    ///
+    /// **Not [`DomainEvent::MessageSendFailed`], and the difference is the whole
+    /// reason this is a separate variant.** A `message.error` is terminal: the row
+    /// becomes `Failed` and the user gets a badge to retry. A failed write is
+    /// *transient* — the message was never refused, it just never arrived — so a
+    /// `Failed` row would put a red badge on screen for a blip that is about to fix
+    /// itself, and hand the user a retry that is not needed. `PLAN.md` §7's "failures
+    /// are never silently dropped" is about *telling someone*, and there is nobody
+    /// to tell until the reconnection either works or does not.
+    ///
+    /// **What the row does instead is nothing visible.** It stays `Pending`, and
+    /// `state/actions.rs` puts the identity back in the outbox, so the next flush
+    /// drives it once the socket is genuinely back. Re-driving is safe because the
+    /// server dedupes on `client_msg_id` and answers a duplicate with the same
+    /// `message.ack` — a frame that failed mid-write may or may not have been
+    /// stored, and either way the retry terminates and creates no second row.
+    ///
+    /// **Only `message.send` produces this.** A `typing.start` or a `reaction.add`
+    /// that fails to write is *not* owed: both are ephemeral, and re-sending a
+    /// stale typing indicator is worse than losing it. Re-driving is correct only
+    /// for the one frame kind that carries durable, user-authored content.
+    SendUndelivered {
+        /// The `client_msg_id` of the `message.send` whose write failed.
+        ///
+        /// **The optimistic row's own identity, unchanged** — the retry travels
+        /// under the id the server will dedupe on, so it is recognisable as the
+        /// same message rather than a second one.
+        client_msg_id: Uuid,
     },
 
     /// Somebody reacted to a message.
@@ -180,7 +232,7 @@ pub enum DomainEvent {
 
     /// The connection's state changed.
     ///
-    /// The only event with no frame behind it: it is produced by
+    /// One of the three events with no frame behind it: it is produced by
     /// `network/reconnect.rs` from the state of its own state machine, and it is
     /// the one thing the UI must always be able to show, because §3.3 requires
     /// network failures to surface as a recoverable state rather than as silence.

@@ -179,13 +179,30 @@
 //! on the wire for one message. The server drops the second as a duplicate, so
 //! no transcript is harmed — but it is a doubled frame per send, for nothing.
 //!
-//! **The residual hole this leaves, stated rather than hidden.** A send handed to
-//! a *connected* transport whose write later fails is still not re-driven, because
-//! nothing puts it in the queue: `begin_send` runs before the frame is pushed, and
-//! its `offline` flag was already false. **Closing that hole means the composer
-//! must ask the outbox instead of the transport — a `ui/` change, and `ui/` is
-//! not this layer's.** What this unit fixes is the case `PLAN.md` §7 is about: a
-//! send composed *while disconnected*, which previously had no re-drive at all.
+//! **The residual hole a *connected* send leaves is closed by
+//! [`DomainEvent::SendUndelivered`]**, and it was the more likely one. `begin_send`
+//! runs before the frame is pushed and its `offline` flag was already false, so a
+//! send composed while connected was handed straight to the socket and **nothing
+//! put it in the queue** — and when that write failed, `network/ws.rs` returned
+//! with the frame consumed and no re-drive. You are connected, you send, the
+//! network blips: the message is gone and the user is never told.
+//!
+//! The fix reports the failure rather than hoping against it.
+//! `network/ws.rs`'s `write_frame` returning `false` **is** the knowledge, so the
+//! worker turns it into [`DomainEvent::SendUndelivered`] and this module re-queues
+//! it. **The row stays `Pending` and no badge appears** — see
+//! [`requeue_undelivered`] for why that is not `MessageSendFailed`'s treatment.
+//! [`flush_outbox`] is gated on [`AppState::can_send`], and the write failure
+//! returns `Outcome::Established`, which emits `Disconnected` and is followed by
+//! `Reconnecting` — so `can_send()` is false for the whole gap and the 20-tick
+//! flush drives nothing until the socket is genuinely back. **No hot loop, and
+//! not by luck**: it is the gate that was already there, doing the job §7 needs it
+//! to do.
+//!
+//! **What is still not covered, stated rather than implied.** This queue is in
+//! memory, so a client that exits before the connection returns loses what it
+//! held — §7.4. And the retry is not *acknowledged* until the server answers, so a
+//! send re-driven onto a socket that dies again is owed again by the same path.
 //!
 //! ## 7.2 Order, and where a retry goes
 //!
@@ -710,6 +727,8 @@ pub fn apply_event(state: &mut AppState, event: DomainEvent) -> ApplyOutcome {
             code,
             detail,
         } => fail_send(state, client_msg_id, code, detail),
+
+        DomainEvent::SendUndelivered { client_msg_id } => requeue_undelivered(state, client_msg_id),
 
         DomainEvent::ReactionUpdated {
             message_id,
@@ -1419,6 +1438,64 @@ fn fail_send(
     state.dequeue_outbox(&client_msg_id);
     state.record_failure(client_msg_id, SendFailure::new(code, detail));
     state.set_delivery(client_msg_id, channel_id, DeliveryState::Failed);
+    ApplyOutcome::Applied
+}
+
+/// Re-queues a send whose write never reached the socket.
+///
+/// **The other half of [`fail_send`], and the one that makes no visible change at
+/// all.** `fail_send` is the server's answer — terminal, a `Failed` row, a badge —
+/// and this is the local transport's report that nothing refused anything. So
+/// here the row's delivery state is **not touched**: it is already `Pending` from
+/// [`begin_send`], and leaving it `Pending` is the entire difference the user can
+/// see, which is *nothing*. A red badge on a network blip that is about to fix
+/// itself would be a lie told to the user.
+///
+/// **Idempotent, because the outbox is a set per identity rather than a list.**
+/// The transport emits this once per failed write, but the two events it emits
+/// around it — this and the `ConnectionStateChanged` that follows — can be
+/// applied in either order, and a reconnection can produce another attempt before
+/// anything drains. [`AppState::enqueue_outbox`] already refuses a second entry
+/// for one identity, so an already-queued send is accepted rather than reported as
+/// a full queue, which is the same reasoning [`retry_send`] uses.
+///
+/// **Only a `Pending` row is re-queued, and the two refusals are not the same
+/// shape.** A row that is already `Acked` is a row the server already stored: the
+/// write may have failed *after* the bytes left, the ack may have been read
+/// before the failure was observed, and re-driving it would queue an entry for a
+/// message that is already delivered — which is the leak
+/// `assert_internally_consistent`'s third outbox invariant exists to prevent. A
+/// `Failed` row is the user's retry to make, not this function's, and queueing it
+/// would silently resurrect a refusal the user is looking at.
+///
+/// # Errors
+///
+/// None as such. An unknown identity is an [`IgnoreReason::NotHeld`] and a full
+/// queue is an [`IgnoreReason::OutboxFull`]; both leave the queue untouched. See
+/// the module docs, §1.
+fn requeue_undelivered(state: &mut AppState, client_msg_id: Uuid) -> ApplyOutcome {
+    // The held check first, because `delivery` answers `None` for an identity this
+    // client never sent and that must not be reported as a state problem.
+    if state.outgoing_channel(&client_msg_id).is_none() {
+        return ApplyOutcome::Ignored(IgnoreReason::NotHeld { client_msg_id });
+    }
+    if state.delivery(&client_msg_id) != Some(DeliveryState::Pending) {
+        // The obligation is already discharged — by an ack, or by a terminal
+        // `message.error`. Either way the row is not one this client is waiting on,
+        // and the outbox only ever holds those.
+        return ApplyOutcome::Applied;
+    }
+    // **Asked before the delivery state could move, and it does not move here.** An
+    // identity already queued is `Applied`, not `OutboxFull`: `enqueue_outbox`
+    // reports one refusal for both "already there" and "at the bound", and
+    // conflating them here would tell the transport its outbox is full when it is
+    // not.
+    if state.outbox_holds(&client_msg_id) {
+        return ApplyOutcome::Applied;
+    }
+    if !state.enqueue_outbox(client_msg_id) {
+        return ApplyOutcome::Ignored(IgnoreReason::OutboxFull { client_msg_id });
+    }
     ApplyOutcome::Applied
 }
 

@@ -327,12 +327,30 @@ rather than by the code around it:
    `resync` asks for, and a replay moving it would make a client that resumed from
    it skip the message the replay was about.
 
+**Property 1 is what makes a lost write recoverable, and it is worth stating from
+the server's side.** A client that cannot distinguish "my frame never left" from
+"my frame arrived and the answer was lost" must re-drive, or the send is lost
+forever. Re-driving under the *same* `client_msg_id` is safe: a frame that was
+never stored is stored by the retry, and a frame that was stored is answered as a
+duplicate — **so the retry always terminates, and neither case duplicates the
+message.** Only `message.send` is re-driven this way; `typing.start`,
+`typing.stop` and `reaction.add` are hints a peer is better off without, and
+re-sending a stale typing indicator is worse than losing it.
+
 ### 2.3 Refusals
 
 Every rejection is a `message.error` carrying a machine-readable `code` and a
 human-readable `detail`, and the connection **stays open** — `PLAN.md` §7 is
 explicit that failures are never silently dropped, and the client's boundary turns
 `message.error` into `DeliveryState::Failed` with the row still visible for retry.
+
+**A failed *write* is not a refusal, and the client must not treat it as one.** A
+`message.error` is the server's answer: terminal, and the user's next move is a
+retry. A write that never reached the socket is a local fact — the server never saw
+the frame and never refused anything — so the client keeps the row `Pending` and
+re-drives it when the socket returns, per §2.2's first property. Marking a transient
+blip `Failed` would put a badge in front of the user for a failure that is about to
+fix itself, and hand them a retry that is not needed.
 
 | `code` | `detail` | Cause |
 |---|---|---|

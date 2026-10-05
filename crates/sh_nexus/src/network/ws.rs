@@ -1706,12 +1706,40 @@ impl Session {
                     None => return Outcome::Stopped,
                     Some(item) => {
                         let (id, frame, remember) = split_outbound(item);
+                        // **Asked before the write, because the write consumes the
+                        // frame.** `write_frame` takes `ClientFrame` by value, so a
+                        // question asked afterwards would have no subject left to ask
+                        // about.
+                        let owed = is_owed_on_failed_write(&frame);
                         if remember {
                             if let ClientFrame::Resync { channel_id, after } = &frame {
                                 cursors.insert(channel_id.clone(), *after);
                             }
                         }
                         if !write_frame(&mut socket, id, frame, counters).await {
+                            // **The frame was consumed by the failed write and this
+                            // loop is about to return, so nothing will ever drive it
+                            // again.** `return Outcome::Established` alone is the
+                            // silent loss this reports.
+                            //
+                            // **`SendUndelivered` is emitted *before* the connection
+                            // state changes, and the order is incidental rather than
+                            // load-bearing** — either order is safe, and stating the
+                            // reason here is what stops a future reader from
+                            // depending on it. `actions` re-queues idempotently
+                            // (`AppState::enqueue_outbox` is a set per identity), so
+                            // a duplicate is a no-op rather than a second entry; and
+                            // `actions::flush_outbox` is gated on `can_send()`, which
+                            // is false across this whole gap, so neither event's
+                            // arrival can drive the frame before the socket is
+                            // genuinely back.
+                            if owed {
+                                emit_event(
+                                    events,
+                                    counters,
+                                    DomainEvent::SendUndelivered { client_msg_id: id },
+                                );
+                            }
                             return Outcome::Established;
                         }
                     }
@@ -1744,14 +1772,68 @@ impl Session {
     /// A refused *connection state* is counted in the same place as a refused
     /// message event, deliberately: both mean the main thread is not keeping up
     /// with this socket, and a UI that watched only one of them would see a
-    /// healthy client in one case and a healthy network in the other.
+    /// healthy client in one case and a healthy network in the other. That is
+    /// [`emit_event`], and this is it with the state chosen.
     fn emit_connection(&self, state: ConnectionState) {
-        let outcome = self
-            .events
-            .deliver(DomainEvent::ConnectionStateChanged(state));
-        if matches!(outcome, Delivery::Refused(_)) {
-            Counters::bump(&self.counters.events_refused);
-        }
+        emit_event(
+            &self.events,
+            &self.counters,
+            DomainEvent::ConnectionStateChanged(state),
+        );
+    }
+}
+
+/// Whether a frame is owed a re-drive when its write fails.
+///
+/// **This is the rule that keeps a transient blip from turning into message loss,
+/// and it is deliberately narrower than "every frame".** Only `message.send`
+/// carries durable, user-authored content, so only `message.send` is worth
+/// re-sending. A `typing.start` that fails to write is *not* owed: the indicator
+/// is advisory, the server's inactivity timeout is the backstop, and re-sending a
+/// stale `true` would show a typist who stopped typing. A `reaction.add` that
+/// fails to write is not owed either — it is an increment the user can see did not
+/// stick, and re-driving it silently would undo a later deliberate removal.
+///
+/// **A function rather than an inline `matches!`, for one reason: it is the whole
+/// content of this unit's policy, and a policy worth stating is a policy worth
+/// asserting.** Every other pure decision in this module is a free function with a
+/// doctest — `keepalive_action`, `classify_frame_error`, `is_unauthorized`,
+/// `backoff_delay` — and the reason is the same each time: a decision the worker
+/// makes on a socket is not observable from outside the socket, so making it
+/// reachable is the only way a test can pin it.
+///
+/// # Example
+///
+/// ```
+/// use sh_nexus::network::ws::is_owed_on_failed_write;
+/// use sh_nexus_wire::frame::ClientFrame;
+///
+/// assert!(is_owed_on_failed_write(
+///     &ClientFrame::MessageSend {
+///         channel_id: "c_general".to_owned(),
+///         content: "hi".to_owned(),
+///     }
+/// ));
+/// assert!(!is_owed_on_failed_write(&ClientFrame::TypingStart {
+///     channel_id: "c_general".to_owned()
+/// }));
+/// ```
+pub fn is_owed_on_failed_write(frame: &ClientFrame) -> bool {
+    matches!(frame, ClientFrame::MessageSend { .. })
+}
+
+/// Delivers one event and counts a refusal.
+///
+/// **A function rather than a method, because the read loop holds disjoint borrows
+/// of the [`Session`]'s fields and needs it** — `split_outbound` is a function for
+/// the same reason. [`Session::emit_connection`] is this with a
+/// [`ConnectionState`] already chosen, and a refused *connection state* is counted
+/// in the same place as a refused message event deliberately: both mean the main
+/// thread is not keeping up with this socket, and a UI that watched only one of
+/// them would see a healthy client in one case and a healthy network in the other.
+fn emit_event(events: &EventSender, counters: &Counters, event: DomainEvent) {
+    if matches!(events.deliver(event), Delivery::Refused(_)) {
+        Counters::bump(&counters.events_refused);
     }
 }
 
