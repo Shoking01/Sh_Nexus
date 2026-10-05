@@ -21,6 +21,7 @@
 //! | [`a_shut_down_transport_refuses_further_frames`] | `AGENTS.md` §2.1, and §7.5 through `Debug` |
 //! | [`the_suites_socket_path_is_the_servers_own_constant`] | the duplication `tests/support/mod.rs` admits to is watched |
 //! | [`the_shell_s_channel_is_one_the_server_accepts`] | the one duplicated constant that a behavioural test can watch, in place of a third copy of the literal |
+//! | [`only_a_message_send_is_owed_when_its_write_fails`] | §7's outbox is owed durable content and **only** durable content; a registry guard over `FrameKind::CLIENT` |
 //!
 //! # Why the server is a child process
 //!
@@ -57,11 +58,12 @@ use sh_nexus::app::STARTUP_CHANNEL;
 use sh_nexus::core::models::events::{ConnectionState, DomainEvent};
 use sh_nexus::core::models::user::UserStatus;
 use sh_nexus::network::ws::{
-    backoff_window, TransportConfig, TransportError, TransportStats, WsTransport,
+    backoff_window, is_owed_on_failed_write, TransportConfig, TransportError, TransportStats,
+    WsTransport,
 };
 use sh_nexus::state::bridge::{self, Delivery, DeliveryRefusal, DrainReport, EventSender};
 use sh_nexus::state::{bridge::MAX_PENDING_EVENTS, SendOutcome};
-use sh_nexus_wire::frame::{ClientEnvelope, ClientFrame, ServerFrame};
+use sh_nexus_wire::frame::{ClientEnvelope, ClientFrame, FrameKind, ServerFrame};
 use sh_nexus_wire::version::{PROTOCOL_VERSION, UNSUPPORTED_VERSION_CODE};
 use sh_nexus_wire::WireError;
 use tokio_tungstenite::connect_async;
@@ -1349,5 +1351,100 @@ fn a_refused_version_reduces_to_a_line_without_the_peers_payload() {
     assert!(
         !line.contains(BODY),
         "the reduced line must not carry a payload: {line}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Which frame is owed when its write fails
+// ---------------------------------------------------------------------------
+
+/// One representative of every client frame kind.
+///
+/// **A function rather than five literals in the test, because it is the *whole*
+/// enumeration.** `FrameKind::CLIENT` is the protocol's own closed list, and the
+/// test below walks it and asks [`is_owed_on_failed_write`] about each entry — so a
+/// sixth client frame kind is a compile error here and a decision somebody has to
+/// make, rather than a variant that quietly joins the "not owed" side because
+/// nobody re-read the filter.
+fn one_of_every(kind: FrameKind) -> ClientFrame {
+    match kind {
+        FrameKind::MessageSend => ClientFrame::MessageSend {
+            channel_id: CHANNEL.to_owned(),
+            content: BODY.to_owned(),
+        },
+        FrameKind::ReactionAdd => ClientFrame::ReactionAdd {
+            message_id: "m_1".to_owned(),
+            emoji: "\u{1F44D}".to_owned(),
+        },
+        FrameKind::TypingStart => ClientFrame::TypingStart {
+            channel_id: CHANNEL.to_owned(),
+        },
+        FrameKind::TypingStop => ClientFrame::TypingStop {
+            channel_id: CHANNEL.to_owned(),
+        },
+        FrameKind::Resync => ClientFrame::Resync {
+            channel_id: CHANNEL.to_owned(),
+            after: sh_nexus::network::ws::epoch_cursor(),
+        },
+        // Server-to-server kinds are not constructible as a client frame, and
+        // naming them makes that a compile error rather than a silent skip.
+        other => panic!("{other:?} is not a client frame kind"),
+    }
+}
+
+/// **Exactly `message.send` is owed a re-drive when its write fails — and every
+/// other client frame is not.**
+///
+/// **The asymmetry is the design, so it is asserted one frame at a time rather
+/// than as "the set is `{MessageSend}`".** A `typing.start` that failed to write
+/// is *not* owed: the indicator is advisory, the server's inactivity timeout is the
+/// backstop, and re-sending a stale `true` shows a typist who stopped typing — a
+/// *worse* failure than the one being repaired. A `reaction.add` is not owed
+/// either: it is an increment the user can see did not stick, and re-driving it
+/// silently would undo a later deliberate removal. A `resync` is not owed because
+/// the cursor is remembered and replayed on the next connect regardless, so a
+/// failed one has already been scheduled.
+///
+/// **What is owed is the one frame carrying durable, user-authored content** —
+/// the only frame whose loss is a lost message rather than a lost hint.
+///
+/// **This is the whole of the filter, and it is reachable because it is a `pub
+/// fn`.** A decision the worker makes on a socket is otherwise unobservable from
+/// outside the socket, which is the reason every other pure decision in `ws.rs`
+/// (`keepalive_action`, `classify_frame_error`, `is_unauthorized`, `backoff_delay`)
+/// is shaped the same way.
+#[test]
+fn only_a_message_send_is_owed_when_its_write_fails() {
+    let owed: Vec<FrameKind> = FrameKind::CLIENT
+        .iter()
+        .copied()
+        .filter(|kind| is_owed_on_failed_write(&one_of_every(*kind)))
+        .collect();
+
+    assert_eq!(
+        owed,
+        vec![FrameKind::MessageSend],
+        "the owed set is the frames whose loss is a lost message. `typing.start`, \
+         `typing.stop` and `reaction.add` are hints the peer is better off without, \
+         and `resync` is replayed from the remembered cursor on the next connect."
+    );
+
+    // **Named individually as well, so a failure says which frame changed its mind**
+    // rather than printing two vectors and leaving the reader to diff them.
+    for kind in [
+        FrameKind::TypingStart,
+        FrameKind::TypingStop,
+        FrameKind::ReactionAdd,
+    ] {
+        assert!(
+            !is_owed_on_failed_write(&one_of_every(kind)),
+            "{kind:?} must not be owed: re-sending a stale ephemeral frame is worse \
+             than losing it, which is why only `message.send` is"
+        );
+    }
+    assert!(
+        !is_owed_on_failed_write(&one_of_every(FrameKind::Resync)),
+        "`resync` must not be owed: `WsTransport::request_resync` remembers the \
+         cursor and replays it on every connect, so a failed one is already scheduled"
     );
 }

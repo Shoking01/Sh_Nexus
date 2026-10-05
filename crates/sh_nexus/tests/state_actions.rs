@@ -32,6 +32,9 @@
 //! | A retry re-queues at the back | `a_retry_requeues_at_the_back_and_leaves_on_an_ack_or_a_failure`, `a_retry_at_a_full_queue_is_refused_and_the_row_stays_failed` | hand-written, three-entry queue |
 //! | A queued send never outlives its row | `a_discard_retires_nothing_because_a_failed_send_is_never_queued`, `a_queued_send_at_the_head_is_never_the_row_eviction_takes` | hand-written, through the discard and through eviction |
 //! | A resync echo retires the entry too | `a_resync_echo_of_a_queued_send_retires_its_entry` | hand-written; the third door, and the one the proptest found missing |
+//! | A **connected** send whose write fails is owed again, and still arrives | `a_connected_send_whose_write_fails_is_owed_again_and_still_arrives` | hand-written; the residual hole §7.1 used to name as open |
+//! | It is not re-driven while the connection cannot carry it | `an_owed_send_is_not_re_driven_while_the_connection_cannot_carry_it` | `#[rstest]`, five states, twenty flushes each |
+//! | Only the frames carrying durable content are owed | `only_a_message_send_is_owed_when_its_write_fails` in `tests/ws_transport.rs` | hand-written, over `FrameKind::CLIENT` |
 //! | Every queue entry names a held, awaited row | inside `assert_internally_consistent` | **proptest**, checked after *every* step |
 //!
 //! # The two properties, and why they are two tests
@@ -4344,6 +4347,447 @@ fn a_queued_send_at_the_head_is_never_the_row_eviction_takes() {
     );
 }
 
+/// **A send handed to a *connected* transport whose write then fails is owed, and
+/// it arrives** — the more likely loss case, and the one that was open.
+///
+/// `only_an_offline_send_is_queued` above is the pin that recorded the hole: a
+/// connected send is handed straight to the socket, so `begin_send` queues
+/// nothing, and a failed write consumed the frame with nothing behind it. The
+/// shape of the fix is that the transport reports the failure
+/// ([`DomainEvent::SendUndelivered`]) and this layer re-queues it, so the frame is
+/// produced again the moment a socket can carry it.
+///
+/// **Every step is a different claim, and the last one is the point of the whole
+/// unit**: the row stays on screen, stays `Pending`, and carries **no** failure
+/// reason — so the user sees nothing at all. `MessageSendFailed` would satisfy
+/// every other assertion here and fail that one, which is why the transport does
+/// not produce it.
+#[test]
+fn a_connected_send_whose_write_fails_is_owed_again_and_still_arrives() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Connected),
+    );
+
+    // **Composed while connected**, which is the whole difference from every other
+    // test in this section: `begin_send` sees `can_send()` and queues nothing.
+    let mine = cid(1);
+    assert_eq!(
+        begin_send(&mut state, "c_0", "written while connected", mine, at(0)),
+        SendOutcome::Pending {
+            client_msg_id: mine,
+            offline: false,
+        },
+        "the composer is told nothing is queued, because at this instant nothing is"
+    );
+    assert_eq!(state.outbox_len(), 0, "and the queue agrees");
+
+    // The transport's report: the write failed.
+    assert_eq!(
+        apply_event(
+            &mut state,
+            DomainEvent::SendUndelivered {
+                client_msg_id: mine
+            }
+        ),
+        ApplyOutcome::Applied,
+        "an owed send is re-queued rather than refused"
+    );
+
+    // **What the user sees, which is nothing.**
+    assert_eq!(
+        state.delivery(&mine),
+        Some(DeliveryState::Pending),
+        "the row is still `Pending`: nothing refused it, so nothing failed"
+    );
+    assert!(
+        state.failure(&mine).is_none(),
+        "and carries no failure reason, so no badge is drawn. A red badge on a \
+         network blip that is about to fix itself would be a lie."
+    );
+    assert_eq!(
+        state.message_count("c_0"),
+        1,
+        "and it never left the screen"
+    );
+
+    // The connection comes back, and the flush produces the frame again -- under the
+    // *same* identity, which is what the server dedupes on.
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Connected),
+    );
+    let driven = flush_outbox(&state);
+    assert_eq!(driven.len(), 1, "the owed send is put on the wire again");
+    assert_eq!(
+        driven[0].client_msg_id(),
+        mine,
+        "under the identity it already had"
+    );
+    assert_eq!(driven[0].channel_id(), "c_0");
+    assert_eq!(
+        driven[0].content(),
+        "written while connected",
+        "with the body the user authored, read from the held row"
+    );
+
+    // The server answers, and the row is reconciled and the entry retired.
+    fire(
+        &mut state,
+        DomainEvent::MessageAcked {
+            client_msg_id: mine,
+            message: stored("m_1", 1, "c_0", "u_me", "written while connected", 0),
+        },
+    );
+    assert_eq!(
+        state.delivery(&mine),
+        Some(DeliveryState::Acked),
+        "the message arrived, exactly once"
+    );
+    assert_eq!(
+        state.outbox_len(),
+        0,
+        "and the entry retired through the ack door"
+    );
+    assert_eq!(
+        state
+            .messages("c_0")
+            .iter()
+            .filter(|held| held.client_msg_id == mine)
+            .count(),
+        1,
+        "a re-driven send that the server dedupes is still one row"
+    );
+}
+
+/// **The owed send is driven only when the connection can carry it** — which is
+/// the answer to the one fear this design invites: a 20-tick-per-second flush
+/// hammering a doomed frame.
+///
+/// **The twenty ticks are the test, not decoration.** `bridge.rs` calls
+/// `actions::flush_outbox` every tick, so the question is not whether the gate
+/// exists but whether a caller can get twenty frames out of a queue it should not
+/// have been driven from. Each of those calls must produce nothing, and the queue
+/// must be the same length afterwards — a flush that dequeued without driving, or
+/// drove without dequeuing, would show up as a length change.
+///
+/// **Every state the reconnect loop can be in is walked, in the order the loop
+/// emits them.** `network/ws.rs` reports `SendUndelivered`, then `Disconnected`,
+/// then `Reconnecting { attempt }` on each pass, then `Connected` — so the states
+/// are applied in exactly that sequence rather than chosen independently, because
+/// "safe in either order" is only a claim if it holds in both. **All five gapped
+/// states are cases, not the one that matters most**, and that is the
+/// `IgnoreReason` registry's lesson applied here: a hand-maintained case list is
+/// not self-verifying, so a `ConnectionState` that *could* send and was not
+/// exercised would be a state nobody checked.
+#[rstest]
+#[case(ConnectionState::Connecting)]
+#[case(ConnectionState::Reconnecting { attempt: 1 })]
+#[case(ConnectionState::Reconnecting { attempt: 7 })]
+#[case(ConnectionState::Disconnected)]
+#[case(ConnectionState::Rejected {
+    code: "version".to_owned(),
+    detail: "v2".to_owned()
+})]
+fn an_owed_send_is_not_re_driven_while_the_connection_cannot_carry_it(
+    #[case] gap: ConnectionState,
+) {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Connected),
+    );
+
+    let mine = cid(1);
+    begin_send(&mut state, "c_0", "owed", mine, at(0));
+    fire(
+        &mut state,
+        DomainEvent::SendUndelivered {
+            client_msg_id: mine,
+        },
+    );
+
+    // **The whole of the reconnect loop, in the order `network/ws.rs` emits it.**
+    for connection in [ConnectionState::Disconnected, gap] {
+        fire(
+            &mut state,
+            DomainEvent::ConnectionStateChanged(connection.clone()),
+        );
+
+        for tick in 0..20 {
+            assert!(
+                flush_outbox(&state).is_empty(),
+                "a flush during {connection:?} produced a frame on tick {tick}. \
+                 `can_send()` is false in this state, and that gate is the only \
+                 thing standing between a doomed frame and twenty frames a second."
+            );
+            assert_eq!(
+                state.outbox_len(),
+                1,
+                "and the queue is untouched: a flush that resolved an entry without \
+                 driving it has lost the send"
+            );
+            assert!(
+                !state.can_send(),
+                "{connection:?} must not report that it can send, or the gate above \
+                 is asserting something false"
+            );
+        }
+    }
+
+    // The socket is genuinely back, and the queue is finally driven -- once, and
+    // the entry is still there for the server's answer.
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Connected),
+    );
+    assert_eq!(
+        flush_outbox(&state).len(),
+        1,
+        "and now it is driven, which is what makes the gate a gate rather than a \
+         permanent refusal"
+    );
+    assert_eq!(
+        state.outbox_len(),
+        1,
+        "still queued until the server answers"
+    );
+}
+
+/// **Two reports of the same owed send produce one entry** — the queue is a set per
+/// identity, and the two events the transport emits around this one can be
+/// applied in either order.
+///
+/// `actions.rs`'s module docs claim idempotence rather than assume it, so it is
+/// asserted twice: once for two identical events, and once with the connection
+/// state the transport emits *between* them, because a reconnection that produced
+/// another attempt before anything drained is the realistic source of the second.
+#[test]
+fn an_owed_send_is_queued_once_however_often_it_is_reported() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Connected),
+    );
+
+    let mine = cid(1);
+    begin_send(&mut state, "c_0", "owed", mine, at(0));
+
+    for round in 0..3 {
+        assert_eq!(
+            apply_event(
+                &mut state,
+                DomainEvent::SendUndelivered {
+                    client_msg_id: mine
+                }
+            ),
+            ApplyOutcome::Applied,
+            "report {round} is applied, not refused as a full queue -- an identity \
+             already queued is what a repeated report looks like"
+        );
+        fire(
+            &mut state,
+            DomainEvent::ConnectionStateChanged(ConnectionState::Reconnecting { attempt: 1 }),
+        );
+        assert_eq!(
+            state.outbox_ids(),
+            vec![mine],
+            "three reports and one entry: a queue holding one identity twice puts \
+             one message on the wire twice per flush forever"
+        );
+    }
+}
+
+/// **An owed send whose row the server has already answered is not owed again.**
+///
+/// **This is the case the transport cannot prevent and only the order can produce.**
+/// A write that fails after its bytes have already left is indistinguishable from
+/// one that failed before, so the frame may have been stored; and the `ack` can
+/// be read *before* the failure is observed, because the read and the write are
+/// branches of the same `select!`. So `MessageAcked` can be applied before
+/// `SendUndelivered`, and the row is `Acked` by the time the second arrives.
+///
+/// **Re-queuing here would be the leak, not the repair.** The third invariant in
+/// `assert_internally_consistent` requires every queue entry to name a row this
+/// client is *still waiting on*, and an entry on a stored row is re-driven on
+/// every reconnect forever.
+#[test]
+fn a_send_the_server_already_answered_is_not_owed_again() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Connected),
+    );
+
+    let stored_first = cid(1);
+    begin_send(
+        &mut state,
+        "c_0",
+        "stored despite the failed write",
+        stored_first,
+        at(0),
+    );
+    fire(
+        &mut state,
+        DomainEvent::MessageAcked {
+            client_msg_id: stored_first,
+            message: stored(
+                "m_1",
+                1,
+                "c_0",
+                "u_me",
+                "stored despite the failed write",
+                0,
+            ),
+        },
+    );
+    fire(
+        &mut state,
+        DomainEvent::SendUndelivered {
+            client_msg_id: stored_first,
+        },
+    );
+
+    assert_eq!(
+        state.outbox_len(),
+        0,
+        "the server already has it, so there is nothing to owe: an entry here would \
+         be re-driven on every reconnect for a message that is already stored"
+    );
+    assert_eq!(
+        state.delivery(&stored_first),
+        Some(DeliveryState::Acked),
+        "and the server's answer stands -- a local write failure does not undo it"
+    );
+
+    // **The terminal refusal is the same shape and the same answer.** A
+    // `message.error` for this identity and a `SendUndelivered` for it cannot both
+    // come from one write -- only one branch of the `select!` runs per pass -- but
+    // the refusal may have been for the frame the *previous* pass wrote, and a
+    // queue entry on a `Failed` row would resurrect a refusal the user is looking
+    // at. `retry_send` is that user's gesture, and this is not it.
+    let refused = cid(2);
+    begin_send(
+        &mut state,
+        "c_0",
+        "refused after the failed write",
+        refused,
+        at(1),
+    );
+    fire(
+        &mut state,
+        DomainEvent::MessageSendFailed {
+            client_msg_id: refused,
+            code: "server.refused".to_owned(),
+            detail: String::new(),
+        },
+    );
+    fire(
+        &mut state,
+        DomainEvent::SendUndelivered {
+            client_msg_id: refused,
+        },
+    );
+
+    assert_eq!(state.outbox_len(), 0, "a terminal refusal is not re-queued");
+    assert_eq!(
+        state.delivery(&refused),
+        Some(DeliveryState::Failed),
+        "and the badge the user can act on stays"
+    );
+    assert_eq!(
+        state.message_count("c_0"),
+        2,
+        "both rows are still on screen"
+    );
+}
+
+/// **An owed send for an identity this client never sent is refused, and an owed
+/// send at the queue's bound is refused too** — both leaving the queue untouched.
+///
+/// Two refusals rather than one test each because they are the same line of the
+/// same function and the interesting assertion is the same: **neither invented an
+/// entry**. A re-queue for an unknown identity would be an entry naming nothing,
+/// which `flush_outbox`'s `?` would then silently skip forever.
+#[test]
+fn an_owed_send_this_client_does_not_hold_is_refused() {
+    let mut state = AppState::new("u_me");
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+
+    let never_sent = cid(7);
+    assert_eq!(
+        apply_event(
+            &mut state,
+            DomainEvent::SendUndelivered {
+                client_msg_id: never_sent
+            }
+        ),
+        ApplyOutcome::Ignored(IgnoreReason::NotHeld {
+            client_msg_id: never_sent
+        }),
+        "an identity this client never sent has no row to keep `Pending` and \
+         nothing to re-drive"
+    );
+    assert_eq!(state.outbox_len(), 0, "and nothing was queued for it");
+
+    // **At the bound**, a real send is reported owed and the queue refuses it.
+    // Driven by composing offline sends, which is the only way to fill the queue,
+    // and the refusal is asserted rather than inferred from the count.
+    set_channels(&mut state, vec![channel("c_0", "channel-0")]);
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Disconnected),
+    );
+    let mut held = Vec::new();
+    for index in 0..MAX_OUTBOX_ENTRIES {
+        let identity = cid(u128::try_from(index).expect("far below u128::MAX") + 1_000);
+        held.push(identity);
+        begin_send(&mut state, "c_0", "queued", identity, at(0));
+    }
+    assert_eq!(
+        state.outbox_len(),
+        MAX_OUTBOX_ENTRIES,
+        "the queue is at its bound, filled with real sends"
+    );
+
+    // A send composed while connected is *not* queued, so this one is held and
+    // waiting: it is exactly the case the bound has to refuse.
+    let overflow = cid(9_000);
+    fire(
+        &mut state,
+        DomainEvent::ConnectionStateChanged(ConnectionState::Connected),
+    );
+    begin_send(&mut state, "c_0", "owed, at a full queue", overflow, at(0));
+    assert_eq!(
+        apply_event(
+            &mut state,
+            DomainEvent::SendUndelivered {
+                client_msg_id: overflow
+            }
+        ),
+        ApplyOutcome::Ignored(IgnoreReason::OutboxFull {
+            client_msg_id: overflow
+        }),
+        "the bound refuses rather than dropping, and it names the bound"
+    );
+    assert_eq!(
+        state.outbox_len(),
+        MAX_OUTBOX_ENTRIES,
+        "so the queue is exactly as it was: the refused send was not admitted and \
+         nothing already queued was taken"
+    );
+    assert_eq!(
+        state.outbox_ids().first(),
+        held.first(),
+        "and what is queued is still the send that was queued first"
+    );
+}
+
 /// The universe the generated sequences draw from.
 ///
 /// **Small enough to reason about and to enumerate, wide enough to hit every
@@ -4438,6 +4882,11 @@ enum Step {
     Resync {
         channel: u8,
         second: i64,
+    },
+    /// A write that failed on the way out, for an identity this sequence may or
+    /// may not hold.
+    Undelivered {
+        client: u8,
     },
 }
 
@@ -4594,6 +5043,18 @@ fn perform(state: &mut AppState, step: &Step) -> ApplyOutcome {
             DomainEvent::ResyncRequested {
                 channel_id: universe::channel(*channel),
                 after: at(*second),
+            },
+        ),
+        // **In the whole alphabet and not the modellable one**, because it is the
+        // step that *moves a row into* the queue and the third outbox invariant
+        // ("every entry names a held row that is `Pending`") can only be reached
+        // through it. A `Send` composed while `Connected` is never queued, and
+        // `Step::Connection` can put the client in any state, so only this is a
+        // path into the queue that does not go through `begin_send`'s offline flag.
+        Step::Undelivered { client } => apply_event(
+            state,
+            DomainEvent::SendUndelivered {
+                client_msg_id: cid(u128::from(*client)),
             },
         ),
     }
@@ -4878,6 +5339,7 @@ fn any_step() -> impl Strategy<Value = Step> {
             .prop_map(|(channel, author, active)| Step::Typing { channel, author, active }),
         1 => (0u8..4u8).prop_map(|attempt| Step::Connection { attempt }),
         1 => (channel, second).prop_map(|(channel, second)| Step::Resync { channel, second }),
+        2 => identity.prop_map(|client| Step::Undelivered { client }),
     ]
 }
 
@@ -5109,6 +5571,13 @@ impl UnreadModel {
                 }
                 Step::Reaction { .. } | Step::Typing { .. } | Step::Connection { .. } => {}
                 Step::Resync { .. } => {}
+                // **Inert for the model, and the model's alphabet excludes it anyway.**
+                // A re-queue moves a row between "queued" and "not queued" and
+                // changes neither what is held nor what is counted -- the same
+                // argument that excludes `retry_send`. It is listed so the arm is
+                // explicit rather than a wildcard, because a wildcard here would
+                // silently absorb the next step somebody adds.
+                Step::Undelivered { .. } => {}
             }
         }
     }
