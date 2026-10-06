@@ -1,0 +1,36 @@
+# CodeQL configuration
+#
+# GitHub's *default setup* runs CodeQL for this repository. It reads this file, which
+# means the query policy is versioned, reviewable, and diffable in a pull request
+# rather than living invisibly in repository settings.
+#
+# ## Why `rust/hard-coded-cryptographic-value` is excluded from test paths
+#
+# The rule is correct and it is being switched off only where it cannot mean
+# anything. A hard-coded credential in a **test fixture** is not a leaked secret:
+# these are the passwords an authentication test *must* be able to present in order
+# to assert on what happens when a password is right and when it is wrong.
+# `crates/sh_nexus_server/tests/auth.rs` passes literals such as
+# `"a-long-enough-passphrase"` and `"a-correct-passphrase"` straight to
+# `auth::hash_password`, and there is no stronger form available: a hash the test
+# cannot compute against proves nothing.
+#
+# **The cost of leaving it on was not 22 red alerts. It was that this repository
+# stopped looking.** `main` carried 22 open alerts of exactly this class, none of
+# them triaged, and when PR #49 introduced a finding, its real annotation was buried
+# behind a false positive that had been sitting there since the server landed. A
+# scanner that reports a test fixture as a leaked credential trains its readers to
+# ignore it, and the next finding goes unread too.
+#
+# **What is *not* excluded.** The rule still applies to every non-test path, so a
+# hard-coded secret in `crates/*/src/**` is reported exactly as before. Only the
+# paths where a literal is the point are filtered. Nothing about the server's own
+# security posture changes.
+
+name: "Sh_Nexus CodeQL config"
+
+query-filters:
+  - exclude:
+      id: rust/hard-coded-cryptographic-value
+      paths:
+        - "**/tests/**"
