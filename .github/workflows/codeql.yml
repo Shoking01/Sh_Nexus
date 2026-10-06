@@ -1,0 +1,94 @@
+name: CodeQL
+
+# The *advanced* CodeQL setup, replacing the default one this repository used
+# until PR #49. The reason is narrow and specific, and it is worth stating plainly
+# rather than leaving as "we changed the scanner".
+#
+# ## Why the default setup had to go
+#
+# `.github/codeql-config.yml` excludes `rust/hard-coded-cryptographic-value` from
+# `**/tests/**`, with the reasoning recorded in that file. **The default setup did
+# not honour it.** That file sat on `main`, correctly formatted and correctly
+# scoped, and CodeQL went on reporting a hard-coded credential in
+# `crates/sh_nexus_server/tests/support/mod.rs` — at `critical` security severity,
+# as a "new alert in code changed by this pull request".
+#
+# The finding is a false positive. It is a *test fixture* password: an
+# authentication test must be able to present a known password to assert both the
+# accepted and the rejected case, and a hash the test cannot compute against proves
+# nothing. The finding also was not dismissible, because CodeQL never persisted it
+# as an alert -- it existed only as an annotation on the check run.
+#
+# So the default setup offered three things and delivered none of them: a policy
+# that could not be configured, a finding that could not be dismissed, and a red
+# check that could not be cleared by any change to the code being scanned. The
+# advanced setup applies `config-file` reliably, which is the only reason to move.
+#
+# ## What does NOT change
+#
+# The rule still applies to every non-test path. A hard-coded secret in
+# `crates/*/src/**` is reported exactly as it was before. Only the paths where a
+# literal is the point are filtered, and that judgement is written down where a
+# reviewer will meet it.
+#
+# Both languages the default setup analysed are kept: `rust` and `actions`. Losing
+# either would be a quieter regression than the false positive ever was.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, on a delay after the hour so this does not queue behind the busiest
+    # minute of the week. The default setup did this too, and dropping it would mean
+    # a vulnerability introduced by a dependency bump sat unseen until the next
+    # push to main.
+    - cron: '37 5 * * 3'
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # The advanced setup does not get this implicitly, unlike the default one.
+  # Without it the analysis runs, finds everything, and then cannot upload a single
+  # result -- which looks exactly like a clean scan.
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    # `ubuntu-latest`, not `windows-latest` as `ci.yml` uses. CodeQL reads source;
+    # it does not build or run the project, so the Windows runner that GPUI needs
+    # buys nothing here and costs several times as much per minute.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, actions]
+
+    steps:
+      - name: Check out
+        # v5, not v4: v4 targets Node 20, which GitHub is force-running on Node 24
+        # and warning about. v5 is the release that moved to Node 24. `ci.yml` still
+        # pins v4 and still draws the warning -- fixing that is its own change, not
+        # this one's business.
+        uses: actions/checkout@v5
+
+      - name: Initialize CodeQL
+        # v4, and not a choice. v3 is deprecated in December 2026 and v4 is the only
+        # major tag the project publishes, so this is the current release rather than
+        # an upgrade.
+        uses: github/codeql-action/init@v4
+        with:
+          # The whole reason this workflow exists. The default setup ignored it.
+          config-file: ./.github/codeql-config.yml
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}

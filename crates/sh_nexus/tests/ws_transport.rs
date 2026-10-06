@@ -16,6 +16,10 @@
 //! | [`two_transports_exchange_a_message_through_one_real_server`] | §8.1's Real-time Flow, with two clients and two inboxes |
 //! | [`a_full_inbox_refuses_the_arriving_event_rather_than_growing`] | §7.1's bound, end to end |
 //! | [`a_dropped_connection_is_retried_on_the_backoff_schedule_and_recovers`] | §8.1's Reconnect Flow, and §4.2's reset-on-success |
+//! | [`a_full_batch_is_followed_by_another_request_and_a_short_batch_stops_the_loop`] | the catch-up loop's whole policy, at both edges of the bound |
+//! | [`the_cursor_advances_to_the_batch_maximum_and_a_duplicate_moves_it_too`] | the advancement rule that makes an inclusive server bound finite |
+//! | [`a_catch_up_recovers_every_missed_message_with_no_gap_and_no_duplicate_row`] | §7.4's resume, across more than one batch |
+//! | [`messages_sent_while_this_client_was_down_are_present_after_the_resync`] | §8.1's Reconnect Flow's outcome, after a real drop |
 //! | [`the_transport_gives_up_after_its_configured_allowance`] | §4.2's max-attempt behaviour |
 //! | [`an_unsupported_major_version_is_refused_rather_than_silently_continued`] | §7.4's explicit rejection, both directions |
 //! | [`a_shut_down_transport_refuses_further_frames`] | `AGENTS.md` §2.1, and §7.5 through `Debug` |
@@ -48,6 +52,7 @@
 
 mod support;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -58,8 +63,8 @@ use sh_nexus::app::STARTUP_CHANNEL;
 use sh_nexus::core::models::events::{ConnectionState, DomainEvent};
 use sh_nexus::core::models::user::UserStatus;
 use sh_nexus::network::ws::{
-    backoff_window, is_owed_on_failed_write, TransportConfig, TransportError, TransportStats,
-    WsTransport,
+    advance_cursor, backoff_window, catch_up, is_owed_on_failed_write, CatchUp, TransportConfig,
+    TransportError, TransportStats, WsTransport, RESYNC_BATCH_LIMIT,
 };
 use sh_nexus::state::bridge::{self, Delivery, DeliveryRefusal, DrainReport, EventSender};
 use sh_nexus::state::{bridge::MAX_PENDING_EVENTS, SendOutcome};
@@ -94,6 +99,19 @@ const CHANNEL: &str = "c_general";
 /// print it. The constant is here so the assertion that it arrived is about *this*
 /// body rather than about some non-empty string.
 const BODY: &str = "hello from client A";
+
+/// How many messages the catch-up fixture stores before the client under test
+/// connects.
+///
+/// **More than one batch, and that is the whole point of the number.**
+/// [`RESYNC_BATCH_LIMIT`] is 256; 300 is one full batch plus a short one, which is
+/// the only pair of lengths that can tell "fetched everything" from "fetched the
+/// first page and stopped". A client that ignored the follow-up would hold 256 rows
+/// and pass a fixture that stored fewer.
+const PLANTED_MESSAGES: usize = 300;
+
+/// How many messages the reconnect fixture sends while the client is down.
+const DURING_THE_GAP: usize = 4;
 
 /// How long a socket's counters must hold still before a test may treat the worker
 /// as finished with it.
@@ -780,9 +798,16 @@ fn an_unsupported_major_version_is_refused_rather_than_silently_continued() {
 /// A frame the *client* cannot read is dropped without ending the connection.
 ///
 /// The complement of the test above and the other half of `AGENTS.md` §3.3's
-/// "recoverable, not fatal": the server drops a `resync` at `warn!` and keeps the
-/// socket, so a client that treated an unanswered frame as a reason to disconnect
-/// would be unable to use the very frame `AGENTS.md` §7.4 requires it to send.
+/// "recoverable, not fatal": the server drops a `typing.start` at `warn!` and keeps
+/// the socket, so a client that treated an unanswered frame as a reason to disconnect
+/// would be unable to use the very frames `AGENTS.md` §7.4 requires it to send.
+///
+/// **`typing.start` is the frame this names, and the choice is not incidental.**
+/// It used to be `resync`, back when `sh_nexus_server/src/ws.rs` decoded it and
+/// logged it without answering — which is precisely the gap this work unit closed. A
+/// test whose subject had stopped existing would keep passing while describing a
+/// server that no longer exists, so the frame moved to one the server still does not
+/// implement and the property it protects is the same one.
 #[test]
 fn a_frame_the_server_does_not_implement_leaves_the_socket_open() {
     let server = ServerProcess::start("unimplemented-frame");
@@ -797,19 +822,18 @@ fn a_frame_the_server_does_not_implement_leaves_the_socket_open() {
         let request = server.handshake_request(Some(&token));
         let (mut socket, _) = connect_async(request).await.expect("a websocket upgrade");
 
-        // A `resync` is exactly the frame `sh_nexus_server/src/ws.rs` decodes,
+        // A `typing.start` is exactly the frame `sh_nexus_server/src/ws.rs` decodes,
         // `warn!`s about and drops. The connection must survive it.
-        let resync = ClientEnvelope::new(
+        let typing = ClientEnvelope::new(
             Uuid::new_v4().hyphenated().to_string(),
-            ClientFrame::Resync {
+            ClientFrame::TypingStart {
                 channel_id: CHANNEL.to_owned(),
-                after: sh_nexus::network::ws::epoch_cursor(),
             },
         );
         socket
-            .send(Message::Text(resync.encode().expect("encodes").into()))
+            .send(Message::Text(typing.encode().expect("encodes").into()))
             .await
-            .expect("the resync to reach the server");
+            .expect("the typing frame to reach the server");
 
         // A `message.send` afterwards proves the socket is still usable. If the
         // server had closed on the resync, this write or the read would fail.
@@ -1447,4 +1471,402 @@ fn only_a_message_send_is_owed_when_its_write_fails() {
         "`resync` must not be owed: `WsTransport::request_resync` remembers the \
          cursor and replays it on every connect, so a failed one is already scheduled"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 9. The catch-up loop
+// ---------------------------------------------------------------------------
+
+/// A full batch is followed by another request, and a short batch stops the loop.
+///
+/// **The whole of "ask again while a batch comes back full", asserted at both edges
+/// of the bound and one past it.** The rule the client runs on is
+/// [`catch_up`], and it is the only thing standing between an inclusive server bound
+/// and an unbounded loop: the server's `after` is inclusive, so the boundary
+/// millisecond comes back every time, and the loop terminates because a *short*
+/// batch produces no further request.
+///
+/// **The three cases and what each one rules out:**
+///
+/// | `received` | Answer | The bug it catches |
+/// |---|---|---|
+/// | 1 | `Pending` | a client that asks again after every message, forever |
+/// | `RESYNC_BATCH_LIMIT - 1` | `Pending` | an off-by-one that stops one message early |
+/// | `RESYNC_BATCH_LIMIT` | `AskAgain` | a client that truncates at one batch and silently loses the rest |
+/// | `RESYNC_BATCH_LIMIT + 9` | `AskAgain` | `==` instead of `>=`, which stalls on a counter that ran past the bound |
+#[test]
+fn a_full_batch_is_followed_by_another_request_and_a_short_batch_stops_the_loop() {
+    assert_eq!(
+        catch_up(1, RESYNC_BATCH_LIMIT),
+        CatchUp::Pending,
+        "one message is a short batch, so the client is caught up and asks nothing \
+         more. A client that re-asked here would loop on the inclusive boundary row \
+         the server keeps sending back."
+    );
+    assert_eq!(
+        catch_up(RESYNC_BATCH_LIMIT - 1, RESYNC_BATCH_LIMIT),
+        CatchUp::Pending,
+        "a batch one short of the bound is still short: there may be nothing after it, \
+         and the client cannot see the batch end, so it stops"
+    );
+    assert_eq!(
+        catch_up(RESYNC_BATCH_LIMIT, RESYNC_BATCH_LIMIT),
+        CatchUp::AskAgain,
+        "a batch that came back full is the server's own statement that more rows \
+         exist, and stopping here would lose them"
+    );
+    assert_eq!(
+        catch_up(RESYNC_BATCH_LIMIT + 9, RESYNC_BATCH_LIMIT),
+        CatchUp::AskAgain,
+        "the rule is `>=`, not `==`: a counter that ran past the bound must ask \
+         again rather than leave messages on the table"
+    );
+}
+
+/// The cursor advances to the batch maximum, and a duplicate moves it too.
+///
+/// **This is the rule that makes an inclusive server bound safe, and it is the
+/// opposite of the intuitive version.** The server returns the boundary millisecond
+/// on every request, so the newest row of every full batch is usually one the client
+/// already holds. A cursor that advanced only on *newly accepted* rows would
+/// therefore never move past that boundary and would re-read the same millisecond
+/// forever — the client-side half of the same lost-message problem the inclusive
+/// bound fixes on the server, pointed the other way.
+///
+/// The second half is equally load-bearing: **the cursor must never move backwards**,
+/// or a late frame carrying an older `accepted_at` would drag it behind and the next
+/// catch-up would re-read everything after it.
+#[test]
+fn the_cursor_advances_to_the_batch_maximum_and_a_duplicate_moves_it_too() {
+    let mut cursors: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
+
+    assert_eq!(
+        advance_cursor(&mut cursors, CHANNEL, at(10)),
+        at(10),
+        "the first row of a channel defines its cursor"
+    );
+    assert_eq!(
+        advance_cursor(&mut cursors, CHANNEL, at(10)),
+        at(10),
+        "the replayed boundary row -- the same instant the client already holds -- \
+         moves nothing, because the cursor is already there"
+    );
+    assert_eq!(
+        advance_cursor(&mut cursors, CHANNEL, at(30)),
+        at(30),
+        "the newest row of a batch does move it, which is what \"advance to the batch \
+         maximum\" means"
+    );
+    assert_eq!(
+        advance_cursor(&mut cursors, CHANNEL, at(4)),
+        at(30),
+        "and an out-of-order older row must not rewind it: the next catch-up from a \
+         rewound cursor would re-read everything after it"
+    );
+    assert_eq!(
+        advance_cursor(&mut cursors, "c_another", at(7)),
+        at(7),
+        "channels are independent, which is the whole reason the cursor is per channel"
+    );
+    assert_eq!(
+        cursors.get(CHANNEL),
+        Some(&at(30)),
+        "and the map is the client's record of what it holds, one entry per channel"
+    );
+}
+
+/// A catch-up recovers every message the client missed, with no gap and no duplicate.
+///
+/// **The end-to-end proof of `AGENTS.md` §7.4's resume rule and §8.1's Reconnect
+/// Flow's "no duplicates, no gaps", against a real server and a real socket.** More
+/// than one batch on purpose: a client that fetched only the first
+/// [`RESYNC_BATCH_LIMIT`] rows would pass a smaller fixture and lose messages in
+/// production, and that is precisely the bug a bound can hide.
+///
+/// The second connection is a raw `tokio-tungstenite` socket rather than another
+/// [`WsTransport`], so it can put 300 messages on the wire **before** the transport
+/// under test has connected — which is what makes "what this client missed" a fact
+/// rather than a race. Each send is acknowledged before the next goes out, so all
+/// 300 are stored when the transport starts.
+#[gpui::test]
+fn a_catch_up_recovers_every_missed_message_with_no_gap_and_no_duplicate_row(
+    cx: &mut TestAppContext,
+) {
+    let server = ServerProcess::start("catch-up");
+    let token = server.token();
+
+    // A second client fills the channel while the one under test is not connected.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime");
+    runtime.block_on(async {
+        use futures_util::{SinkExt, StreamExt};
+        let request = server.handshake_request(Some(&token));
+        let (mut other, _) = connect_async(request).await.expect("a websocket upgrade");
+        for index in 0..PLANTED_MESSAGES {
+            let envelope = ClientEnvelope::new(
+                Uuid::new_v4().hyphenated().to_string(),
+                ClientFrame::MessageSend {
+                    channel_id: CHANNEL.to_owned(),
+                    content: format!("missed message {index}"),
+                },
+            );
+            other
+                .send(Message::Text(envelope.encode().expect("encodes").into()))
+                .await
+                .expect("the send to reach the server");
+            // Read the ack before the next send, so the server has committed this row
+            // before the loop moves on and no write is left buffered against a
+            // receive window nobody is draining.
+            loop {
+                match other.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let decoded = sh_nexus::network::ws::decode_server_frame(&text)
+                            .expect("the ack is a frame this build speaks");
+                        if matches!(decoded, ServerFrame::MessageAck { .. }) {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => continue,
+                    other => panic!("expected an ack, got {other:?}"),
+                }
+            }
+        }
+    });
+
+    let sender = install(cx, ME);
+    let transport = WsTransport::start(server.authenticated_config(), sender).expect("a thread");
+    await_connected(cx);
+
+    // The ask, from the beginning of time, exactly as `epoch_cursor` documents.
+    transport
+        .request_resync(CHANNEL, sh_nexus::network::ws::epoch_cursor())
+        .expect("the cursor is queued");
+
+    support::wait_until("every missed message to arrive", READY_BUDGET, || {
+        drain(cx);
+        cx.read(|app| {
+            bridge::try_read(app, |state| {
+                state.message_count(CHANNEL) >= PLANTED_MESSAGES
+            })
+            .unwrap_or(false)
+        })
+    });
+
+    // **No duplicate row, and this is the half that is easy to get wrong.** The
+    // inclusive bound means the last row of the first batch comes back a second time
+    // at the head of the second; `core/ordering` collapses it by `client_msg_id`, so
+    // what must be true is that the count did not grow past the number stored.
+    let rows =
+        cx.read(|app| bridge::try_read(app, |state| state.message_count(CHANNEL)).unwrap_or(0));
+    assert_eq!(
+        rows, PLANTED_MESSAGES,
+        "every missed message is present exactly once. An inclusive server bound \
+         overlaps by one row per batch, and the client's dedup on client_msg_id is \
+         what turns that overlap into a comparison rather than a second row."
+    );
+
+    // **The order, which is what "no gap" is really about.** The rows are the ones
+    // the server stored, in the order it accepted them: `ORDER BY
+    // accepted_at_unix_ms, id` is a total order precisely because `mint_message_id`
+    // packs the clock into the id's high bits.
+    let ordered = cx.read(|app| {
+        bridge::try_read(app, |state| {
+            state
+                .messages(CHANNEL)
+                .iter()
+                .map(|held| held.content.clone())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default()
+    });
+    let expected: Vec<String> = (0..PLANTED_MESSAGES)
+        .map(|index| format!("missed message {index}"))
+        .collect();
+    assert_eq!(
+        ordered, expected,
+        "the catch-up arrives in acceptance order, so a transcript rebuilt from it \
+         reads the way it was written. A gap would show here as a missing entry and a \
+         mis-ordering as a permuted one."
+    );
+
+    // **And the loop stopped.** One ask plus one follow-up is the whole of a
+    // two-batch catch-up; a third request would mean the second batch came back full,
+    // which it did not, or that the cursor failed to advance and the first batch was
+    // being fetched again.
+    let stats = transport.stats();
+    assert_eq!(
+        stats.resyncs_sent, 2,
+        "exactly two requests: the ask, plus one because the first batch came back \
+         full. A short second batch is caught up, and this is the assertion that says \
+         so -- it is what a client looping on the inclusive boundary row would break. \
+         {stats}"
+    );
+    assert_eq!(
+        stats.events_refused, 0,
+        "the inbox never filled: a refused delivery is one this client does not hold, \
+         and the cursor deliberately does not move past it. {stats}"
+    );
+
+    transport.shutdown();
+    drop(server);
+}
+
+/// Messages sent while this client was down are present after the resync, once each.
+///
+/// **§8.1's Reconnect Flow, end to end, and the assertion is deliberately about the
+/// outcome rather than about the route the messages took.** A reconnect, a second
+/// client sending during the gap, and then a client that holds every message exactly
+/// once. Whether a given message arrived live or through the catch-up depends on how
+/// the reconnect and the send interleave, and asserting the route would make this a
+/// test of scheduling; asserting the outcome is what the flow is for.
+///
+/// **The mechanism is asserted separately and unambiguously** — by
+/// [`a_catch_up_recovers_every_missed_message_with_no_gap_and_no_duplicate_row`],
+/// where the transport is not connected while the messages are written, and by the
+/// `resyncs_sent` counter climbing across this test's reconnect. Between them the two
+/// cover "the resync goes out on a reconnect" and "everything the client missed
+/// arrives once".
+#[gpui::test]
+fn messages_sent_while_this_client_was_down_are_present_after_the_resync(cx: &mut TestAppContext) {
+    let port = support::free_port().expect("an ephemeral loopback port");
+    let url = format!("ws://127.0.0.1:{port}{WS_PATH}");
+    let server = ServerProcess::start_on(port, "resync-after-reconnect");
+    let token = server.token();
+
+    let sender = install(cx, ME);
+    let transport = WsTransport::start(TransportConfig::new(url).with_token(token.clone()), sender)
+        .expect("a thread");
+    await_connected(cx);
+
+    // One message, acknowledged, so this client holds the channel and therefore has a
+    // cursor for it. **The first connect asks for nothing**, because a client that
+    // has held nothing has no cursor and `epoch_cursor` is the caller's choice rather
+    // than a default this layer applies — which is why the assertions below are about
+    // the *second* connect.
+    let own = Uuid::new_v4();
+    cx.update(|cx| {
+        bridge::try_begin_send(cx, CHANNEL, BODY, own, at(0)).expect("the state is installed");
+    });
+    transport
+        .send_message(own, CHANNEL, BODY)
+        .expect("the send is queued");
+    await_server_id(cx, &own);
+    assert_eq!(
+        transport.stats().resyncs_sent,
+        0,
+        "the first connect had no cursor to resume from, so it asked for nothing"
+    );
+    // **Drop the socket from the other end.** 70 KiB is above the server's 64 KiB
+    // ceiling, so it terminates the connection without a close frame — the same
+    // provocation, and the same reason, as the reconnect suite above.
+    let oversized = "x".repeat(70 * 1024);
+    transport
+        .send_message(Uuid::new_v4(), CHANNEL, &oversized)
+        .expect("the send is queued");
+
+    // While this client is reconnecting, somebody else talks in the channel.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime");
+    runtime.block_on(async {
+        use futures_util::{SinkExt, StreamExt};
+        let request = server.handshake_request(Some(&token));
+        let (mut other, _) = connect_async(request).await.expect("a websocket upgrade");
+        for index in 0..DURING_THE_GAP {
+            let envelope = ClientEnvelope::new(
+                Uuid::new_v4().hyphenated().to_string(),
+                ClientFrame::MessageSend {
+                    channel_id: CHANNEL.to_owned(),
+                    content: format!("during the gap {index}"),
+                },
+            );
+            other
+                .send(Message::Text(envelope.encode().expect("encodes").into()))
+                .await
+                .expect("the gap send to reach the server");
+            loop {
+                match other.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let decoded = sh_nexus::network::ws::decode_server_frame(&text)
+                            .expect("the ack is a frame this build speaks");
+                        if matches!(decoded, ServerFrame::MessageAck { .. }) {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => continue,
+                    other => panic!("expected an ack, got {other:?}"),
+                }
+            }
+        }
+    });
+
+    let total = 1 + DURING_THE_GAP;
+    support::wait_until(
+        "the socket to be replaced and the gap filled",
+        READY_BUDGET,
+        || {
+            drain(cx);
+            transport.stats().connects >= 2 && {
+                cx.read(|app| {
+                    bridge::try_read(app, |state| state.message_count(CHANNEL) >= total)
+                        .unwrap_or(false)
+                })
+            }
+        },
+    );
+
+    // **Exactly one request, and it went out because of the reconnect.** The cursor
+    // this client holds names its own acknowledged message, so the catch-up returns
+    // that message again and nothing newer — a short batch against a bound of 256, so
+    // the loop stops. A second request would mean the first batch came back full, or
+    // that the cursor had failed to advance and the batch was being re-fetched.
+    let stats = transport.stats();
+    assert_eq!(
+        stats.resyncs_sent, 1,
+        "one reconnect, one remembered cursor, one request: that is §7.4's \"resume \
+         from the last known last_message_at\" rather than \"rely on live delivery \
+         across a gap\". Asking more than once here would mean the batch looped. \
+         {stats}"
+    );
+
+    // **Exactly once each, and that is the whole of "no duplicates".** A reconnect
+    // that replayed a channel the client had already caught up with would put the
+    // same message in the transcript twice; the inclusive bound guarantees one
+    // overlapping row per batch, and this is where the overlap has to disappear.
+    let contents = cx.read(|app| {
+        bridge::try_read(app, |state| {
+            state
+                .messages(CHANNEL)
+                .iter()
+                .map(|held| held.content.clone())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default()
+    });
+    let mut unique = contents.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        contents.len(),
+        unique.len(),
+        "no message appears twice across the reconnect: {contents:?}"
+    );
+    assert_eq!(
+        contents.len(),
+        total,
+        "and no message is missing: this client holds its own message plus the {DURING_THE_GAP} sent while it was down"
+    );
+    for index in 0..DURING_THE_GAP {
+        let expected = format!("during the gap {index}");
+        assert!(
+            contents.contains(&expected),
+            "the message sent while this client was down is present: {expected}"
+        );
+    }
+
+    transport.shutdown();
+    drop(server);
 }

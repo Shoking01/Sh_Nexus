@@ -40,7 +40,16 @@
 //! | `messages` | the whole round trip | The one working path. |
 //! | `sessions` | every WebSocket handshake | A revoked session has to be distinguishable from a live one without reading the token, which is why the row is keyed on the hash. |
 //! | `read_cursors` | **no** | Required by ADR-010 "from the first migration". |
-//! | `channel_members` | yes, by `message.rs`'s authorization check | Membership is an authorization concern, and this is the milestone that reads it. |
+//! | `channel_members` | yes, by `message.rs`'s authorization check **and by the catch-up read** | Membership is an authorization concern, and reading a channel's history is as much a question of membership as writing to it is. |
+//!
+//! **The catch-up read is [`Store::read_since`], and it is the second way
+//! `messages` is exercised.** It is keyed on `(channel_id, accepted_at_unix_ms)`
+//! rather than on an id, because `AGENTS.md` §7.4's resume cursor is a time and
+//! nothing in this schema is a per-channel sequence number — the channel's
+//! `last_message_at_unix_ms` column is the upper bound, and the cursor a client
+//! holds is a lower one. **The two are deliberately the same column in opposite
+//! directions**, and that is what makes "resume from `last_message_at`" a
+//! statement about storage rather than about a convention.
 //!
 //! **`read_cursors` is the one to read the ADR for.** ADR-010's decision is
 //! per-`(user, channel)` read state, and its stated reason is that the client's
@@ -403,6 +412,31 @@ pub enum ChannelAccess {
 const SELECT_BY_CLIENT_MSG_ID: &str = "SELECT id, client_msg_id, channel_id, user_id, \
      content, accepted_at_unix_ms FROM messages WHERE client_msg_id = ?1";
 
+/// The catch-up read behind a `resync`: one channel, one lower bound, one page.
+///
+/// **`accepted_at_unix_ms >= ?2` and not `>`, and that is the whole reason this
+/// method exists in this shape.** The acceptance clock has millisecond
+/// resolution, so two messages can share an instant; a strict bound read from a
+/// cursor pointing at the first of them skips the second permanently, because the
+/// cursor has already moved past it and nothing will ask again.
+/// `sh_nexus_wire::frame::ClientFrame::Resync`'s `after` carries the full argument,
+/// and the client-side rule that terminates the resulting overlap — advance to the
+/// batch maximum *including duplicates*, ask again only while a batch comes back
+/// full — is what makes the inclusive bound cost one duplicate row rather than an
+/// unbounded loop.
+///
+/// **`ORDER BY accepted_at_unix_ms, id` is a total order, and it is exact rather
+/// than a tie-break guess.** `mint_message_id` packs
+/// `(accepted_at_unix_ms << 64) | sequence` with a per-store atomic counter, so the
+/// id's high bits are the clock and its low bits are acceptance order within the
+/// millisecond. Sorting by the pair therefore agrees with acceptance order in every
+/// case, which is what lets a replayed batch arrive in the order it was accepted.
+/// `messages_channel_order` is exactly this index.
+const SELECT_SINCE: &str = "SELECT id, client_msg_id, channel_id, user_id, \
+     content, accepted_at_unix_ms FROM messages \
+     WHERE channel_id = ?1 AND accepted_at_unix_ms >= ?2 \
+     ORDER BY accepted_at_unix_ms, id LIMIT ?3";
+
 /// One account that can log in.
 ///
 /// **Not the reserved [`UNATTRIBUTED_USER_ID`] row**, which has no
@@ -727,6 +761,114 @@ impl Store {
             .map_err(|_| ServerError::LockPoisoned {
                 resource: CONNECTION,
             })
+    }
+
+    // -----------------------------------------------------------------------
+    // The catch-up read
+    // -----------------------------------------------------------------------
+
+    /// Every message in `channel_id` accepted **at or after** `after_unix_ms`, in
+    /// acceptance order, at most `limit` of them.
+    ///
+    /// **This is the per-channel resume cursor's reader, and the one method in
+    /// this module that reads rather than writes.** `AGENTS.md` §7.4 asks for
+    /// reconnection to "resume from the last known `last_message_at` cursor — never
+    /// rely solely on 'live' delivery during a gap", and a single global cursor
+    /// cannot do that: each channel has its own `last_message_at`, so one cursor is
+    /// either too old (replaying what the user read) or too new (skipping a channel
+    /// they had not caught up on). The cursor is an argument, per channel, because
+    /// the shape of the answer has to be per channel too.
+    ///
+    /// ## The bound, and why the caller owns it
+    ///
+    /// `limit` is the caller's, not this method's, and the reason is that the
+    /// caller is the one that has to write the rest of the batch back down a
+    /// socket: `ws.rs` passes the same 256 that `Hub::CAPACITY` and the client's
+    /// `MAX_OUTBOUND_FRAMES` use, so one catch-up batch costs one bounded buffer on
+    /// each side. **A client that missed 10 000 messages therefore takes 40 round
+    /// trips, which is correct and bounded** — `AGENTS.md` §7.1 forbids the
+    /// unbounded alternative, and a reader with no limit is that alternative.
+    ///
+    /// ## An unknown channel is an error, not an empty batch
+    ///
+    /// **This is the failure the whole unit exists to close.** A channel this
+    /// instance does not have and a channel the client has already caught up with
+    /// return the same zero rows if existence is not checked, and a catch-up that
+    /// "succeeded" while recovering nothing is worse than no catch-up at all,
+    /// because it is invisible. The refusal is [`ServerError::UnknownChannel`],
+    /// which is the same variant and therefore the same `unknown_channel` code
+    /// [`crate::message`] reports for a send naming a channel that does not exist.
+    ///
+    /// The check costs one indexed `SELECT` and duplicates the existence half of
+    /// [`Store::channel_access`], which `ws.rs` asks first for the membership
+    /// question. **It is here anyway because this method is `pub`:** a caller that
+    /// reached it without asking about membership must still not be told "you are
+    /// up to date" about a channel that does not exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel_id` - the channel to catch up. Must already exist.
+    /// * `after_unix_ms` - the **inclusive** lower bound; see [`SELECT_SINCE`] for
+    ///   why inclusive, and the client's advancement rule for why that terminates.
+    /// * `limit` - the largest batch to return. A returned batch of exactly `limit`
+    ///   rows means there may be more, which is how a truncated batch is
+    ///   distinguishable from a caught-up channel.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::UnknownChannel`] if `channel_id` names no channel,
+    /// [`ServerError::Sqlite`] for a driver failure, and
+    /// [`ServerError::TimestampOutOfRange`] if a stored millisecond value is not a
+    /// representable instant. [`ServerError::LockPoisoned`] if an earlier panic
+    /// left the connection unusable.
+    ///
+    /// **An empty batch is not an error.** A channel with nothing at or after the
+    /// cursor is a caught-up channel, which is an ordinary answer to the question
+    /// that was asked.
+    pub fn read_since(
+        &self,
+        channel_id: &str,
+        after_unix_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<WireMessage>> {
+        let connection = self.lock()?;
+
+        if !channel_exists(&connection, channel_id)? {
+            debug!(
+                channel_id,
+                after_unix_ms, "refused a catch-up naming a channel that does not exist"
+            );
+            return Err(ServerError::UnknownChannel {
+                channel_id: channel_id.to_owned(),
+            });
+        }
+
+        // `usize` is cast rather than bound directly because `rusqlite` has no
+        // `ToSql` for it, and because a page bound that could exceed `i64::MAX`
+        // would need a platform this server does not build for. The bound is a
+        // named constant at every call site, so the cast is a formality rather
+        // than a truncation risk.
+        let mut statement = connection.prepare(SELECT_SINCE)?;
+        let rows =
+            statement.query_map(params![channel_id, after_unix_ms, limit as i64], |row| {
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    client_msg_id: row.get(1)?,
+                    channel_id: row.get(2)?,
+                    user_id: row.get(3)?,
+                    content: row.get(4)?,
+                    accepted_at_unix_ms: row.get(5)?,
+                })
+            })?;
+
+        // Collected rather than mapped lazily, because the timestamp conversion
+        // can fail with `ServerError` while the row closure's error type is
+        // `rusqlite::Error` -- the same split `StoredMessage`'s own docs give.
+        let mut batch = Vec::new();
+        for row in rows {
+            batch.push(row?.into_wire_message()?);
+        }
+        Ok(batch)
     }
 
     // -----------------------------------------------------------------------
@@ -1294,8 +1436,13 @@ fn table_exists(connection: &Connection, name: &str) -> Result<bool> {
 }
 
 /// Whether the send's target channel exists.
-fn channel_exists(transaction: &Transaction<'_>, channel_id: &str) -> Result<bool> {
-    let found: Option<i64> = transaction
+///
+/// `&Connection` rather than `&Transaction`, so the same one-liner serves the send
+/// path — which holds an open transaction — and [`Store::read_since`], which does
+/// not. `Transaction` derefs to `Connection`, so `accept_message` passes `&transaction`
+/// unchanged and the existence rule stays written once.
+fn channel_exists(connection: &Connection, channel_id: &str) -> Result<bool> {
+    let found: Option<i64> = connection
         .query_row(
             "SELECT 1 FROM channels WHERE id = ?1",
             [channel_id],

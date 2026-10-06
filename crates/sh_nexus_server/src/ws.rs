@@ -70,8 +70,8 @@
 //!
 //! # What this milestone does not handle, and why dropping is the protocol's answer
 //!
-//! `reaction.add`, `typing.start`, `typing.stop` and `resync` decode and are then
-//! logged at `warn!`. They are ADR-010's next PR.
+//! `reaction.add`, `typing.start` and `typing.stop` decode and are then logged at
+//! `warn!`. They are ADR-010's next PR.
 //!
 //! A `warn!` and a kept connection, with no `error` frame, is the protocol's own
 //! prescribed behaviour for a frame this end does not implement: `sh_nexus_wire`'s
@@ -82,12 +82,47 @@
 //! `ConnectionState::Rejected`, so a client that sent a `typing.start` would be
 //! told its connection had been rejected over a frame whose loss costs nothing.
 //!
-//! `resync` is the one gap in that list with teeth, and it is named rather than
-//! buried: a reconnecting client that asks to catch up will not be sent what it
-//! missed. It is data-bearing, so it eventually deserves a frame that says so --
-//! and that frame belongs to the milestone that implements resync, because
-//! inventing a code now would be a protocol decision taken before anything can
-//! send it.
+//! `resync` used to be in that list, and it was **the one gap in it with teeth** —
+//! a reconnecting client that asked to catch up was answered with nothing and told
+//! nothing. It is answered below.
+//!
+//! # Resync is per-connection, and that is what settles the echo question
+//!
+//! [`crate::hub::Delivery`] left this open in so many words: *"a future milestone
+//! that adds resync will have to decide deliberately whether the echo resumes."*
+//!
+//! **It does not, because a resync never enters the hub.** A catch-up replay is
+//! addressed to exactly one connection — the one that asked — so [`replay`] reads it
+//! from the store and writes it straight to that connection's socket. There is no
+//! `broadcast`, therefore no `origin` to filter, therefore no echo decision to make.
+//! The question is not answered; it does not arise.
+//!
+//! This is also the cheaper shape. Fanning a replay out through the hub would need
+//! a sentinel origin so the asking connection could skip its own copy, would change
+//! [`Delivery`] for every frame kind, and would risk a 256-message replay being
+//! delivered to every client on the instance — each of which would then deduplicate
+//! a conversation it was not part of.
+//!
+//! # Why the reply is bare `message.new` frames
+//!
+//! A catch-up arrives as one `message.new` per stored message, in acceptance order,
+//! and a refusal arrives as the same `message.error` a refused send produces.
+//!
+//! **There is no `resync.result`, and that is stated rather than left implied.**
+//! `PLAN.md` §6 describes one carrying a `watermark`, and `core/ordering.rs` §4 says
+//! the consequence of its absence: with no watermark, every resync reports
+//! `SyncStatus::Unverifiable` — which that module calls the correct answer rather
+//! than a missing feature. Giving the client a watermark would mean a new
+//! `ServerFrame` variant **and** a real change to `core/ordering.rs`'s gap
+//! assessment, which is a protocol addition rather than a transport decision. This
+//! milestone instead lets the client decide "is there more" by counting: a batch of
+//! [`RESYNC_BATCH_LIMIT`] rows means there may be more, a shorter one means the
+//! channel is caught up.
+//!
+//! The counting rule and its terminating argument are the client's
+//! ([`crate::db::Store::read_since`] is the other half); what is decided here is only
+//! that **a full batch is distinguishable from a short one**, which is what makes
+//! counting sound.
 //!
 //! # Version negotiation
 //!
@@ -102,14 +137,17 @@ use axum::extract::ws::{close_code, CloseFrame, Message, Utf8Bytes, WebSocket, W
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use sh_nexus_wire::{ClientEnvelope, ClientFrame, ServerEnvelope, WireError};
+use sh_nexus_wire::{ClientEnvelope, ClientFrame, ServerEnvelope, ServerFrame, WireError};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::Receiver;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::{self, Authenticated};
+use crate::db::ChannelAccess;
+use crate::error::ServerError;
 use crate::hub::{ConnectionId, Delivery, CAPACITY};
 use crate::message;
+use crate::time;
 use crate::AppState;
 
 /// The largest frame this server will accept, in bytes.
@@ -138,6 +176,22 @@ use crate::AppState;
 /// answers "what is a reasonable message". Inventing a number here would be a
 /// second, disagreeing policy in all but name.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+
+/// The largest catch-up batch one `resync` is answered with: 256 messages.
+///
+/// **Precedent, not invention.** It is [`Hub::CAPACITY`]'s number and the client's
+/// `MAX_OUTBOUND_FRAMES`'s, so one batch costs one bounded buffer on each side of
+/// the wire and the client's "a full batch means there may be more" rule counts
+/// against a number the other two ends already use.
+///
+/// **It bounds the reply, not the work.** A client that missed 10 000 messages asks
+/// again from the cursor this batch advanced to, and does so 40 times; that is
+/// correct and bounded, where an unbounded reader is `AGENTS.md` §7.1's forbidden
+/// alternative. The alternative shape — replaying until the channel is exhausted,
+/// in one answer — would put an unbounded write loop on a socket with no client on
+/// the other end of it, which is how a server dies with a client that stopped
+/// reading.
+pub const RESYNC_BATCH_LIMIT: usize = 256;
 
 /// Serves [`crate::WS_PATH`], upgrading to a WebSocket **for an authenticated
 /// peer only**.
@@ -526,6 +580,24 @@ async fn handle_text(
             }
             true
         }
+        ClientFrame::Resync { channel_id, after } => {
+            // **Not `if let Err(..) => return false`.** A failed catch-up is one
+            // bad frame, not a broken connection: the client's next `resync`, from
+            // a reconnect or from the next full batch, is the retry, and closing
+            // the socket would turn "that channel is not readable" into "the whole
+            // conversation is gone".
+            let answered = replay(
+                state,
+                connection_id,
+                socket,
+                user_id,
+                &client_msg_id,
+                &channel_id,
+                time::to_unix_millis(after),
+            )
+            .await;
+            answered
+        }
         unimplemented_frame => {
             // The module docs explain why this is a `warn!` and an open connection
             // rather than an `error` frame.
@@ -538,6 +610,323 @@ async fn handle_text(
             true
         }
     }
+}
+
+/// Answers one `resync` with a bounded catch-up, on the connection that asked.
+///
+/// # Why this is not `Hub::broadcast`
+///
+/// The module docs give the argument; the short version is that a catch-up replay
+/// is addressed to one connection and a broadcast is addressed to all of them. So
+/// the messages are read from the store and written to [`socket`] directly, and
+/// [`crate::hub`] is not touched at all — which is also why the echo question
+/// [`crate::hub::Delivery`] left open does not arise.
+///
+/// # The order of the four steps, and what each one is for
+///
+/// 1. **Validate** the channel id, before any storage is touched. A refused catch-up
+///    therefore cannot leave a row, cannot move a channel's resume cursor, and
+///    cannot be half-applied — the same contract [`crate::message::accept`] states
+///    for a send, and the reason both paths check blankness the same way.
+/// 2. **Authorize.** The account must be a member of the channel. **This is the
+///    step a catch-up could most easily have skipped and must not**: a replay hands
+///    over a channel's entire recent history, so a client that could ask for one it
+///    is not in would be a read-access hole of exactly the kind ADR-010 decides
+///    against for registration. It is [`Store::channel_access`]'s existing question,
+///    asked in the existing order, so "no such channel" and "not a member" keep the
+///    two distinct sentences a user needs.
+/// 3. **Read**, on a blocking thread. `db.rs`'s module docs are explicit that
+///    [`Store`] is synchronous, and this is a tokio worker — `AGENTS.md` §2.3's
+///    rule is that blocking work does not run on a thread with something else to do.
+/// 4. **Write**, one `message.new` per stored message, in the order the store
+///    returned them.
+///
+/// # What is not logged
+///
+/// The message id, the channel, the cursor, the batch length and whether it was
+/// truncated. **Never a body**: `AGENTS.md` §7.5, and the same rule
+/// [`crate::message`] keeps about the `detail` string that reaches a user's client
+/// log. `client_msg_id` is peer-supplied and length-unbounded, so this logs its
+/// length rather than its value — which is why the refusal helper takes the
+/// envelope's id but the log lines do not quote it.
+///
+/// # Arguments
+///
+/// * `user_id` - the authenticated account, from the handshake. **The only** source
+///   of "who is asking", for the reason `crate::message::accept` states: the frame
+///   has no author field, and a catch-up that answered whoever the frame claimed
+///   would make channel visibility a claim rather than a fact.
+/// * `client_msg_id` - the envelope's id, as untrusted text. It is echoed on a
+///   refusal so the client can tell which request was refused; nothing acknowledges
+///   a `resync`, and nothing dedupes one.
+/// * `channel_id` - the channel to catch up, as untrusted text.
+/// * `after_unix_ms` - the **inclusive** lower bound, already reduced to the
+///   storage clock's resolution by the caller.
+///
+/// **There is no `is_admin` argument, and an administrator is deliberately not a
+/// super-reader.** ADR-010 gives an administrator exactly one power — creating
+/// accounts — and `Store::channel_access` refuses a channel the account is not a
+/// member of whatever its role. A catch-up that waved an administrator through would
+/// make `is_admin` a read-access grant the rest of this server does not recognise,
+/// which is the kind of privilege that has to be inferred rather than audited.
+///
+/// # Returns
+///
+/// Whether the connection survives. `false` only when a write to the socket failed,
+/// which is a closed peer rather than a refused request.
+async fn replay(
+    state: &AppState,
+    connection_id: ConnectionId,
+    socket: &mut WebSocket,
+    user_id: &str,
+    client_msg_id: &str,
+    channel_id: &str,
+    after_unix_ms: i64,
+) -> bool {
+    if channel_id.trim().is_empty() {
+        return refuse(
+            socket,
+            connection_id,
+            client_msg_id,
+            message::BLANK_CHANNEL_ID,
+            "channel_id must not be blank",
+        )
+        .await;
+    }
+
+    // One `spawn_blocking` for the authorization decision, for the reason
+    // `message.rs` gives: `db.rs` is the only component that knows what a channel
+    // is, and both questions are reads against the same connection.
+    let store = state.store.clone();
+    let owner = user_id.to_owned();
+    let target = channel_id.to_owned();
+    let access = tokio::task::spawn_blocking(move || store.channel_access(&owner, &target)).await;
+
+    match access {
+        Ok(Ok(ChannelAccess::Allowed)) => {}
+        Ok(Ok(ChannelAccess::UnknownChannel)) => {
+            info!(
+                connection = %connection_id,
+                user_id = %user_id,
+                channel_id = %channel_id,
+                client_msg_id_len = client_msg_id.len(),
+                "refused a catch-up naming a channel that does not exist"
+            );
+            return refuse(
+                socket,
+                connection_id,
+                client_msg_id,
+                message::UNKNOWN_CHANNEL,
+                &format!("there is no channel with the id {channel_id:?} on this server"),
+            )
+            .await;
+        }
+        Ok(Ok(ChannelAccess::NotAMember)) => {
+            // The channel id is **not** quoted, for the reason `message.rs` gives
+            // for the same refusal: the user already has this channel in their
+            // sidebar, and "ask an administrator for access" is the whole sentence.
+            // Quoting it would also be the difference between a message about
+            // access and a message about the instance's channel list.
+            info!(
+                connection = %connection_id,
+                user_id = %user_id,
+                channel_id_len = channel_id.len(),
+                client_msg_id_len = client_msg_id.len(),
+                "refused a catch-up of a channel the asker is not a member of"
+            );
+            return refuse(
+                socket,
+                connection_id,
+                client_msg_id,
+                message::NOT_A_MEMBER,
+                "your account is not a member of that channel; ask an administrator \
+                 for access",
+            )
+            .await;
+        }
+        // A driver failure here is a server fault, not a peer's, and the `Display`
+        // is kept rather than discarded: "the membership check could not run" and
+        // "the database refused the replay" have different fixes.
+        Ok(Err(error)) => {
+            error!(
+                connection = %connection_id,
+                user_id = %user_id,
+                channel_id_len = channel_id.len(),
+                error = %error,
+                "could not check channel access for a catch-up"
+            );
+            return refuse(
+                socket,
+                connection_id,
+                client_msg_id,
+                message::STORAGE_FAILURE,
+                "the server could not read this channel's history; please retry",
+            )
+            .await;
+        }
+        Err(join_error) => {
+            error!(
+                connection = %connection_id,
+                user_id = %user_id,
+                channel_id_len = channel_id.len(),
+                error = %join_error,
+                "the catch-up's authorization task did not complete"
+            );
+            return refuse(
+                socket,
+                connection_id,
+                client_msg_id,
+                message::STORAGE_FAILURE,
+                "the server could not read this channel's history; please retry",
+            )
+            .await;
+        }
+    }
+
+    // The read is a second `spawn_blocking` rather than a third question asked
+    // through the first one, and the reason is that `channel_access` is a *single
+    // indexed row read per question* while the replay is a paged scan. Keeping them
+    // apart is what lets the refusal path above stay a refusal: an unauthorized
+    // reader never reaches the scan at all.
+    let store = state.store.clone();
+    let target = channel_id.to_owned();
+    let batch = tokio::task::spawn_blocking(move || {
+        store.read_since(&target, after_unix_ms, RESYNC_BATCH_LIMIT)
+    })
+    .await;
+
+    let batch = match batch {
+        Ok(Ok(batch)) => batch,
+        Ok(Err(ServerError::UnknownChannel { channel_id: named })) => {
+            // Unreachable while `channel_access` above is the first question, and
+            // handled rather than unwrapped for the reason `db.rs` gives about the
+            // `ON CONFLICT` read: "unreachable" is a claim and this is the code that
+            // would be wrong if it ever became false.
+            info!(
+                connection = %connection_id,
+                channel_id = %named,
+                client_msg_id_len = client_msg_id.len(),
+                "refused a catch-up naming a channel that does not exist"
+            );
+            return refuse(
+                socket,
+                connection_id,
+                client_msg_id,
+                message::UNKNOWN_CHANNEL,
+                &format!("there is no channel with the id {named:?} on this server"),
+            )
+            .await;
+        }
+        Ok(Err(error)) => {
+            error!(
+                connection = %connection_id,
+                user_id = %user_id,
+                channel_id_len = channel_id.len(),
+                error = %error,
+                "could not read a catch-up"
+            );
+            return refuse(
+                socket,
+                connection_id,
+                client_msg_id,
+                message::STORAGE_FAILURE,
+                "the server could not read this channel's history; please retry",
+            )
+            .await;
+        }
+        Err(join_error) => {
+            error!(
+                connection = %connection_id,
+                user_id = %user_id,
+                channel_id_len = channel_id.len(),
+                error = %join_error,
+                "the catch-up's storage task did not complete"
+            );
+            return refuse(
+                socket,
+                connection_id,
+                client_msg_id,
+                message::STORAGE_FAILURE,
+                "the server could not read this channel's history; please retry",
+            )
+            .await;
+        }
+    };
+
+    // A full batch is what tells the client there may be more; a short one tells it
+    // the channel is caught up. Logging the difference is what makes a truncated
+    // replay visible to an operator instead of looking like a quiet channel.
+    let truncated = batch.len() >= RESYNC_BATCH_LIMIT;
+    let mut written = 0_usize;
+    for message in batch {
+        let envelope = ServerEnvelope::new(ServerFrame::MessageNew { message });
+        if send(socket, &envelope, connection_id).await.is_err() {
+            debug!(
+                connection = %connection_id,
+                channel_id = %channel_id,
+                replayed = written,
+                "connection closed part-way through a catch-up"
+            );
+            return false;
+        }
+        written += 1;
+    }
+
+    info!(
+        connection = %connection_id,
+        user_id = %user_id,
+        channel_id = %channel_id,
+        after_unix_ms,
+        replayed = written,
+        batch_limit = RESYNC_BATCH_LIMIT,
+        truncated,
+        "catch-up answered"
+    );
+    true
+}
+
+/// Answers a refused `resync` with the same frame a refused send produces, and
+/// reports whether the connection survives.
+///
+/// **A `message.error` and not a bare `error`, and the reason is the layering.**
+/// `crate::message`'s module docs give it: the connection's authorization already
+/// succeeded at the handshake, so a statement about the connection would be about
+/// something that was fine. `crates/sh_nexus/src/network/mapping.rs` maps
+/// `ServerFrame::Error` onto `ConnectionState::Rejected`, and a client that asked
+/// for a channel it is not in would be told its connection had been rejected —
+/// over a request whose loss costs nothing.
+///
+/// **The same `code` vocabulary as a send, deliberately.** `unknown_channel` and
+/// `not_a_member` are already the server's two answers to "you named a channel you
+/// cannot use", and a client that had to learn a second set for the same fact would
+/// be a protocol with two spellings of one rule.
+///
+/// # Returns
+///
+/// Always `true`: a refusal is a frame this end can write, and the only `false`
+/// this module produces is a socket that has already gone.
+async fn refuse(
+    socket: &mut WebSocket,
+    connection_id: ConnectionId,
+    client_msg_id: &str,
+    code: &str,
+    detail: &str,
+) -> bool {
+    let envelope = ServerEnvelope::new(ServerFrame::MessageError {
+        client_msg_id: client_msg_id.to_owned(),
+        code: code.to_owned(),
+        detail: detail.to_owned(),
+    });
+    if let Err(error) = send(socket, &envelope, connection_id).await {
+        debug!(
+            connection = %connection_id,
+            code,
+            error = %error,
+            "connection closed before a refusal could be written"
+        );
+        return false;
+    }
+    true
 }
 
 /// Sends one frame.

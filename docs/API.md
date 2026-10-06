@@ -431,7 +431,48 @@ decode and are then **logged at `warn!` with the connection kept open**, which i
 | Presence | No `presence.update` is ever sent. |
 | Typing | `typing.start`/`typing.stop` are accepted and discarded. No `typing.update` is ever sent. |
 | Reactions | `reaction.add` is accepted and discarded. No `reaction.update` is ever sent. |
-| `resync` | **A reconnecting client that asks to catch up is not sent what it missed.** This is the one gap in the list with teeth, and it is data-bearing. It deserves a frame that says so; that frame belongs to the milestone that implements resync, because inventing a code now would be a protocol decision taken before anything can send it. |
+
+### 2.6.1 `resync`: the catch-up
+
+**Answered.** It was the one gap in the table above with teeth — a reconnecting
+client asked to catch up, recovered nothing, and was not told so — so it is worth
+writing down what a client gets.
+
+| Question | Answer |
+|---|---|
+| Which messages? | Every message in `channel_id` accepted **at or after** `after`, in acceptance order. |
+| How many? | At most **256**, which is `Hub::CAPACITY` and the client's `MAX_OUTBOUND_FRAMES`. A batch of exactly 256 means there may be more. |
+| In what shape? | One `message.new` per stored message, written **to the asking connection's socket**. |
+| Does anyone else see it? | **No.** A catch-up is per-connection; it never enters the hub, so the echo question `hub::Delivery` left open does not arise. |
+| A channel that does not exist? | `message.error` with `unknown_channel` — the same code and the same sentence a `message.send` naming it gets. The socket stays open. |
+| A channel the account is not in? | `message.error` with `not_a_member`. **Reading a channel's history is a membership question, not a connection one**, and a client that could ask for a channel it is not in would be a read-access hole. |
+| A blank `channel_id`? | `message.error` with `blank_channel_id`, before any storage is touched. |
+| Nothing newer than the cursor? | Silence. Not a frame, not an error: a caught-up channel is an ordinary answer. |
+| A storage failure? | `message.error` with `storage_failure`. |
+
+#### The bound is inclusive, and that is a corrected decision
+
+`after` was documented as an **exclusive** lower bound. **It is inclusive, and the
+reasoning is in `sh_nexus_wire/src/frame.rs` on `Resync::after`** — in short:
+`accepted_at_unix_ms` is millisecond resolution, so two messages accepted in the
+same millisecond are ordinary, and a strict bound read from a cursor pointing at
+the first of them drops the second **permanently**, because the cursor has moved
+past it and nothing will ask again. The client already deduplicates on
+`client_msg_id`, so an overlap costs one comparison and a gap costs a message.
+
+**What makes the overlap finite is on the client**: advance to the maximum
+`accepted_at` in the batch — duplicates included — and ask again only while a batch
+comes back full. The cost is one duplicated row per reconnect, which
+`core/ordering.rs` collapses.
+
+#### What a client cannot learn yet
+
+**There is no `resync.result` and no watermark**, although `PLAN.md` §6 describes
+one. So the client can tell *"a batch came back full"* and therefore *whether to
+ask again*; it cannot tell *"the reply contains every message in `(after,
+watermark]`"*. Every resync therefore reports `SyncStatus::Unverifiable`, which
+`core/ordering.rs` §4 calls the correct answer rather than a missing feature. Adding
+the frame is a protocol decision with a real change to `core/ordering.rs` behind it.
 
 ### 2.7 Frame types the server does not send
 

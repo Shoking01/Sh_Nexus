@@ -32,6 +32,7 @@
 //! | A retry re-queues at the back | `a_retry_requeues_at_the_back_and_leaves_on_an_ack_or_a_failure`, `a_retry_at_a_full_queue_is_refused_and_the_row_stays_failed` | hand-written, three-entry queue |
 //! | A queued send never outlives its row | `a_discard_retires_nothing_because_a_failed_send_is_never_queued`, `a_queued_send_at_the_head_is_never_the_row_eviction_takes` | hand-written, through the discard and through eviction |
 //! | A resync echo retires the entry too | `a_resync_echo_of_a_queued_send_retires_its_entry` | hand-written; the third door, and the one the proptest found missing |
+//! | A catch-up's cursor is the batch maximum, duplicates included | `a_catch_up_batches_cursor_is_the_batch_maximum_with_the_duplicate_included` | hand-written; the state-side half of the rule that makes the server's inclusive bound finite |
 //! | A **connected** send whose write fails is owed again, and still arrives | `a_connected_send_whose_write_fails_is_owed_again_and_still_arrives` | hand-written; the residual hole §7.1 used to name as open |
 //! | It is not re-driven while the connection cannot carry it | `an_owed_send_is_not_re_driven_while_the_connection_cannot_carry_it` | `#[rstest]`, five states, twenty flushes each |
 //! | Only the frames carrying durable content are owed | `only_a_message_send_is_owed_when_its_write_fails` in `tests/ws_transport.rs` | hand-written, over `FrameKind::CLIENT` |
@@ -2219,11 +2220,17 @@ fn a_presence_update_is_recorded_and_the_last_one_wins() {
 /// The resync cursor is local state, and it never asks for what is already held.
 ///
 /// `core/models/events.rs` on `ResyncRequested` says the cursor *"comes from local
-/// state, so it is not a thing a frame can carry"*, and `PLAN.md` §6's `after` is
-/// exclusive. The rule that matters: **the newest message this client holds wins
-/// over the recorded cursor**, because a message already held must not be
-/// requested again — and an optimistic row's client-local clock is routinely ahead
-/// of the server's `last_message_at`.
+/// state, so it is not a thing a frame can carry"*. The rule that matters: **the
+/// newest message this client holds wins over the recorded cursor**, because a
+/// message already held must not be requested again — and an optimistic row's
+/// client-local clock is routinely ahead of the server's `last_message_at`.
+///
+/// **`PLAN.md` §6's `after` used to be described as an exclusive bound, and is not
+/// any more.** The wire is inclusive at the server, for the reason
+/// `sh_nexus_wire/src/frame.rs` now argues at length; the rule below is what makes
+/// that safe, and it is unchanged by the reversal — a cursor that names an instant
+/// the client already holds still gets exactly one row back, and the client's own
+/// dedup collapses it.
 #[test]
 fn the_resync_cursor_is_local_state_and_never_re_asks_for_what_is_held() {
     let mut state = loaded();
@@ -2271,6 +2278,99 @@ fn the_resync_cursor_is_local_state_and_never_re_asks_for_what_is_held() {
     );
 }
 
+/// A catch-up batch's cursor is the batch maximum, and a duplicate is part of it.
+///
+/// **The state-side half of the rule that makes the server's inclusive bound
+/// finite**, and the half that is easy to get wrong.
+///
+/// The server's `after` is **inclusive** — `sh_nexus_wire/src/frame.rs` carries the
+/// argument, and the reasoning is that `accepted_at_unix_ms` is millisecond
+/// resolution, so an exclusive bound silently drops every message that shared its
+/// cursor's millisecond. The price is that the boundary row comes back on every
+/// request. **The client must therefore advance to the maximum `accepted_at` in the
+/// batch, duplicates included, and not to "the last row I newly accepted"** — a
+/// version that only moved on new rows would re-read that millisecond forever,
+/// because a replayed row is by definition not newly accepted.
+///
+/// **The batch below ends in a duplicate on purpose, and the assertion is that the
+/// cursor still reaches it.** Rows at `at(1..=3)` are new; the row at `at(9)` is the
+/// boundary the client already holds and the server sent again. A cursor that
+/// tracked only the newly accepted rows would report `at(3)` and ask from there,
+/// which is the loop. The correct answer is `at(9)` — which is also the maximum, so
+/// the two rules coincide here *only because* the duplicate is the batch's newest
+/// row, which is exactly the situation a full batch produces every time.
+///
+/// `resync_cursor` reads `max(recorded, newest held)`, so the duplicate's instant is
+/// the recorded cursor rather than a held row's; that is the same arithmetic
+/// `network::ws::advance_cursor` performs on the wire, and
+/// `tests/ws_transport.rs::the_cursor_advances_to_the_batch_maximum_and_a_duplicate_moves_it_too`
+/// is its other half.
+#[test]
+fn a_catch_up_batches_cursor_is_the_batch_maximum_with_the_duplicate_included() {
+    let mut state = loaded();
+    fire(
+        &mut state,
+        DomainEvent::ResyncRequested {
+            channel_id: "c_0".to_owned(),
+            after: at(0),
+        },
+    );
+
+    // Three new rows, then the boundary row again: an inclusive server returns the
+    // cursor's own instant, so the newest thing in the batch is a duplicate.
+    for (server_id, client, second) in [("m_1", 1_u128, 1_i64), ("m_2", 2, 2), ("m_3", 3, 3)] {
+        fire(
+            &mut state,
+            DomainEvent::MessageReceived(stored(server_id, client, "c_0", "u_ada", "body", second)),
+        );
+    }
+    fire(
+        &mut state,
+        DomainEvent::ResyncRequested {
+            channel_id: "c_0".to_owned(),
+            after: at(9),
+        },
+    );
+    fire(
+        &mut state,
+        DomainEvent::MessageReceived(stored("m_boundary", 4, "c_0", "u_ada", "boundary", 9)),
+    );
+
+    assert_eq!(
+        state.resync_cursor("c_0"),
+        Some(at(9)),
+        "the cursor is the batch maximum. It is not at(3): a cursor that stopped at \
+         the last *newly accepted* row would re-ask from there on every request and \
+         receive the same boundary row for ever, because the server's bound is \
+         inclusive and a replayed row is never newly accepted."
+    );
+
+    // And the duplicate is genuinely a duplicate rather than a fourth row, which is
+    // what makes the whole arrangement possible.
+    assert_eq!(
+        state.message_count("c_0"),
+        4,
+        "the boundary row merged into the row the client already held instead of \
+         arriving beside it"
+    );
+
+    // **A later batch from that cursor cannot move it backwards**, so a replayed
+    // millisecond cannot rewind the ask.
+    fire(
+        &mut state,
+        DomainEvent::ResyncRequested {
+            channel_id: "c_0".to_owned(),
+            after: at(2),
+        },
+    );
+    assert_eq!(
+        state.resync_cursor("c_0"),
+        Some(at(9)),
+        "a cursor never walks backwards; rewinding it would re-read everything after \
+         the older instant"
+    );
+}
+
 /// The gap-detection expectation carries no invented watermark.
 ///
 /// `core/ordering.rs` §4 is explicit that on the protocol as `PLAN.md` §6
@@ -2278,6 +2378,13 @@ fn the_resync_cursor_is_local_state_and_never_re_asks_for_what_is_held() {
 /// correct answer rather than a missing feature: a client that answered "no gaps"
 /// from a timestamp cursor would be asserting something it cannot know. This test
 /// asserts the client does not manufacture the missing field.
+///
+/// **Still true after resync landed, and worth saying why.** The server answers a
+/// `resync` with bare `message.new` frames and no watermark frame, so the client
+/// learns that a batch came back *full* — which is enough to keep asking — and
+/// nothing about the far end of the interval. `PLAN.md` §6's `resync.result` would
+/// close that, and adding it is a protocol decision with a real change to
+/// `core/ordering.rs` behind it, so this unit did not take it.
 #[test]
 fn the_gap_expectation_carries_no_invented_watermark() {
     let mut state = loaded();

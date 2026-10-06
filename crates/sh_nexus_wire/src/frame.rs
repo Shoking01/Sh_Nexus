@@ -365,14 +365,42 @@ pub enum ClientFrame {
     Resync {
         /// The channel to catch up. Non-blank.
         channel_id: String,
-        /// Exclusive lower bound: the client already holds messages up to and
-        /// including this instant, and wants everything strictly after it.
+        /// Lower bound on what the client wants, **inclusive**: the client holds
+        /// messages up to and including this instant, and wants everything at or
+        /// after it.
         ///
-        /// Inclusive here, exclusive at the server, so the boundary is stated
-        /// once instead of twice. A `>` at the server means the last message
-        /// the client holds is never re-sent -- which is the half of "no
-        /// duplicates" that the client's own dedup on `client_msg_id` cannot
-        /// provide, since it has never seen a message it was not sent.
+        /// ## Why inclusive, and what it costs
+        ///
+        /// **This was documented as an exclusive bound, and the server read it
+        /// that way. That was a lost-message bug, not a nicety**, so the reversal
+        /// is argued here rather than made silently:
+        ///
+        /// - The server's acceptance clock is `accepted_at_unix_ms` — **millisecond
+        ///   resolution**. Two messages accepted inside one millisecond are
+        ///   ordinary: a resync burst, or a sender faster than the clock. A cursor
+        ///   pointing at the first of them, read strictly, skips the second
+        ///   **forever** — the cursor has moved past it and nothing will ask for it
+        ///   again. Silent, and unrecoverable, which is the worst pair of
+        ///   properties a message can have.
+        /// - **The client deduplicates on `client_msg_id`.** `crates/sh_nexus`'s
+        ///   `core/ordering.rs` keys every message by identity and collapses what
+        ///   it already holds, so an overlapping row costs one comparison. A gap
+        ///   costs a message.
+        /// - The old argument — that a `>` gives *guaranteed* no-duplicates, which
+        ///   the client's own dedup cannot give because a receiving client has
+        ///   never seen a message it was not sent — is real, and it is a nicety.
+        ///   `AGENTS.md`'s second priority is "no lost messages"; no-gaps is a
+        ///   correctness floor and no-duplicates is a courtesy.
+        ///
+        /// ## What makes the overlap safe: the cursor's advancement rule
+        ///
+        /// An inclusive bound means the boundary millisecond comes back on every
+        /// request, so **a client that advanced its cursor to "the last row I newly
+        /// accepted" would re-read that millisecond forever.** The rule that
+        /// terminates it is: **advance to the maximum `accepted_at` in the batch
+        /// after processing the whole batch, duplicates included, and ask again
+        /// only while a batch comes back full.** One overlapping millisecond per
+        /// reconnect is the price; an unbounded loop is not.
         after: DateTime<Utc>,
     },
 }
