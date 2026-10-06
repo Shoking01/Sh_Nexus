@@ -73,15 +73,22 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        # v5, not v4: v4 targets Node 20, which GitHub is force-running on Node 24
+        # and warning about. v5 is the release that moved to Node 24. `ci.yml` still
+        # pins v4 and still draws the warning -- fixing that is its own change, not
+        # this one's business.
+        uses: actions/checkout@v5
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        # v4, and not a choice. v3 is deprecated in December 2026 and v4 is the only
+        # major tag the project publishes, so this is the current release rather than
+        # an upgrade.
+        uses: github/codeql-action/init@v4
         with:
           # The whole reason this workflow exists. The default setup ignored it.
           config-file: ./.github/codeql-config.yml
 
       - name: Analyze
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: /language:${{ matrix.language }}
