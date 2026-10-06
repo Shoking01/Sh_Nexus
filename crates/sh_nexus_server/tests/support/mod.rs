@@ -120,6 +120,25 @@ pub const ADMIN_USERNAME: &str = "root";
 /// would be obviously wrong rather than plausibly a real credential.
 pub const ADMIN_PASSWORD: &str = "fixture-admin-passphrase";
 
+/// The password every [`TestServer::create_account`] fixture account gets.
+///
+/// **A constant rather than `format!("{username}-passphrase")`, and the reason is
+/// CodeQL rather than taste.** Deriving it from the username meant every caller's
+/// username literal flowed through `format!` into [`auth::hash_password`], which
+/// CodeQL read as a hard-coded credential and reported at `critical` security
+/// severity. It was always a false positive — `username` is a name, not a secret —
+/// but it fired on every fixture account in the suite, so a finding that says
+/// nothing was burying the ones that might.
+///
+/// **Nothing logs in with this, so changing it costs nothing.** An account that
+/// needs a *known* password is created through `create_account_over_http` or
+/// hashed inline, which is what the authentication suites do; this one exists for
+/// suites about the socket, which authenticate with
+/// [`TestServer::session_for`] and never present a password at all. The value was
+/// changed anyway, so the reason for the constant is visible rather than
+/// historical.
+pub const FIXTURE_PASSWORD: &str = "fixture-account-passphrase";
+
 /// A password for an account that [`TestServer::start`] does not create.
 ///
 /// For the login-failure tests. Distinguishable from [`ADMIN_PASSWORD`] so a
@@ -393,6 +412,8 @@ impl TestServer {
     ///
     /// For suites that need a *second* identity -- a non-member, or a second
     /// member whose messages must be distinguishable from the administrator's.
+    /// Builds an account for a socket-level suite.
+    ///
     /// Goes through [`Store::create_account`] rather than through
     /// `POST /admin/users` so that a suite about the socket does not also have to
     /// be a suite about HTTP.
@@ -404,8 +425,7 @@ impl TestServer {
     /// test asked for the same account twice.
     pub fn create_account(&self, username: &str, join_default_channel: bool) -> String {
         let store = self.store.as_ref().expect("a live store");
-        let hash = auth::hash_password(&format!("{username}-passphrase"))
-            .expect("a hash for the fixture account");
+        let hash = auth::hash_password(FIXTURE_PASSWORD).expect("a hash for the fixture account");
         let account = store
             .create_account(username, username, &hash, false)
             .expect("a fixture account");
