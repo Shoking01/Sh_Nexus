@@ -417,3 +417,128 @@ argon2 = "0.6"
 #   between declaring a hash function and declaring a hash function *as a
 #   standard*, and only the first is true here.
 sha2 = { version = "0.11", default-features = false, features = ["alloc"] }
+
+# ===========================================================================
+# The AUTH milestone's CLIENT half -- one HTTP POST
+# ===========================================================================
+#
+# The login milestone needs exactly one HTTP request from the client: `POST
+# /auth/login`. `std` has no HTTP client, and neither does GPUI at the pinned rev,
+# so one of these is being added rather than chosen. All three are **already in
+# `Cargo.lock`** -- `docs/DEPENDENCIES.md:70` audits them together in one row,
+# "axum's HTTP stack", which is the server's own stack and the only HTTP
+# implementation this workspace has ever compiled.
+#
+# **The alternative was `reqwest`, and it is the wrong one here.** It is genuinely
+# new to `Cargo.lock` and it drags in a TLS backend, which this project has
+# declined twice on purpose: `docs/DEPENDENCIES.md:106` records that `ring` and
+# `rustls` are absent *by decision*, and the server's auth milestone chose opaque
+# session tokens partly to stay out of that stack. `reqwest` is also, for this
+# project, the crate that would make "no TLS" impossible to keep true: its default
+# TLS features are on, and turning them off buys a client with no way to reach
+# anything that is not loopback -- which, per `AGENTS.md` 7.4's rule about never
+# disabling certificate validation in release, is a stack that has to be audited
+# when it arrives rather than smuggled in with a login form.
+#
+# **Criterion 5 (compile-time impact) is a real figure here and is stated as one --
+# including the part that is worse than "no new compile units".**
+# These crates were already compiled by every `cargo build --workspace`, because
+# `sh_nexus_server` depends on them through `axum`. What changes is narrower and
+# worth naming precisely rather than rounding off: a `cargo build -p sh_nexus`
+# now compiles `hyper` and `hyper-util` for the first time, and the client binary
+# links them. `docs/DEPENDENCIES.md` records the client's binary size per
+# milestone, so the release figure is re-measured there rather than guessed at
+# here.
+#
+# **TWO PACKAGES ARE GENUINELY NEW TO `Cargo.lock`, and they are this file's own
+# admission that the "already here" argument has a limit.** A hyper *server* needs
+# no request-body machinery, so axum never enabled `hyper/client` -- and `client`
+# is what pulls `want` 0.3.1, which in turn pulls `try-lock` 0.2.5. Both are tiny
+# pure-Rust crates with no C dependency, no build script and no proc-macro, and
+# both exist for hyper's own cancellable-request plumbing; they are not ours to
+# choose, and there is no configuration of hyper that yields an HTTP client without
+# them. They are named here so the figure in `docs/DEPENDENCIES.md` is a real one
+# rather than an argument.
+
+# hyper 1.11.1 | MIT | actively maintained (1.11.x is the current line) |
+#   crates.io, hundreds of millions of downloads/month | MSRV well inside our
+#   1.99.0 | pure Rust, no C dependency, no build script, no proc-macro.
+#
+#   Criterion 1: `AGENTS.md` 3.1 names `network/rest.rs` as a client module and
+#   7.4 requires "timeouts on everything" plus an explicit, distinguishable
+#   mapping of HTTP status to outcome -- and no such thing exists in `std`. The
+#   whole *request* half of 7.4 (`rest.rs`'s row in the 4.2 test matrix:
+#   "request construction; auth header injection; error status mapping; retry on
+#   5xx/network, never on 4xx") is unimplementable without it.
+#
+#   Feature choice: `client` and `http1`, and **nothing else**. `http2` is off
+#   because the server this client talks to is `axum` on plain HTTP/1.1 and
+#   adding the second protocol is a claim nothing here can test. Every TLS
+#   feature stays off for the reason the paragraph above gives, and `server` is
+#   off because a client that also serves HTTP is a server, which is
+#   `sh_nexus_server`'s job and its crate's.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+
+# hyper-util 0.1.21 | MIT | actively maintained (0.1.21 is the current release) |
+#   crates.io, tens of millions of downloads/month | pure Rust, no C, no build
+#   script, no proc-macro.
+#
+#   Criterion 1: hyper 1.x deliberately ships **no** connector, **no** executor
+#   and **no** pooling -- it is a protocol implementation, and every one of those
+#   is a policy decision it refuses to make. `hyper_util::client::legacy::Client`
+#   is the piece that opens a TCP socket, spawns the work onto a runtime and
+#   hands back a future. Declaring `hyper` without it yields a client that cannot
+#   reach a host, so this is not a convenience import: it is the other half of
+#   the same dependency.
+#
+#   Feature choice, and each entry is a refusal as much as a need:
+#     - `client-legacy` -- the ergonomic `Client`. The alternative is assembling
+#       `hyper::client::conn::http1::handshake` per request and writing a
+#       `hyper::rt::Read + Write` adapter over `tokio::net::TcpStream` by hand.
+#       That is ~150 lines of adapter in a crate whose whole job is to be the
+#       other side of that adapter.
+#     - `client` -- implied by `client-legacy`, named for the same reason
+#       `chrono/clock` and `uuid/v4` above were named: a declaration that says
+#       nothing while the build depends on someone else's feature set is not a
+#       declaration.
+#     - `http1` -- implied again, and the reason `hyper/http1` is on above.
+#     - `tokio` -- **this is the load-bearing one**, and it is what
+#       `TokioExecutor` and the timeout machinery hang off. `AGENTS.md` 7.4's
+#       "request (10s)" needs a timer, and `tokio/time` is where a timer is.
+#     - OFF: `client-pool` (hyper-util does not enable the pool by default and one
+#       login per session gains nothing from reusing a connection),
+#       `client-proxy` and `client-proxy-system` (this client must never read a
+#       proxy configuration, and `AGENTS.md` 3.3 has no variant for one),
+#       `server` / `server-auto` / `server-graceful` (see `hyper` above),
+#       `http2` (see `hyper` above), `service` (a `tower::Service` re-export with
+#       no consumer), `tracing` (hyper-util's own spans would arrive at a
+#       subscriber this client installs for its own events).
+hyper-util = { version = "0.1", default-features = false, features = [
+    "client",
+    "client-legacy",
+    "http1",
+    "tokio",
+] }
+
+# http-body-util 0.1.3 | MIT | actively maintained (0.1.x) | crates.io, tens of
+#   millions of downloads/month | pure Rust, no C, no build script, no
+#   proc-macro.
+#
+#   Criterion 1: it is the only spelling of the two operations this client needs
+#   from a response body, and neither has an inherent method on
+#   `hyper::body::Incoming`:
+#     - `Full<Bytes>` -- the request body. hyper accepts any `hyper::body::Body`,
+#       and a whole-buffer body is the honest shape for a login form: the request
+#       is a username and a password and it fits in one buffer by construction.
+#     - `BodyExt::collect` -- reading the response. hyper 1.x removed the
+#       inherent `.collect()` precisely because it belongs to the extension trait
+#       rather than to any one body type.
+#   `docs/DEPENDENCIES.md:70` audits it in the same "axum's HTTP stack" row as
+#   `hyper` and `hyper-util`, so this is the third crate of that row becoming a
+#   direct dependency of the client rather than a new entry in it.
+#
+#   Feature choice: defaults (`default`), which are empty. The crate has no
+#   optional dependencies at this version, so there is nothing to turn off and
+#   saying `default-features = false` would be a claim about a feature set that
+#   does not exist.
+http-body-util = "0.1"

@@ -22,12 +22,17 @@
 //! §2.1 requires to happen before a payload touches state. [`ws`] is the
 //! WebSocket transport that produces those events, on a worker thread, and hands
 //! them to `state/bridge.rs` — the only module in this crate permitted to reach
-//! the main thread.
+//! the main thread. [`rest`] is the one HTTP request the client makes,
+//! `POST /auth/login`, which is what turns a window into a usable application.
 //!
-//! `rest` and `auth` are `AGENTS.md` §3.1 modules that arrive with ADR-010's
-//! next PR (`PLAN.md` §8), and they are **not** declared here rather than
-//! declared empty: a module that exists and does nothing reads as finished work,
-//! and `cargo` will not tell anyone it is hollow.
+//! `auth` is still **not** declared here rather than declared empty: a module that
+//! exists and does nothing reads as finished work, and `cargo` will not tell
+//! anyone it is hollow. **What the login milestone produced is a `rest.rs` that
+//! reads and a token the shell holds**, not an `auth.rs`: there is no JWT to
+//! parse and no refresh to schedule, because ADR-010 chose opaque tokens and
+//! `sh_nexus_server` answers an expired handshake with a 401 that the reconnect
+//! path already surfaces as `ConnectionState::Rejected`. A client-side `Auth`
+//! type with nothing in it is the hollow module this paragraph is about.
 //!
 //! **The transport does not live in a file called `websocket.rs`, and `ws.rs` is
 //! the reason.** `AGENTS.md` §3.1's table names the module `websocket.rs`, and
@@ -37,6 +42,11 @@
 //! `websocket.rs` would have merged two entries of the constitution's own tree
 //! into one file, and `reconnect.rs` deserves its own row in that table the day
 //! `Auth` lands beside it.
+//!
+//! **`rest.rs` follows the same rule and is not called `http.rs`**, for the same
+//! reason: `AGENTS.md` §3.1's table has a row for it, and the row is what a
+//! reader of the constitution will look for.
 
 pub mod mapping;
+pub mod rest;
 pub mod ws;

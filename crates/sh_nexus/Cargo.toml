@@ -202,6 +202,42 @@ tokio = { workspace = true, features = ["time", "rt"] }
 #   proc-macro crate.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# hyper: the HTTP protocol implementation behind `network/rest.rs`, which is
+# `AGENTS.md` 3.1's client REST module and the one request the login view needs
+# (`POST /auth/login`). The full 7.2 audit -- version, license, maintenance,
+# download volume, the `client`/`http1` feature choice and why every TLS feature
+# is off -- is in the root manifest.
+#
+# NOT a new crate: `docs/DEPENDENCIES.md:70` already audits `hyper` in one row
+# with the server's own HTTP stack, because `sh_nexus_server` depends on it
+# through `axum`. **The honest part of that claim is narrower than "costs nothing",
+# and the root manifest states it in full:** every `cargo build --workspace`
+# already compiled this crate, so there is no new compile unit for the workspace --
+# but a `cargo build -p sh_nexus` now compiles it for the first time, the client
+# binary links it, and the `client` feature (which a hyper *server* never needs)
+# adds `want` and `try-lock` to `Cargo.lock`.
+#
+# The alternative considered and rejected is `reqwest`, and the reason is a
+# decision rather than a preference: `docs/DEPENDENCIES.md:106` records that
+# `ring` and `rustls` are absent from this project **by choice**, and `reqwest`
+# arrives with a TLS backend attached. `AGENTS.md` 7.4's rule about never
+# disabling certificate validation in a release build is a rule about a stack
+# that does not exist yet, and adding the stack to deliver a login form would
+# make the rule unauditable rather than satisfied.
+hyper = { workspace = true }
+
+# hyper-util: the connector, executor and pooling policy hyper 1.x deliberately
+# does not ship. Without it `hyper` is a protocol implementation that cannot open
+# a socket, so this is the other half of the dependency above rather than a
+# convenience import. Audited in the root manifest, feature choice included.
+hyper-util = { workspace = true }
+
+# http-body-util: the only spelling of `Full<Bytes>` and of `BodyExt::collect`,
+# which is what one POST body and one response body need. Audited in the root
+# manifest; it is the third crate of `docs/DEPENDENCIES.md:70`'s "axum's HTTP
+# stack" row to become a direct dependency of the client rather than a new row.
+http-body-util = { workspace = true }
+
 [dev-dependencies]
 # proptest: `AGENTS.md` 4.4 mandates it. Its property tests here cover the
 # properties the hand-written cases cannot: that no wire value at all reaches
