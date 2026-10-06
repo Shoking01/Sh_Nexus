@@ -126,6 +126,11 @@
 //! protocol as specified today every resync is `Unverifiable` and that is the
 //! correct answer.
 //!
+//! **The event now has a producer, which it did not have when this section was
+//! written.** `network/ws.rs` emits one per channel on every connect, from the
+//! cursor it recorded for that channel — see §7.4 for why the *asking* stays on
+//! the wire side and only the *record* is here.
+//!
 //! # 6. Purity
 //!
 //! No `gpui`, no `tokio`, no I/O, no clock, no interior mutability. Checked
@@ -213,24 +218,43 @@
 //! starve everything queued behind it while reordering this client's history
 //! against every other client's.
 //!
-//! ## 7.3 The bound, and the accepted deviation
+//! ## 7.3 The bound, and where the resync happens
 //!
 //! **At [`MAX_OUTBOX_ENTRIES`] the enqueue is refused** and the row reads
 //! `Failed` with a reason naming the bound. Not the oldest dropped, not the
 //! newest: §7's *"failures are never silently dropped"* forbids both.
 //!
-//! **§7 says "the client resyncs per channel … then flushes the outbox", and the
-//! resync does not happen.** `request_resync` has no production caller — it is
-//! referenced only from doctests in `network/ws.rs`, and `resyncs_sent` is a
-//! counter nothing drives — so the flush runs without one. **This is safe rather
-//! than convenient:** the server does not echo to the sender, and
-//! `core::ordering` dedupes by `client_msg_id`, so resync-then-flush and
-//! flush-then-resync converge on the same held set with no duplicate and no gap.
-//! **What is therefore NOT provided is the ordering guarantee §7 asks for** —
-//! where this client's own message lands among other people's. Closing it belongs
-//! with the resync work.
+//! **§7's ordering — "the client resyncs per channel … then flushes the outbox" —
+//! is honoured, and the resync is no longer missing.** It used to be, and this
+//! section said so: `request_resync` had no production caller and `resyncs_sent`
+//! was a counter nothing drove. **Both now have one, and neither of them is this
+//! module.** `network/ws.rs` asks on every connect, from the per-channel cursor it
+//! records from each delivered `message.new` and `message.ack`, and keeps asking
+//! while a batch comes back full; §7's sequence is honoured because the request
+//! goes out before the read loop starts and the outbox is driven from the shell's
+//! tick, which is strictly later.
 //!
-//! ## 7.4 Durability
+//! **The safety argument this section used to make is now the whole answer.** The
+//! server does not echo to the sender and `core::ordering` dedupes by
+//! `client_msg_id`, so resync-then-flush and flush-then-resync converge on the same
+//! held set with no duplicate and no gap — which is why the ordering guarantee §7
+//! asks for was never at risk, and why closing the gap could not make things worse.
+//!
+//! ## 7.4 What the state owns of a resync
+//!
+//! **The cursor, and nothing else — and this is a division rather than an
+//! oversight.** [`AppState::record_resync_cursor`] is what
+//! [`DomainEvent::ResyncRequested`] records, and [`AppState::resync_cursor`] is
+//! what `core::ordering` reads to judge continuity. Both are the same arithmetic —
+//! `max(recorded, newest held)` — as `network::ws::advance_cursor` on the wire
+//! side, so the two agree by construction rather than by convention.
+//!
+//! **The *asking* is `network/`'s and cannot be moved here.** A batch is a run of
+//! frames on one socket, counting one needs the read loop, and `AGENTS.md` §3.2
+//! forbids `state/` from reaching `network/`. What this layer contributes is the
+//! record, which is what makes `sync_expectation` answerable at all.
+//!
+//! ## 7.5 Durability
 //!
 //! **This queue is in memory, and a client that exits before the connection
 //! returns loses what it held.** `PLAN.md` §7's outbox is persistence and
@@ -753,8 +777,11 @@ pub fn apply_event(state: &mut AppState, event: DomainEvent) -> ApplyOutcome {
         }
 
         DomainEvent::ResyncRequested { channel_id, after } => {
-            // A question, not an instruction: the cursor is local state, and
-            // `AppState::resync_cursor` is the answer. Module docs, section 5.
+            // A record, not an instruction: the cursor is local state, and
+            // `AppState::resync_cursor` is the answer. Module docs, sections 5 and
+            // 7.4. `network/ws.rs` is the producer — it emits one per channel on
+            // every connect — and the *asking* it does from the same cursor, because
+            // only the read loop can see a batch arrive.
             state.record_resync_cursor(&channel_id, after);
             ApplyOutcome::Applied
         }

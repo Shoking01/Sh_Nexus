@@ -32,8 +32,69 @@
 //!   `crates/sh_nexus/tests/layer_boundary.rs` scan this directory for those
 //!   tokens and fail the build on any of them.
 //!
-//! # Why one `tokio` runtime per transport, on its own OS thread
+//! # The catch-up loop: per channel, from a cursor, and bounded
 //!
+//! `AGENTS.md` §7.4: *"Reconnection must resume from the last known
+//! `last_message_at` cursor — never rely solely on 'live' delivery during a gap."*
+//! `PLAN.md` §7 puts it first in the reconnect sequence, ahead of the outbox flush.
+//!
+//! **Three rules, and each of them exists because the alternative loses something.**
+//!
+//! 1. **The cursor is per channel and it advances to the batch maximum.** See
+//!    [`advance_cursor`] for the arithmetic and for why "the last row I newly
+//!    accepted" is the version that loops forever.
+//! 2. **Ask again only while a batch comes back full.** [`catch_up`] is the whole of
+//!    that policy, and [`RESYNC_BATCH_LIMIT`] is the number it counts against.
+//! 3. **A short batch is caught up**, which is what terminates the loop. With no
+//!    end-of-batch marker on the wire this is a *conclusion*, not an observation:
+//!    the client cannot see the batch end, it can only see that fewer than the
+//!    limit arrived and therefore stops asking.
+//!
+//! ## Where the rule lives, and why not in `state/`
+//!
+//! **In this module, because it is the only layer that can see a batch.** A batch is
+//! a run of frames on one socket; counting it needs the read loop, and `state/` may
+//! not reach `network/` (`AGENTS.md` §3.2) nor hold this thread's socket. The
+//! decision itself is therefore written as two free functions with doctests, which
+//! is this module's standing answer to "a decision the worker makes on a socket is
+//! not observable from outside the socket" — the same reason `keepalive_action`,
+//! `classify_frame_error` and `is_unauthorized` are free functions.
+//!
+//! `state/actions.rs` keeps the mirror of the same arithmetic, in
+//! `AppState::resync_cursor`, and that is not a second policy: both are
+//! `max(recorded, newest held)`, and the state's own docs say which is which.
+//!
+//! ## Which channels are asked about
+//!
+//! **Every channel this client holds a message in, which is why the cursor map
+//! learns from traffic rather than only from [`WsTransport::request_resync`].**
+//! `Hub::broadcast` fans a message out to every connection, so a delivered
+//! `message.new` is proof this client holds that channel's newest message — which is
+//! precisely what a resume cursor is. Learning from it is what makes a reconnect ask
+//! per channel with no channel list, no bridge door and no caller.
+//!
+//! **A channel this account is not a member of is still asked about, and the server
+//! refuses it with `not_a_member`.** That is a real cost of not knowing the user's
+//! channels — `GET /channels` does not exist yet — and it is bounded and safe: one
+//! request and one refusal per such channel per reconnect, no history, and no effect
+//! on the channels the client can read. The alternative, asking only for channels
+//! some caller nominated, is a resync that never happens in the shipped client,
+//! which is the invisible failure this loop exists to remove.
+//!
+//! ## The cost that is paid rather than avoided
+//!
+//! **A channel stays armed after a short batch, because "the batch ended" is not
+//! something this layer can observe.** So `RESYNC_BATCH_LIMIT` further live messages
+//! in that channel produce one redundant `resync`, which returns the single boundary
+//! row the client already holds and which `core/ordering` collapses. That is one
+//! request per 256 messages, it costs a duplicate comparison rather than a gap, and
+//! it has the side effect of recovering anything a refused delivery lost — which is
+//! why it is stated rather than designed around. The clean answer is a
+//! `resync.result` carrying a watermark, which `PLAN.md` §6 describes and
+//! `core/ordering.rs` §4 is already waiting for; that is a protocol addition, and it
+//! is not this module's to make.
+//!
+//! # Why one `tokio` runtime per transport, on its own OS thread//!
 //! A current-thread runtime inside one named `std::thread` per transport. The
 //! alternatives were a shared multi-thread runtime (which needs a process-wide
 //! owner, and `network/` is not allowed to own application lifecycle), a task on
@@ -239,6 +300,126 @@ pub const JITTER_BUCKETS: u16 = (2 * JITTER_RANGE_PERMILLE + 1) as u16;
 
 /// How many frames may sit in the outbound queue before a send is refused.
 pub const MAX_OUTBOUND_FRAMES: usize = 256;
+
+/// The largest catch-up batch this client treats as *"there may be more"*: 256.
+///
+/// **A mirror of `sh_nexus_server::ws::RESYNC_BATCH_LIMIT`, and the two numbers
+/// have to agree.** This one decides when to ask again; the server's decides how
+/// much comes back. A client counting against a different bound would either stop
+/// early and lose messages or ask forever after a short batch — and neither failure
+/// would be visible from inside this process, because both look like a quiet channel.
+///
+/// **It is [`MAX_OUTBOUND_FRAMES`]'s number for the same reason the server uses
+/// [`sh_nexus_server::hub::CAPACITY`]'s.** One number per wire, bounded at both
+/// ends, so a catch-up costs one bounded buffer on each side.
+pub const RESYNC_BATCH_LIMIT: usize = MAX_OUTBOUND_FRAMES;
+
+/// What the client does with a channel's catch-up once one more message arrives.
+///
+/// **Two outcomes and no third, and the absent one is the point.** There is no
+/// "caught up" variant, because this layer cannot observe a batch ending — see the
+/// module docs, "The catch-up loop". What it *can* observe is a batch that came back
+/// full, and that is the only thing worth acting on: it is the server's own
+/// statement that more rows exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchUp {
+    /// The batch has not filled yet. Nothing is asked for.
+    Pending,
+    /// The batch came back full, so the cursor has advanced and there may be more.
+    /// Ask again from the advanced cursor.
+    AskAgain,
+}
+
+/// Whether a catch-up batch of `received` rows means there is more to fetch.
+///
+/// **The whole of "ask again while a batch comes back full", as a pure function.**
+///
+/// The rule is `received >= batch_limit` rather than `==`: the counter is reset by
+/// the re-ask rather than by the observation, so a caller that increments past the
+/// bound without resetting — a bug worth surviving rather than looping on — asks
+/// again instead of stalling with rows left on the table.
+///
+/// # Example
+///
+/// ```
+/// use sh_nexus::network::ws::{catch_up, CatchUp, RESYNC_BATCH_LIMIT};
+///
+/// // A short batch is caught up: this is what terminates the loop.
+/// assert_eq!(catch_up(1, RESYNC_BATCH_LIMIT), CatchUp::Pending);
+/// assert_eq!(catch_up(RESYNC_BATCH_LIMIT - 1, RESYNC_BATCH_LIMIT), CatchUp::Pending);
+///
+/// // A full batch may have more behind it.
+/// assert_eq!(catch_up(RESYNC_BATCH_LIMIT, RESYNC_BATCH_LIMIT), CatchUp::AskAgain);
+///
+/// // The rule is `>=`, not `==`: a counter that ran past the bound asks again
+/// // rather than leaving messages on the table.
+/// assert_eq!(catch_up(RESYNC_BATCH_LIMIT + 9, RESYNC_BATCH_LIMIT), CatchUp::AskAgain);
+/// ```
+pub fn catch_up(received: usize, batch_limit: usize) -> CatchUp {
+    if received >= batch_limit {
+        CatchUp::AskAgain
+    } else {
+        CatchUp::Pending
+    }
+}
+
+/// Records `timestamp` as the newest message this client holds in `channel_id`,
+/// and returns the cursor a catch-up of that channel would resume from.
+///
+/// **This is the advancement rule, and it is `max`, unconditionally.** Two
+/// properties of it are load-bearing:
+///
+/// - **It moves for a row the client already held.** The server's bound is
+///   inclusive — `sh_nexus_wire/src/frame.rs`'s `Resync::after` carries the
+///   argument — so the boundary millisecond comes back on every request. A version
+///   that only moved on a *newly accepted* row would re-read that millisecond
+///   forever, because the replay of a held row is by definition not newly accepted.
+///   **Inclusive replay without this rule is an infinite loop; with it, it is one
+///   overlapping millisecond per reconnect.**
+/// - **It never moves backwards.** A late frame carrying an older `accepted_at` than
+///   one already seen must not drag the cursor behind it, or the next catch-up would
+///   re-read everything after it. `AppState::record_resync_cursor` does the same
+///   arithmetic on the state side, and `AppState::resync_cursor` is the same `max`
+///   over the same two facts.
+///
+/// An unseen channel is inserted rather than ignored: a delivered `message.new` is
+/// the only evidence this client holds anything about a channel, and it is what
+/// makes a reconnect ask per channel without a channel list (module docs, "Which
+/// channels are asked about").
+///
+/// # Example
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// use chrono::{DateTime, Utc};
+/// use sh_nexus::network::ws::advance_cursor;
+///
+/// fn at(second: i64) -> DateTime<Utc> {
+///     DateTime::from_timestamp(1_789_000_000 + second, 0).expect("in range")
+/// }
+///
+/// let mut cursors: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
+/// assert_eq!(advance_cursor(&mut cursors, "c_1", at(10)), at(10));
+///
+/// // A replayed boundary row is older-or-equal, so it neither moves the cursor
+/// // nor rewinds it.
+/// assert_eq!(advance_cursor(&mut cursors, "c_1", at(10)), at(10));
+/// assert_eq!(advance_cursor(&mut cursors, "c_1", at(4)), at(10));
+///
+/// // A newer row does move it, which is what a catch-up batch's maximum means.
+/// assert_eq!(advance_cursor(&mut cursors, "c_1", at(30)), at(30));
+/// ```
+pub fn advance_cursor(
+    cursors: &mut BTreeMap<String, DateTime<Utc>>,
+    channel_id: &str,
+    timestamp: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let slot = cursors.entry(channel_id.to_owned()).or_insert(timestamp);
+    if *slot < timestamp {
+        *slot = timestamp;
+    }
+    *slot
+}
 
 /// The protocol major version every frame this transport writes carries.
 ///
@@ -1142,6 +1323,7 @@ impl WsTransport {
             events,
             outbound: inbound,
             cursors: BTreeMap::new(),
+            catch_up_counts: BTreeMap::new(),
             counters: Arc::clone(&counters),
             shutdown: Arc::clone(&shutdown),
             closed: Arc::clone(&closed),
@@ -1240,28 +1422,40 @@ impl WsTransport {
     /// had not caught up on, and §8.1's Reconnect Flow requires no duplicates
     /// *and* no gaps.
     ///
+    /// # It is a starting point, not the whole mechanism
+    ///
+    /// **A caller no longer has to name a channel for this client to catch up.**
+    /// The worker learns one from every `message.new` it successfully delivers, so a
+    /// reconnect asks for every channel this client holds something in — see the
+    /// module docs, "Which channels are asked about". This method remains because it
+    /// is how a caller asks for a channel the client has *never* seen traffic in
+    /// (a channel created while the client was offline, or a first catch-up of a
+    /// quiet channel), and because arming the follow-up batches is what starts a
+    /// multi-batch catch-up.
+    ///
     /// # Why the cursor is remembered here and not read from local state
     ///
-    /// The cursor lives in `AppState`, and `AppState` is main-thread-only
+    /// The cursor also lives in `AppState`, and `AppState` is main-thread-only
     /// (`docs/ARCHITECTURE.md` ADR-009). This thread cannot read it, and
     /// [`DomainEvent::ResyncRequested`] exists precisely because the answer is
-    /// local state. So the caller reads it on the main thread and hands it over
-    /// here — and once handed over it is remembered, so **every** future reconnect
-    /// replays it without the caller being asked again. That is the difference
-    /// between sending a resync and reconnecting that resumes.
+    /// local state — the worker's copy is authoritative for the wire, the state's for
+    /// `sync_expectation`, and both are the same `max` over the same two facts. So
+    /// the caller may hand a cursor over, and once handed over it is remembered, so
+    /// **every** future reconnect replays it without the caller being asked again.
+    /// That is the difference between sending a resync and reconnecting that resumes.
     ///
     /// # Arguments
     ///
     /// * `channel_id` - the channel to catch up.
-    /// * `after` - the inclusive cursor: everything strictly later is wanted.
-    ///   [`epoch_cursor`] when this client holds nothing for the channel.
+    /// * `after` - the **inclusive** cursor: everything at or after this instant is
+    ///   wanted. [`epoch_cursor`] when this client holds nothing for the channel.
     ///
     /// # Returns
     ///
-    /// `Ok(())` once queued. No server answers a `resync` in this milestone —
-    /// `sh_nexus_server/src/ws.rs` decodes it, logs it at `warn!` and keeps the
-    /// connection — so there is nothing to wait for and the frame's effect is
-    /// counted in [`TransportStats::resyncs_sent`] instead.
+    /// `Ok(())` once queued. **Nothing acknowledges a `resync`** — the answer is the
+    /// replayed `message.new` frames, arriving on the inbox as
+    /// [`DomainEvent::MessageReceived`] — so there is no outcome to wait for here and
+    /// the request's effect is counted in [`TransportStats::resyncs_sent`] as well.
     ///
     /// # Errors
     ///
@@ -1478,7 +1672,18 @@ struct Session {
     config: Arc<TransportConfig>,
     events: EventSender,
     outbound: mpsc::Receiver<Outbound>,
+    /// The newest message this client holds, per channel. See [`advance_cursor`].
     cursors: BTreeMap<String, DateTime<Utc>>,
+    /// How many messages have been delivered per channel since the last `resync`
+    /// was written for it. See [`catch_up`].
+    ///
+    /// **An entry is the channel's arming, and its absence is what stops the loop
+    /// asking.** A channel is armed when a `resync` goes out for it — on a connect,
+    /// or because a caller asked for one — and stays armed until the connection
+    /// ends. A channel that was never asked about therefore has no entry and can
+    /// never trigger a re-ask, which is what keeps ordinary live traffic from
+    /// turning into a request storm.
+    catch_up_counts: BTreeMap<String, usize>,
     counters: Arc<Counters>,
     shutdown: Arc<Notify>,
     closed: Arc<AtomicBool>,
@@ -1632,21 +1837,57 @@ impl Session {
         // fast the two happened to arrive rather than on anything the client
         // controls. Collected first because the borrow of `cursors` has to end
         // before the socket is written to.
-        let replay: Vec<ClientFrame> = self
+        //
+        // **Each one also arms that channel's catch-up counter**, which is what
+        // makes a multi-batch catch-up continue: the count is reset to zero here and
+        // the read loop asks again when it reaches `RESYNC_BATCH_LIMIT`.
+        let replay: Vec<(String, DateTime<Utc>)> = self
             .cursors
             .iter()
-            .map(|(channel_id, after)| ClientFrame::Resync {
-                channel_id: channel_id.clone(),
-                after: *after,
-            })
+            .map(|(channel_id, after)| (channel_id.clone(), *after))
             .collect();
-        for frame in replay {
-            if !self.write(&mut socket, Uuid::new_v4(), frame).await {
+        for (channel_id, after) in replay {
+            self.catch_up_counts.insert(channel_id.clone(), 0);
+            if !self
+                .write(
+                    &mut socket,
+                    Uuid::new_v4(),
+                    ClientFrame::Resync {
+                        channel_id: channel_id.clone(),
+                        after,
+                    },
+                )
+                .await
+            {
                 return Outcome::Established;
             }
         }
 
         self.emit_connection(ConnectionState::Connected);
+
+        // **One `ResyncRequested` per channel, after `Connected` and never before.**
+        //
+        // `core/models/events.rs` documents this event as produced by the reconnect
+        // path, once per channel, "each carrying that channel's own
+        // `last_message_at`" — and until now nothing produced it, so
+        // `actions::apply_event`'s arm for it was reachable only from a test. It is
+        // how the state learns a cursor it would otherwise hold only implicitly:
+        // `AppState::resync_cursor` reads the recorded cursor and the newest held
+        // message, and `sync_expectation` is built from it.
+        //
+        // **After `Connected`, so the state sees the connection before it is told
+        // about work on it**, and **after the frames are written**, so the ordering
+        // the comment above depends on — catch-up first, live delivery second — is
+        // not disturbed by where the events land in the inbox.
+        let requested: Vec<(String, DateTime<Utc>)> = self
+            .cursors
+            .iter()
+            .map(|(channel_id, after)| (channel_id.clone(), *after))
+            .collect();
+        for (channel_id, after) in requested {
+            self.emit_event(DomainEvent::ResyncRequested { channel_id, after });
+        }
+
         self.serve(socket).await
     }
 
@@ -1658,6 +1899,7 @@ impl Session {
             counters,
             shutdown,
             cursors,
+            catch_up_counts,
             outbound,
             ..
         } = self;
@@ -1714,6 +1956,13 @@ impl Session {
                         if remember {
                             if let ClientFrame::Resync { channel_id, after } = &frame {
                                 cursors.insert(channel_id.clone(), *after);
+                                // **Arming here, not only on connect**, because this
+                                // is the door a caller uses to ask for a channel the
+                                // transport has never heard of. An unarmed channel
+                                // has no counter, so its messages would advance the
+                                // cursor and never trigger the follow-up request a
+                                // client that missed 10 000 messages needs.
+                                catch_up_counts.insert(channel_id.clone(), 0);
                             }
                         }
                         if !write_frame(&mut socket, id, frame, counters).await {
@@ -1753,8 +2002,53 @@ impl Session {
                     Some(Err(_)) => return Outcome::Established,
                     Some(Ok(message)) => {
                         silent_for = Duration::ZERO;
-                        if let Outcome::Rejected(state) = on_message(events, counters, &message) {
+                        let (outcome, delivered) = on_message(events, counters, &message);
+                        if let Outcome::Rejected(state) = outcome {
                             return Outcome::Rejected(state);
+                        }
+                        // **Only a frame that reached the inbox moves the cursor.**
+                        // `delivered` is `None` for a decode failure, a mapping
+                        // refusal and a full inbox alike -- and in each of those
+                        // cases this client does *not* hold the row. Advancing past it
+                        // would make the next reconnect skip a message permanently,
+                        // which is the one failure `AGENTS.md` ranks second.
+                        let Some(delivered) = delivered else {
+                            continue;
+                        };
+                        let advanced =
+                            advance_cursor(cursors, &delivered.channel_id, delivered.timestamp);
+                        // **An ack is not a batch row**, so it moves the cursor and
+                        // stops there. Counting it would let a send composed during a
+                        // catch-up provoke a request that recovers nothing.
+                        if !delivered.in_batch {
+                            continue;
+                        }
+                        // A channel with no counter was never asked about, so its
+                        // live traffic advances the cursor and nothing else.
+                        let Some(received) = catch_up_counts.get_mut(&delivered.channel_id) else {
+                            continue;
+                        };
+                        *received = received.saturating_add(1);
+                        if catch_up(*received, RESYNC_BATCH_LIMIT) == CatchUp::Pending {
+                            continue;
+                        }
+                        // **The batch came back full: ask again from where it ended.**
+                        // The write goes out on this same socket, from this same
+                        // branch, so the re-ask costs one frame and does not queue
+                        // behind anything.
+                        *received = 0;
+                        if !write_frame(
+                            &mut socket,
+                            Uuid::new_v4(),
+                            ClientFrame::Resync {
+                                channel_id: delivered.channel_id.clone(),
+                                after: advanced,
+                            },
+                            counters,
+                        )
+                        .await
+                        {
+                            return Outcome::Established;
                         }
                     }
                 },
@@ -1775,11 +2069,12 @@ impl Session {
     /// healthy client in one case and a healthy network in the other. That is
     /// [`emit_event`], and this is it with the state chosen.
     fn emit_connection(&self, state: ConnectionState) {
-        emit_event(
-            &self.events,
-            &self.counters,
-            DomainEvent::ConnectionStateChanged(state),
-        );
+        self.emit_event(DomainEvent::ConnectionStateChanged(state));
+    }
+
+    /// Emits one event and counts a refusal.
+    fn emit_event(&self, event: DomainEvent) {
+        emit_event(&self.events, &self.counters, event);
     }
 }
 
@@ -1964,36 +2259,73 @@ async fn write_frame(
     }
 }
 
+/// A frame that means this client now holds a row, as the catch-up bookkeeping
+/// needs it.
+///
+/// **Present only so [`advance_cursor`] has something to advance on, and `None`
+/// everywhere else.** `on_message` has several ways to read a frame without the
+/// client holding it — an undecodable payload, a boundary rejection, a full inbox —
+/// and a cursor that moved in any of those cases would skip the row on the next
+/// reconnect. The type exists so "read" and "held" cannot be confused at the call
+/// site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Delivered {
+    /// The channel the row belongs to, already validated non-blank by the
+    /// boundary's conversion.
+    channel_id: String,
+    /// When the server accepted it — the field the ordering guarantees are defined
+    /// on, and therefore the field a cursor is made of.
+    timestamp: DateTime<Utc>,
+    /// Whether this row is one of a catch-up batch's rows.
+    ///
+    /// **True for `message.new` and false for `message.ack`, and that difference is
+    /// why this is a field rather than two types.** Both frames mean the client now
+    /// holds a row, so both move the cursor. Only a replay is a *batch*, so only a
+    /// replay counts toward [`RESYNC_BATCH_LIMIT`]: an ack is one row in reply to a
+    /// send this client made, and counting it would let a send composed during a
+    /// catch-up masquerade as a full batch and provoke a request that recovers
+    /// nothing.
+    in_batch: bool,
+}
+
 /// Decodes one incoming message, maps it, and hands it to the inbox.
 ///
-/// Returns [`Outcome::Rejected`] only for the one case §7.4 makes terminal.
-/// Everything else — a frame this build cannot read, a frame whose payload fails
-/// the boundary's validation, a binary frame on a text-only protocol — is counted
-/// and dropped, because `AGENTS.md` §3.3 requires a network failure to be a
-/// recoverable state rather than the end of the connection.
+/// Returns the [`Outcome`] **and** what reached the inbox, as a pair because the
+/// two answers are different questions: `Outcome` is about the connection, and the
+/// second element is about this client's hold on the row. Everything else — a frame
+/// this build cannot read, a frame whose payload fails the boundary's validation, a
+/// binary frame on a text-only protocol, a delivery the full inbox refused — is
+/// counted and reported as `None`, because `AGENTS.md` §3.3 requires a network
+/// failure to be a recoverable state rather than the end of the connection, and
+/// because a cursor must only move over a row the client has.
 ///
 /// **The [`DomainEvent`] is produced by the boundary, not here.**
 /// `network::mapping`'s `TryFrom<ServerFrame> for DomainEvent` has validated every
 /// id, timestamp and attachment size by the time the conversion returns, which is
 /// what lets this function hand the value straight to [`EventSender::deliver`]
-/// with no further checking.
-fn on_message(events: &EventSender, counters: &Counters, message: &Message) -> Outcome {
+/// with no further checking — and what makes `Delivered`'s two fields safe to read
+/// off the wire frame before the conversion consumes it.
+fn on_message(
+    events: &EventSender,
+    counters: &Counters,
+    message: &Message,
+) -> (Outcome, Option<Delivered>) {
     let text = match message {
         Message::Text(text) => text.as_str(),
         // §3.3's rule, applied to a frame type: a binary frame is not a frame this
         // protocol has, and refusing it must not end a connection.
         Message::Binary(_) => {
             Counters::bump(&counters.frames_dropped);
-            return Outcome::Established;
+            return (Outcome::Established, None);
         }
         // A pong is the keepalive's answer, and tungstenite has already matched it
         // to its ping. There is nothing further to do with either, and both reset
         // the silence clock, which is the entire point of §7.4's keepalive.
-        Message::Ping(_) | Message::Pong(_) => return Outcome::Established,
-        Message::Close(_) => return Outcome::Established,
+        Message::Ping(_) | Message::Pong(_) => return (Outcome::Established, None),
+        Message::Close(_) => return (Outcome::Established, None),
         Message::Frame(_) => {
             Counters::bump(&counters.frames_dropped);
-            return Outcome::Established;
+            return (Outcome::Established, None);
         }
     };
 
@@ -2004,30 +2336,58 @@ fn on_message(events: &EventSender, counters: &Counters, message: &Message) -> O
         Err(error) => {
             Counters::bump(&counters.frames_dropped);
             return match classify_frame_error(&error) {
-                FrameFailure::Transient => Outcome::Established,
-                FrameFailure::Rejected(state) => Outcome::Rejected(state),
+                FrameFailure::Transient => (Outcome::Established, None),
+                FrameFailure::Rejected(state) => (Outcome::Rejected(state), None),
             };
         }
+    };
+
+    // **Read off the frame before the conversion consumes it**, and only for the two
+    // frame types that put a row in a channel this client holds. Between them they
+    // are the whole of what a resume cursor is made of; every other frame type says
+    // nothing about a channel's newest message.
+    //
+    // **`message.ack` is here and not only `message.new`, and it closes a real hole.**
+    // A client whose only traffic in a channel is its own sends receives them as acks
+    // — the server deliberately does not echo them (`crate::hub::Delivery`) — so a
+    // cursor learned from replays alone would never exist for the channel a user
+    // talks in and nobody answers. Such a client would reconnect and ask for nothing.
+    let delivered = match &frame {
+        ServerFrame::MessageNew { message } => Some(Delivered {
+            channel_id: message.channel_id.clone(),
+            timestamp: message.timestamp,
+            in_batch: true,
+        }),
+        ServerFrame::MessageAck { message, .. } => Some(Delivered {
+            channel_id: message.channel_id.clone(),
+            timestamp: message.timestamp,
+            in_batch: false,
+        }),
+        _ => None,
     };
 
     match DomainEvent::try_from(frame) {
         Ok(event) => match events.deliver(event) {
             Delivery::Queued => {
                 Counters::bump(&counters.events_delivered);
-                Outcome::Established
+                (Outcome::Established, delivered)
             }
             // A full inbox is `bridge.rs`'s decision and it hands the event back;
             // this loop has nothing to do with the returned value except say so,
             // because the alternative — retrying later — would need a queue in
             // front of a queue, which is the unbounded growth §7.1 forbids.
+            //
+            // **And the cursor does not move**, which is the half that matters here:
+            // the row was on the wire and is not in the state, so a cursor past it
+            // would lose it on the next reconnect rather than re-ask for it.
             Delivery::Refused(_) => {
                 Counters::bump(&counters.events_refused);
-                Outcome::Established
+                (Outcome::Established, None)
             }
         },
         Err(_) => {
             Counters::bump(&counters.frames_dropped);
-            Outcome::Established
+            (Outcome::Established, None)
         }
     }
 }
