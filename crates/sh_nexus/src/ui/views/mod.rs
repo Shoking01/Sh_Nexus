@@ -1,10 +1,10 @@
 //! The views this layer renders.
 //!
 //! `AGENTS.md` §3.1 lists sidebar, chat view, thread panel and input bar here.
-//! Three of them exist so far — the message list, a row of it, and a line that says
-//! what the connection is doing — and the rest are **absent rather than declared
-//! empty**, for the reason `src/lib.rs` gives about `ui/` itself: a module that
-//! exists and does nothing reads as finished work.
+//! Four of them exist so far — the message list, a row of it, a line that says
+//! what the connection is doing, and a login form — and the rest are **absent
+//! rather than declared empty**, for the reason `src/lib.rs` gives about `ui/`
+//! itself: a module that exists and does nothing reads as finished work.
 //!
 //! # What the split is between list and row
 //!
@@ -46,8 +46,28 @@
 //! would be a permanent distraction. Its own module docs carry that reasoning in
 //! full; the short form is that presence (`Shell::transport`) and content
 //! (`ConnectionState`) are two different questions with two different owners.
+//!
+//! # And where the login form sits relative to all of them
+//!
+//! [`login`] is not a sibling of the rest in the ordinary sense, and the reason is
+//! that it **replaces** them rather than joining them: `app::Shell::Render` returns
+//! the form *instead of* the log, the banner and the composer while there is no
+//! session, so a second window on the other side of a login would be a window
+//! showing a channel the user has no claim on. It is here — under `ui/`, beside
+//! the others — rather than in `app.rs` for the reason §5 of that file argues
+//! generally: a second place to decide what a window contains is the audit trail,
+//! and the one decision this module owns is *what the window says*, not *which of
+//! the two windows is on screen*.
+//!
+//! **It is also the only view here that holds a secret, and the only one that
+//! asks the seam for something.** The composer's send goes out through a door that
+//! was already here; this form hands a password to
+//! [`bridge::begin_login`](crate::state::bridge::begin_login) and keeps the answer.
+//! Its module docs carry the whole of why that is the one exception to
+//! `AGENTS.md` §7.5's rule and why it is structural rather than a convention.
 
 pub mod connection_banner;
 pub mod input_bar;
+pub mod login;
 pub mod message_list;
 pub mod message_row;

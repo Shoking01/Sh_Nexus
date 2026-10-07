@@ -144,6 +144,8 @@
 //! | [`try_flush_outbox`] | every send `PLAN.md` §7 queued, in enqueue order |
 //! | [`try_render_and_cache`], [`try_rendered`] | the parse on render, and the read that promotes it |
 //! | [`try_read`] | any read of the state |
+//! | [`begin_login`] | the one door a credential crosses — see §7 |
+//! | [`try_take_login_outcome`], [`login_in_flight`] | the answer, and whether one is outstanding |
 //!
 //! **There is no general `with_state_mut`, and its absence is the point.**
 //! `AGENTS.md` §3.2 asks for every mutation to be auditable, and 1E-1 achieved
@@ -182,7 +184,31 @@
 //! evidence about bytes leaving this process. **A door here that "clears" the
 //! queue would be the exact defect this unit removes, wearing a return type.**
 //!
-//! # 7. What this file does not decide
+//! # 7. The login door, and why this file is allowed one credential
+//!
+//! A login is an HTTP exchange, not a [`DomainEvent`], and it is the one place in
+//! this crate where a **password** exists at all. It arrives here by way of
+//! [`begin_login`], and three properties make it safe rather than policed:
+//!
+//! | Property | How it is structural |
+//! |---|---|
+//! | nothing stores it | the parameter is taken **by value** and moved into a worker closure, so there is no field below this layer to put it in |
+//! | nothing prints it | [`LoginOutcome`]'s `Debug` and `Display` are written out by hand and no other type here carries a secret |
+//! | nothing logs it | the worker names the outcome and the handle; `AGENTS.md` §7.5's rule is a source scan in `tests/login.rs` |
+//!
+//! **The answer travels on its own bounded channel rather than through the inbox,
+//! and that is a decision rather than an oversight.** A login produces no
+//! [`DomainEvent`], so making `drain` return it would mean a second return type on
+//! a door that exists to return one thing — and it would make the answer's arrival
+//! depend on whether the socket happened to be quiet. `tests/login.rs` drives a
+//! completed login against a completely silent inbox to keep the two independent.
+//!
+//! **What this file still refuses to do with it: decide.** The seam reports what
+//! the server said; `app::Shell` decides what the window shows and `ui/views/
+//! login.rs` decides how it is drawn. That is §8 below, applied to the one door
+//! that carries a secret.
+//!
+//! # 8. What this file does not decide
 //!
 //! - **When to drain, and when to flush.** [`drain`] is synchronous and the caller
 //!   owns the schedule; `Shell::apply_inbox` is what calls both, and why it calls
@@ -193,6 +219,9 @@
 //!   message: a view's decision and a worker's decision, not a seam's.
 //! - **Whether the connection is up.** `AppState` records it and [`actions`]
 //!   owns every transition.
+//! - **Whether a login was good enough to open a window.** [`try_take_login_outcome`]
+//!   hands the answer over; the shell builds the [`ConnectionSettings`] and the
+//!   view draws the refusal.
 
 use std::fmt;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -205,6 +234,7 @@ use uuid::Uuid;
 
 use crate::core::markdown::Document;
 use crate::core::models::events::DomainEvent;
+use crate::network::rest::{self, LoginError, Session};
 use crate::network::ws::WsTransport;
 use crate::state::actions::{self, ApplyOutcome, SendOutcome};
 use crate::state::app_state::AppState;
@@ -468,6 +498,15 @@ pub fn install(cx: &mut App, self_user_id: impl Into<String>) -> Result<EventSen
         inbox,
     });
     cx.set_global(OutboundGlobal { transport: None });
+    // The login seam's channel is created here rather than per attempt, so that
+    // `begin_login` needs nothing but `&mut App` and a second window could not
+    // arrive at a second channel. See §7.
+    let (login_sender, login_inbox) = sync_channel(MAX_PENDING_LOGINS);
+    cx.set_global(LoginGlobal {
+        sender: login_sender,
+        inbox: login_inbox,
+        in_flight: false,
+    });
     Ok(EventSender { sender })
 }
 
@@ -705,6 +744,303 @@ pub fn try_flush_outbox(cx: &mut App) -> Option<FlushReport> {
         }
     }
     Some(report)
+}
+
+/// How many finished sign-in attempts may sit in this seam's inbox at once.
+///
+/// **One, and the number is the whole of the concurrency rule rather than a
+/// tuning choice.** [`begin_login`] refuses a second attempt while one is
+/// outstanding, so the queue can never hold two, and a larger capacity would be a
+/// capacity nothing could ever use. `AGENTS.md` §7.1's bound on unbounded
+/// in-memory state is therefore satisfied by the door rather than by a policy
+/// about it — which is the only kind of bound that survives being forgotten.
+pub const MAX_PENDING_LOGINS: usize = 1;
+
+/// What one finished sign-in attempt said.
+///
+/// **Three cases, and none of them means "something went wrong".**
+/// `AGENTS.md` §5.2 asks for an actionable error and a catch-all is the opposite
+/// of one. A refusal the server made is a *decision* and a transport failure is
+/// the *absence* of one, and the two are fixed by opposite actions — retype a
+/// credential, or start the server — so they are separate variants and
+/// `ui/views/login.rs` draws them in different colours for exactly that reason.
+///
+/// **No variant carries a credential, in any field, and that is a property of the
+/// type rather than of its users.** It is what lets the two `fmt` impls below be
+/// written out by hand with no redaction logic in them at all: there is nothing to
+/// redact. [`Session`](crate::network::rest::Session) is the type that *does* hold
+/// a token, and it deliberately does not implement [`Debug`] at all, so the only
+/// way this value exists is after the token has been separated from the rest of
+/// the answer.
+#[derive(Clone, PartialEq, Eq)]
+pub enum LoginOutcome {
+    /// The server issued a session. The token is the credential; the handle is
+    /// not, and is what an operator needs to see.
+    LoggedIn {
+        /// The opaque session token. Reaches
+        /// [`app::ConnectionSettings`](crate::app::ConnectionSettings) and nowhere
+        /// else, and is printed by neither impl below.
+        token: String,
+        /// The account the session belongs to.
+        username: String,
+    },
+    /// The server answered, and the answer was no. All three fields are its own
+    /// words, verbatim, for the reason `network/rest.rs` carries them rather than
+    /// paraphrasing them.
+    Refused {
+        /// The status code from the status line.
+        status: u16,
+        /// The refusal code, e.g. `invalid_credentials`.
+        code: String,
+        /// The server's sentence about it.
+        detail: String,
+    },
+    /// Nothing was decided: the server was not reached, was not understood, or did
+    /// not answer inside its budget.
+    Failed {
+        /// A sentence a person can act on, and never a credential.
+        reason: String,
+    },
+}
+
+impl fmt::Debug for LoginOutcome {
+    /// The token's **presence**, never the token, and for exactly the reason
+    /// [`crate::app::ConnectionSettings`]'s own `Debug` is written out by hand:
+    /// this type is reachable from any `{:?}` on a log field or an error, so a
+    /// derived impl would print a credential and compile while doing it.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LoggedIn { token, username } => formatter
+                .debug_struct("LoggedIn")
+                .field("token_configured", &!token.is_empty())
+                .field("username", username)
+                .finish(),
+            Self::Refused {
+                status,
+                code,
+                detail,
+            } => formatter
+                .debug_struct("Refused")
+                .field("status", status)
+                .field("code", code)
+                .field("detail", detail)
+                .finish(),
+            Self::Failed { reason } => formatter
+                .debug_struct("Failed")
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Display for LoginOutcome {
+    /// One line, and never a credential.
+    ///
+    /// **`Display` is written out for the same reason `Debug` is**, and it is the
+    /// one that matters in practice: `tracing::info!(%outcome)` prints *this*, and
+    /// a hand-written `Display` is exactly as capable of a leak as a hand-written
+    /// `Debug`. `tests/login.rs` asserts both.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LoggedIn { username, .. } => write!(formatter, "signed in as {username}"),
+            Self::Refused { detail, code, .. } => {
+                write!(
+                    formatter,
+                    "the server refused the sign-in: {detail} ({code})"
+                )
+            }
+            Self::Failed { reason } => write!(formatter, "{reason}"),
+        }
+    }
+}
+
+/// The login seam's own global: one outstanding attempt, and the slot its answer
+/// arrives in.
+///
+/// **A separate global for the reason [`OutboundGlobal`] is one**, and here the
+/// reason is narrower and stronger: a login answer is not domain data.
+/// `AGENTS.md` §3.1 describes `state/` as channels, presence, unread counts and
+/// cursors, and an attempt in flight is a field no reader of [`AppState`] could
+/// interpret — §3.2's "every mutation is auditable" is worth nothing if the field
+/// being mutated means nothing.
+///
+/// **And it is deliberately *not* a field on [`AppState`]**, because that is the
+/// shape a credential would take if one were ever stored: the token belongs to
+/// [`app::ConnectionSettings`](crate::app::ConnectionSettings) and the password
+/// exists only inside one HTTP request. `tests/login.rs` asserts that `AppState`
+/// names neither.
+///
+/// **Nothing secret is stored here.** The worker is handed the credential by
+/// value and drops it when the request finishes; what comes back is one of the
+/// three [`LoginOutcome`]s above, and two of the three carry no secret at all.
+pub struct LoginGlobal {
+    /// The producing half, cloned per attempt. `Sync` by construction, which is
+    /// what lets a worker thread hold it while the state itself stays `!Sync`.
+    sender: SyncSender<LoginOutcome>,
+    /// The consuming half, on the main thread. `Receiver` is `!Sync`, so this
+    /// global cannot be shared with a thread that is not this one — the same
+    /// ownership argument [`AppStateGlobal`]'s inbox makes.
+    inbox: Receiver<LoginOutcome>,
+    /// Whether an attempt is outstanding: started, and not yet answered on screen.
+    in_flight: bool,
+}
+
+impl Global for LoginGlobal {}
+
+/// Starts one sign-in attempt on a thread of its own, and reports whether it
+/// started.
+///
+/// **The one door in this crate that a credential crosses, and it takes the secret
+/// by value for a structural reason rather than a conventional one.** The
+/// parameter is moved into the worker's closure and dropped when the request
+/// finishes, so there is no field on this side that could hold it, no borrow that
+/// outlives the call, and no `Debug` on any type below that could print it.
+/// `tests/login.rs` asserts all three by scanning this file's source, and it is
+/// why this file is the single exemption in that scan.
+///
+/// **A second attempt while one is outstanding is refused, and the reason is a
+/// fact about the server rather than a preference.** Every `POST /auth/login`
+/// mints a session, so two concurrent attempts mint two, and which one the socket
+/// then presented would depend on which answer this pump happened to take first.
+/// [`login_in_flight`] is cleared only by [`try_take_login_outcome`], and only
+/// when an answer actually arrived — so two calls inside one turn cannot retire
+/// the first, and the flag cannot be cleared by a poll that found nothing.
+///
+/// **Non-blocking, and that is what makes it safe from a key handler.**
+/// `AGENTS.md` §2.3 forbids blocking the frame loop; this hands the work to a
+/// thread and returns.
+///
+/// # Errors
+///
+/// None as such: a refusal to start is a `false`, and it is one of three things —
+/// the state is not installed, an attempt is already outstanding, or this machine
+/// refused to spawn the thread. `AGENTS.md` §5.2 wants an actionable failure and
+/// each of those is actionable by a different party, so the view says which in
+/// its own words rather than this returning an enum nobody reads.
+pub fn begin_login(cx: &mut App, ws_endpoint: &str, username: &str, password: String) -> bool {
+    if !is_installed(cx) {
+        return false;
+    }
+    let Some(attempt) = cx
+        .try_global::<LoginGlobal>()
+        .map(|global| global.sender.clone())
+    else {
+        return false;
+    };
+
+    // **The flag is claimed before the thread exists**, so a second caller in the
+    // same turn cannot get past it, and it is handed back below if the thread
+    // could not be started at all.
+    let claimed = cx.update_global::<LoginGlobal, _>(|global, _| {
+        if global.in_flight {
+            return false;
+        }
+        global.in_flight = true;
+        true
+    });
+    if !claimed {
+        return false;
+    }
+
+    let endpoint = ws_endpoint.to_owned();
+    let username = username.to_owned();
+    match std::thread::Builder::new()
+        .name("sh_nexus-login".to_owned())
+        .spawn(move || {
+            let outcome = interpret(rest::login(&endpoint, &username, password));
+            tracing::info!(outcome = %outcome, "a sign-in attempt finished");
+            // **The slot cannot be full and the channel cannot be closed** while
+            // this global lives: there is exactly one attempt at a time and
+            // exactly one slot for its answer, and the seam holds the sending half
+            // for the process's life. So this cannot silently drop an answer the
+            // way §3's inbox can — and if it ever did, the flag would stay set and
+            // the window would say an attempt is running rather than nothing.
+            let _ = attempt.try_send(outcome);
+        }) {
+        Ok(_) => true,
+        Err(error) => {
+            cx.update_global::<LoginGlobal, _>(|global, _| global.in_flight = false);
+            tracing::warn!(reason = %error, "this machine refused to start the sign-in worker");
+            false
+        }
+    }
+}
+
+/// Takes the answer to a finished attempt, if one is waiting.
+///
+/// **A separate call from [`drain`], deliberately.** A login produces no
+/// [`DomainEvent``, so routing it through the inbox would mean a second answer on
+/// a door whose whole shape is "one kind of thing", and would make a completed
+/// sign-in depend on whether the socket happened to be quiet.
+/// `tests/login.rs::a_login_completes_with_the_event_inbox_completely_silent`
+/// drives a completed login against an inbox with nothing in it, in both
+/// directions.
+///
+/// **The flag is cleared only here and only on an answer.** A poll that found
+/// nothing leaves an outstanding attempt outstanding, which is what makes
+/// [`begin_login`]'s refusal deterministic rather than a race against the pump.
+pub fn try_take_login_outcome(cx: &mut App) -> Option<LoginOutcome> {
+    if !is_installed(cx) {
+        return None;
+    }
+    cx.update_global::<LoginGlobal, _>(|global, _| match global.inbox.try_recv() {
+        Ok(outcome) => {
+            global.in_flight = false;
+            Some(outcome)
+        }
+        // Nothing has finished. `try_recv` does not block, so this is the normal
+        // end of every poll rather than a wait.
+        Err(_) => None,
+    })
+}
+
+/// Whether a sign-in attempt is outstanding right now.
+///
+/// **Read-only, and it exists so a caller can ask without attempting anything to
+/// ask it.** A view that wanted to know would have to start one to find out, which
+/// is a request on the server and a failure for reasons that have nothing to do
+/// with whether one is already running.
+///
+/// **False when the state is not installed**, so the answer is never a panic on a
+/// startup-ordering mistake (`AGENTS.md` §2.1) and never a second question with a
+/// different shape.
+pub fn login_in_flight(cx: &App) -> bool {
+    cx.try_global::<LoginGlobal>()
+        .is_some_and(|global| global.in_flight)
+}
+
+/// One [`LoginError`] as the three outcomes a window knows how to draw.
+///
+/// **The refusal is the server's own three fields, and the split is the point.**
+/// A `Refused` is a decision the server made and a `Failed` is the absence of one,
+/// so the view can draw the first in the failure colour and the second in the
+/// muted one — and a client that reported a dead server as a rejected credential
+/// would send the user to retype a password that was never wrong.
+///
+/// **Every other variant becomes `Failed`, and its `Display` is already a sentence
+/// a person can act on** — "the server could not be reached: …", "the server did
+/// not answer within 10s". `AGENTS.md` §3.3 requires a network failure to surface
+/// as a recoverable state rather than a crash, and a sentence in the window is
+/// that.
+fn interpret(outcome: Result<Session, LoginError>) -> LoginOutcome {
+    match outcome {
+        Ok(session) => LoginOutcome::LoggedIn {
+            token: session.token,
+            username: session.username,
+        },
+        Err(LoginError::Refused {
+            status,
+            code,
+            detail,
+        }) => LoginOutcome::Refused {
+            status,
+            code,
+            detail,
+        },
+        Err(other) => LoginOutcome::Failed {
+            reason: other.to_string(),
+        },
+    }
 }
 
 /// Whether the application state is installed.
