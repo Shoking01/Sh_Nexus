@@ -1,36 +1,80 @@
 # CodeQL configuration
 #
-# GitHub's *default setup* runs CodeQL for this repository. It reads this file, which
-# means the query policy is versioned, reviewable, and diffable in a pull request
-# rather than living invisibly in repository settings.
+# GitHub's *advanced* setup runs CodeQL for this repository (`.github/workflows/codeql.yml`).
+# It reads this file, which means the query policy is versioned, reviewable, and diffable
+# in a pull request rather than living invisibly in repository settings.
 #
-# ## Why `rust/hard-coded-cryptographic-value` is excluded from test paths
+# ## Why there is no `query-filters` block here
 #
-# The rule is correct and it is being switched off only where it cannot mean
-# anything. A hard-coded credential in a **test fixture** is not a leaked secret:
-# these are the passwords an authentication test *must* be able to present in order
-# to assert on what happens when a password is right and when it is wrong.
-# `crates/sh_nexus_server/tests/auth.rs` passes literals such as
-# `"a-long-enough-passphrase"` and `"a-correct-passphrase"` straight to
-# `auth::hash_password`, and there is no stronger form available: a hash the test
-# cannot compute against proves nothing.
+# **This file used to contain one, and it did nothing.** It read:
 #
-# **The cost of leaving it on was not 22 red alerts. It was that this repository
-# stopped looking.** `main` carried 22 open alerts of exactly this class, none of
-# them triaged, and when PR #49 introduced a finding, its real annotation was buried
-# behind a false positive that had been sitting there since the server landed. A
-# scanner that reports a test fixture as a leaked credential trains its readers to
-# ignore it, and the next finding goes unread too.
+# ```yaml
+# query-filters:
+#   - exclude:
+#       id: rust/hard-coded-cryptographic-value
+#       paths:
+#         - "**/tests/**"
+# ```
 #
-# **What is *not* excluded.** The rule still applies to every non-test path, so a
-# hard-coded secret in `crates/*/src/**` is reported exactly as before. Only the
-# paths where a literal is the point are filtered. Nothing about the server's own
-# security posture changes.
+# Both halves of that are wrong, and the first one is dangerous.
+#
+# **`paths` under `exclude` is not part of the schema.** Per-query path scoping does
+# not exist in a CodeQL configuration file. Path filtering does exist, but as the
+# top-level `paths` / `paths-ignore` keys, and those control *which parts of the
+# codebase are analysed at all* rather than scoping one query to part of it. The
+# unknown key was ignored silently: the file parsed, the check ran green, and six
+# alerts kept arriving at `crates/**/tests/**` anyway. A configuration that looks
+# like it is enforcing something and is not is worse than no configuration, because
+# it is trusted.
+#
+# **`id` was a scalar where the schema wants a list**, and this is the part worth
+# reading twice. The documented shape is:
+#
+# ```yaml
+# query-filters:
+#   - exclude:
+#       id:
+#         - rust/hard-coded-cryptographic-value
+# ```
+#
+# That shape parses cleanly and it works — **globally**. "Fixing" this file to match
+# the documentation would have switched off `rust/hard-coded-cryptographic-value`
+# and `rust/cleartext-logging` for `crates/*/src/**` as well, which is precisely the
+# code where a real hard-coded secret or a real credential in a log line belongs.
+# Two valuable production checks, gone, in the name of tidying a YAML file.
+#
+# ## What is actually done instead: dismissals, with a reason
+#
+# Two rules fire only inside test code, and only in two files:
+#
+# | Rule | Where | Why it is a false positive |
+# |---|---|---|
+# | `rust/hard-coded-cryptographic-value` | `crates/sh_nexus_server/tests/support/mod.rs`, `crates/sh_nexus/tests/{login,support}/mod.rs` | a test fixture password. An authentication test must be able to present a known password to assert both the accepted and the rejected case, and there is no stronger form available — a hash the test cannot compute against proves nothing. |
+# | `rust/cleartext-logging` | `crates/sh_nexus/tests/login.rs` | the three findings are `assert!` / `panic!` **failure messages**. The value passed is `describe(&outcome)`, which renders an account name and an error — never a credential. `network::rest::Session` deliberately does not implement `Debug`, so a token cannot be printed even by accident; that is what makes this provable rather than assumed. |
+#
+# Those alerts are dismissed as `used in tests`, with the reasoning recorded on the
+# alert itself where a reviewer will meet it. The advanced setup is what makes this
+# possible at all: it persists alerts as dismissible objects, whereas the default
+# setup left findings as annotations on a check run that could not be dismissed and
+# could not be cleared by any change to the code being scanned.
+#
+# ## What is *not* given up
+#
+# **Every rule stays active on every path.** `rust/hard-coded-cryptographic-value`
+# and `rust/cleartext-logging` still scan test code — they simply produce findings
+# that are reviewed and dismissed rather than ignored. A real secret committed in a
+# fixture is still reported.
+#
+# The alternative considered and rejected was `paths-ignore: ["**/tests/**"]`. It is
+# declarative and needs no maintenance, and it would take these alerts away in one
+# line. **It would also stop CodeQL reading 45% of the Rust files in this repository**
+# — 36 test files against 44 source files — including the place a real credential is
+# most likely to be pasted by accident. Trading that for a tidy alert list is a bad
+# trade, and a dismissal is cheap enough not to make it.
+#
+# A dismissal is not free, and the honest cost is stated here: a *new* test-only
+# finding of either rule has to be dismissed too. That is one action per finding, and
+# the two files that produce them are known. It is the cheapest honest option, not a
+# free one.
 
 name: "Sh_Nexus CodeQL config"
-
-query-filters:
-  - exclude:
-      id: rust/hard-coded-cryptographic-value
-      paths:
-        - "**/tests/**"
