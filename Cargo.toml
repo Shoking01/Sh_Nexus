@@ -542,3 +542,83 @@ hyper-util = { version = "0.1", default-features = false, features = [
 #   saying `default-features = false` would be a claim about a feature set that
 #   does not exist.
 http-body-util = "0.1"
+
+# keyring 4.2.0 | Apache-2.0 | actively maintained | crates.io, 13.2M downloads in
+#   the last 90 days | last release 2026-08-29, repo last pushed 2026-10-03.
+#
+#   Read from primary sources for the `AGENTS.md` 7.2 audit. crates.io reports
+#   this crate's `license` field as **blank**, which is worth recording because a
+#   blank licence is not a licence; the SPDX identifier was read from
+#   `LICENSE-APACHE` via the GitHub API instead, and it is Apache-2.0 -- one of the
+#   licences 7.2 names as compatible.
+#
+#   **Criterion 1: `AGENTS.md` already requires this.** Three places say so, and
+#   none of them is a preference:
+#     - 7.1: "No plaintext storage of tokens -> Use the OS keychain via
+#       `platform/` abstraction"
+#     - L88: "`platform/`: OS-specific implementations behind traits
+#       (notifications, sounds, secure token storage)"
+#     - 8.1's Login Flow: "Valid credentials -> **Token stored in keychain** ->
+#       Channels load -> Chat view"
+#   `6a-login.md` deferred it so the login milestone would be one decision at a
+#   time. This is that decision, not an addition to it.
+#
+#   **Criterion 2: not hand-rolled.** Windows Credential Manager, macOS Keychain
+#   Services and the Linux Secret Service are three unstable C APIs with three
+#   different failure modes and three different notions of what a "service" and a
+#   "user" are. Writing that by hand is a project in itself, it would put unsafe
+#   FFI against OS internals into a client that currently has none, and 7.2's
+#   entire purpose is to keep exactly that kind of risk reviewed rather than
+#   absorbed.
+#
+#   **Criterion 3: the cost is measured, not estimated.** `cargo build --workspace
+#   --timings` on this branch, 2026-10-07, incremental over a warm `target/`: 30
+#   units recompiled in total, of which **three** are this dependency's --
+#   `keyring` 0 ms, `keyring-core` 1 ms, `windows-native-keyring-store` 1 ms. The
+#   whole subtree costs **about 2 ms of compile time on Windows**, because that is
+#   the only store `v1` compiles there and it builds on the `windows-sys` family
+#   `Cargo.lock` already carried at 0.61.2 through GPUI.
+#
+#   `Cargo.lock` grows 190 lines. **That is not 190 lines of extra build.** A
+#   lockfile is platform-independent and records the whole resolve graph, so the
+#   macOS, iOS and unix entries below are present for a build that will not
+#   happen on this machine. They are recorded here rather than discovered later so
+#   nobody reads a 190-line lockfile diff as a 190-line build-time regression.
+#
+#   Feature choice: `v1` alone, with `default-features = false`.
+#
+#   `v1` is the whole of `default` at this version -- the published feature graph
+#   is `default = [v1]` -- so this is not a narrower build than the defaults, it
+#   states the one feature that is actually wanted. `cli` is left off: it exists to
+#   read credentials into command-line argument and environment helpers, and this
+#   client must never expose its token on a command line.
+#
+#   **What `v1` costs per platform, from the published target table.** `v1` enables
+#   `windows-native-keyring-store`, `apple-native-keyring-store/keychain` and
+#   `zbus-secret-service-keyring-store`, and each is target-gated:
+#
+#   | Platform | Store `v1` compiles | Extra subtree |
+#   |---|---|---|
+#   | Windows | `windows-native-keyring-store` | none -- `windows-sys` is already in `Cargo.lock` at 0.61.2 through GPUI |
+#   | macOS / iOS | `apple-native-keyring-store` | `security-framework` |
+#   | Linux / other unix | `zbus-secret-service-keyring-store` | a D-Bus client |
+#
+#   **The D-Bus row is a real cost on Linux and it is accepted knowingly.** The
+#   lighter alternative exists -- `linux-keyutils-keyring-store`, the kernel
+#   keyutils store, which needs no session bus -- and it is deliberately *not*
+#   enabled here, because `keyring` picks the store at runtime and `v1` already
+#   supplies a working one. Enabling both would compile two stores to use one.
+#   If a Linux build ever needs to work on a headless box with no session bus, that
+#   is the row to revisit, and `linux-keyutils-keyring-store` is the feature to add.
+#
+#   **How the store is resolved, and a correction worth reading.** The obvious
+#   `keyring::use_native_store(prefer_secret_service: bool)` **does not exist in
+#   this build** -- it lives in `keyring::cli` (`src/cli.rs:88`), and `cli` is off
+#   above. Calling it would not compile. The `v1` API is `Entry::store_status()`,
+#   a one-time resolution this client defers behind a `OnceLock` and performs on a
+#   worker thread, because *deciding which store exists* is itself a blocking OS
+#   call: on Linux, initialising the Secret Service backend is a session-bus round
+#   trip. The intent behind "prefer the lighter native store, never force the
+#   Secret Service" survives by not forcing anything -- `v1` supplies exactly one
+#   store per platform and this client simply takes it.
+keyring = { version = "4.2", default-features = false, features = ["v1"] }

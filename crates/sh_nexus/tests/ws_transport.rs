@@ -1130,6 +1130,33 @@ fn a_revoked_token_is_refused_on_the_next_handshake(cx: &mut TestAppContext) {
     drop(server);
 }
 
+/// Whether `stripped` declares `package` as a dependency.
+///
+/// **Matching the *declaration* rather than a substring, and this crate is what
+/// proved the difference.** A bare `contains` scan of the manifest for `ring`
+/// matches `keyring` — the cross-platform credential store, and the single crate
+/// in this dependency set that most reduces plaintext token storage on disk. That
+/// is the precise opposite of what the assertion below is for: the scan reported a
+/// *credential store* as a *cryptographic one*.
+///
+/// The cost of the wrong answer is not a red build. It is a future maintainer
+/// adding a legitimate dependency, seeing a ban they do not understand, and
+/// working around a gate that was never actually about their crate. A gate that
+/// cries wolf on its own dependency list stops being read.
+///
+/// So a dependency counts as declared when a line *begins* with the package name,
+/// optionally quoted, followed by `=`. That is the shape Cargo gives a manifest
+/// entry, and it cannot be produced by a longer name that merely contains a
+/// forbidden token.
+fn declares(stripped: &str, package: &str) -> bool {
+    let bare = format!("{package} = ");
+    let quoted = format!("\"{package}\" = ");
+    stripped
+        .lines()
+        .map(|line| line.trim())
+        .any(|line| line.starts_with(&bare) || line.starts_with(&quoted))
+}
+
 /// The token is not in any `Debug` a caller can reach, and this client cannot hash
 /// a password.
 ///
@@ -1152,7 +1179,7 @@ fn the_client_declares_no_crypto_dependency_and_the_token_stays_out_of_debug() {
 
     for forbidden in ["argon2", "sha2", "jsonwebtoken", "ring"] {
         assert!(
-            !stripped.contains(forbidden),
+            !declares(&stripped, forbidden),
             "this crate must not depend on `{forbidden}`. The client is handed an \
              opaque session token and sends it; it never sees a password, so a \
              password-hashing dependency here would be a dependency with nothing to \
@@ -1160,6 +1187,44 @@ fn the_client_declares_no_crypto_dependency_and_the_token_stays_out_of_debug() {
              reason is revocation."
         );
     }
+
+    // The scan is not vacuous. Tightening it to match declarations rather than
+    // substrings could just as easily have tightened it into matching nothing, and
+    // a crypto gate that detects no crypto dependencies is worse than no gate --
+    // it is a green build carrying an unearned claim. This is the same discipline
+    // `the_password_scanner_is_not_vacuous` applies to the credential scanner.
+    for forbidden in ["argon2", "sha2", "jsonwebtoken", "ring"] {
+        assert!(
+            declares(&format!("\n{forbidden} = \"0.17.0\"\n"), forbidden),
+            "the dependency scan must still catch a genuine `{forbidden}` \
+             declaration; if this fails the gate above is matching nothing at all"
+        );
+        assert!(
+            declares(
+                &format!("\n\"{forbidden}\" = {{ version = \"0.17\" }}\n"),
+                forbidden
+            ),
+            "the dependency scan must catch a quoted `{forbidden}` declaration too -- \
+             Cargo allows both spellings and a gate that reads one of them reads a \
+             convention, not a rule"
+        );
+    }
+
+    // And the case that motivated the fix: a name which *contains* a forbidden
+    // token is not a declaration of that token. `keyring` is in this manifest, and
+    // it is the credential store ADR-014 put here on purpose -- so the gate above
+    // passes while `keyring = ` sits three lines below it in the same file.
+    assert!(
+        declares(&stripped, "keyring"),
+        "`keyring` is declared in this manifest; if it is not, ADR-014 has drifted \
+         from the manifest"
+    );
+    assert!(
+        stripped.contains("keyring = "),
+        "the manifest text `keyring = ` is what made the substring scan misfire, so \
+         its absence here means this test is no longer testing the thing it was \
+         written to test"
+    );
 
     let config = TransportConfig::new("ws://127.0.0.1:8484/ws").with_token("a-live-token");
     let rendered = format!("{config:?}");

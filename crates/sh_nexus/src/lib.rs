@@ -9,9 +9,11 @@
 //! # The module tree (AGENTS.md section 3.1)
 //!
 //! [`app`] is the root component and arrived with work unit 3A; [`run`] opens it.
-//! `db/` and `platform/` are not declared yet. They are later work units, and
-//! they are absent rather than declared empty: a module that exists and does
-//! nothing reads as finished work. `state/bridge.rs` arrived in work unit 1E-2
+//! `db/` is not declared yet. It is a later work unit, and it is absent rather
+//! than declared empty: a module that exists and does nothing reads as finished
+//! work. [`platform`] arrived with the keychain milestone and is the project's
+//! first OS-facing layer, behind the [`platform::TokenStore`] trait `AGENTS.md`
+//! L88 describes. `state/bridge.rs` arrived in work unit 1E-2
 //! and is the single module permitted to mutate a GPUI context, which is why
 //! [`app::open`] installs the global it owns and this file names no such call.
 //! [`ui`] arrived in work unit 2A with the message list, and it is the layer
@@ -36,6 +38,7 @@ pub mod app;
 pub mod core;
 pub mod errors;
 pub mod network;
+pub mod platform;
 pub mod state;
 pub mod ui;
 

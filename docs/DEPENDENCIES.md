@@ -52,10 +52,60 @@ individually is not this file's job, and `gpui`'s own rev is what controls them.
 | 13 | `axum` | `0.8.9` | prod (**server**) | The HTTP and WebSocket server. `PLAN.md` ADR-002, `§7.4`. `features = ["ws"]`. | `std` has no HTTP or WebSocket server | `MIT` | verified |
 | 14 | `rusqlite` | `0.40.2` | prod (**server**) | SQLite bindings, no ORM. `features = ["bundled"]` — the workspace's one C dependency. | ADR-010 chose SQLite; an ORM would be 4 statements of overhead | `MIT` | verified |
 | 15 | `tracing-subscriber` | `0.3.23` | prod (**server**) | The `tracing` sink. `§7.5`'s level table is unimplementable on bare `tracing`. | `§7.1` bans `println!`; a level table needs a subscriber | `MIT OR Apache-2.0` | verified |
+| 16 | `keyring` | `4.2.0` | prod (**client**) | The OS credential store, behind `platform::TokenStore`. ADR-014. `default-features = false`, `features = ["v1"]`. | Three unstable C APIs with three different failure modes; `§7.1` names the keychain as the only sanctioned home | `Apache-2.0` | verified |
+
+### The `keyring` row in full, because it is the first client dependency with a platform-specific cost
+
+**Licence read from the file, not from the index.** crates.io reports this crate's `license` field as
+**blank**, which is worth recording because a blank licence is not a licence. The SPDX identifier was read
+from `LICENSE-APACHE` via the GitHub API and it is `Apache-2.0` — one of the licences `§7.2` names as
+compatible with this project's `MIT`.
+
+**Criterion 1 is a citation rather than an argument**, because three places in `AGENTS.md` already require
+this: `§7.1` ("No plaintext storage of tokens → Use the OS keychain via `platform/` abstraction"), L88
+("`platform/`: OS-specific implementations behind traits … secure token storage"), and `§8.1`'s Login Flow
+("Valid credentials → **Token stored in keychain** → Channels load → Chat view"). `odd/tasks/6a-login.md`
+deferred it so the login milestone would be one decision at a time; this is that decision.
+
+**Criterion 5 is measured, not estimated.** `cargo build --workspace --timings` on `feat/keychain`,
+2026-10-07, incremental over a warm `target/`: **30 units recompiled in total, of which three are this
+dependency's** — `keyring` **0 ms**, `keyring-core` **1 ms**, `windows-native-keyring-store` **1 ms**. The
+whole subtree costs **about 2 ms of compile time on Windows**, because that is the only store `v1` compiles
+there and it builds on the `windows-sys` family `Cargo.lock` already carried at 0.61.2 through GPUI.
+
+**`Cargo.lock` grows 190 lines, and that is NOT 190 lines of extra build.** A lockfile is
+platform-independent and records the whole resolve graph, so the macOS, iOS and unix entries are present for
+builds that will not happen on this machine. It is recorded here so nobody reads a 190-line lockfile diff as
+a 190-line build-time regression.
+
+**What `v1` costs per platform, from the published target table.** `v1` enables
+`windows-native-keyring-store`, `apple-native-keyring-store/keychain` and
+`zbus-secret-service-keyring-store`, each target-gated:
+
+| Platform | Store `v1` compiles | Extra subtree | Measured |
+|---|---|---|---|
+| Windows | `windows-native-keyring-store` | none — `windows-sys` is already in `Cargo.lock` at 0.61.2 through GPUI | **~2 ms** |
+| macOS / iOS | `apple-native-keyring-store` | `security-framework` | not measured here |
+| Linux / other unix | `zbus-secret-service-keyring-store` | a D-Bus client | not measured here |
+
+**The D-Bus row is a real cost on Linux and it is accepted knowingly.** The lighter alternative exists —
+`linux-keyutils-keyring-store`, the kernel keyutils store, which needs no session bus — and it is
+deliberately *not* enabled, because `keyring` picks the store at runtime and `v1` already supplies a working
+one. Enabling both would compile two stores to use one.
+
+**`cli` is left off, and that is a refusal rather than an omission.** It exists to read credentials into
+command-line argument and environment helpers, and this client must never expose its session token on a
+command line. **The visible consequence: `keyring::use_native_store(..)` does not exist in this build.** It
+lives in `keyring::cli`, not in `keyring::v1`. The `v1` API at 4.2 is `Entry::store_status()` for the
+one-time "does this machine have a store" resolution and `Entry::new(..)` for the handle — and because the
+resolution is itself a blocking OS call, `platform::LazyNativeStore` makes it on a worker thread. See
+`docs/ARCHITECTURE.md` ADR-014.
 
 `License` was read from **each crate's own manifest** via `cargo metadata`, not
 from a summary. Every one is MIT or Apache-2.0, both compatible with this
-project's `MIT`.
+project's `MIT`. **`keyring` is the one exception and it is called out above:**
+crates.io leaves its `license` field blank, so the identifier was read from
+`LICENSE-APACHE` in the repository rather than from the index.
 
 ## `sh_nexus_server`'s dependencies, measured
 
