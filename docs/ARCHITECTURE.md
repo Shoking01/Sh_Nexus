@@ -37,6 +37,7 @@ ADR-005.
 | [ADR-010](#adr-010--self-hosted-per-team-instances-with-sqlite) | Self-hosted per-team instances, with SQLite | **Accepted** |
 | [ADR-011](#adr-011--connection-visibility-a-banner-in-the-window-and-stderr-for-the-terminal) | Connection visibility: a banner in the window, and stderr for the terminal | **Accepted** |
 | [ADR-012](#adr-012--the-outbox-is-released-by-acknowledgement-not-by-a-successful-write) | The outbox is released by acknowledgement, not by a successful write | **Accepted** |
+| [ADR-013](#adr-013--a-login-screen-and-the-one-http-request-it-makes) | A login screen, and the one HTTP request it makes | **Accepted** |
 
 ---
 
@@ -1646,6 +1647,17 @@ that "cleared" the queue would be the exact defect this ADR removes, wearing a r
   `the_destructive_discard_has_no_ui_caller` is untouched and green. A `Failed` row is never queued —
   `fail_send` retires the entry before setting `Failed` — so §7's *"failures are never silently
   dropped"* is satisfied by the row staying visible and retrying for real, with no discard button.
+- **The login request that eventually feeds this queue speaks plain HTTP, and that is coupled to
+  `127.0.0.1` being the only deployment this workspace supports.** `network/rest.rs` derives its
+  login URL from the configured `ws://` endpoint and `hyper` is declared with **no TLS feature**,
+  so `wss://`/`https://` is **refused** with a message that says why rather than downgraded.
+  `sh_nexus_server`'s `SH_NEXUS_BIND` defaults to `127.0.0.1`, deliberately, and ADR-010's threat
+  model puts the adversary *outside* the team — so a cleartext POST is correct for the only
+  topology that exists. **The day remote deployment lands, that refusal is the line that breaks,
+  and it must break loudly**: a silent downgrade would post a password in the clear to a host that
+  asked for encryption, which is the worst outcome available rather than a safe one. ADR-013 carries
+  the coupling; it is recorded here too because the outbox is what a session token authenticates,
+  and a client whose login is broken has nothing to put in this queue.
 
 #### Alternatives considered
 
@@ -1660,3 +1672,175 @@ that "cleared" the queue would be the exact defect this ADR removes, wearing a r
 | **A `resync`-then-`flush` ordering** | §7 asks for it and **`request_resync` has no production caller**, so wiring it here would have been a door nothing calls — `bridge.rs` §5's dead-code rule. It also needs a resync caller and a decision about per-channel cursors that this layer does not own. |
 | **Flushing on the `Connected` transition only** | Strands a retry pressed while already connected. The condition is the honest trigger; the transition is one way to reach it. |
 | **Unbounded retry, or an automatic retry policy with backoff** | §7 makes `retry_send` the user's gesture and this crate has no timer a view can own. A silent auto-retry would also hide a message the user can see failing, which is the opposite of §7's fourth bullet. |
+
+---
+
+### ADR-013 — A login screen, and the one HTTP request it makes
+
+**Status:** Accepted — 2026-10-06
+
+#### Context
+
+Until this ADR, **a person could not use the application at all.** `network/ws.rs` recorded both
+absences in its own words:
+
+```text
+| Storing the token | AGENTS.md 7.1's OS keychain, behind platform/… |
+| Obtaining the token | A login screen and a POST /auth/login call      |
+```
+
+The token came from `SH_NEXUS_TOKEN`, so using the client meant calling the REST API by hand and
+pasting the result into an environment variable. **Everything built in PRs #43-#49 — the socket, the
+outbox, the banner, the resync — was reachable only that way**, which means every one of those
+features had never been exercised by a person who did not already know the API.
+
+`AGENTS.md` §8.1 names **Login Flow** and **Auth Failure Flow** among its ten mandatory
+integration flows, and neither was writable. The change record is `odd/tasks/6a-login.md`.
+
+The client had no HTTP client at all. `network/rest.rs` is `AGENTS.md` §3.1's `rest.rs` and it did
+not exist, which `src/lib.rs` accepts: *a module that exists and does nothing reads as finished
+work.*
+
+Four constraints shaped the answer, and three of them are refusals:
+
+- **`hyper` + `hyper-util` + `http-body-util` are already in this workspace.** `docs/DEPENDENCIES.md`
+  audits them in one row — *axum's HTTP stack* — because `sh_nexus_server` depends on them through
+  `axum`. Declaring them as a **client** dependency adds no new crate to the audit and no new
+  compile unit to `cargo build --workspace`.
+- **`reqwest` is the wrong pick and the reason is a recorded decision, not a preference.**
+  `docs/DEPENDENCIES.md` records that `ring` and `rustls` are absent from this project **by choice**,
+  and `reqwest` arrives with a TLS backend attached. `AGENTS.md` §7.4's rule about never disabling
+  certificate validation in a release build is a rule about a stack that does not exist yet;
+  adding the stack to deliver a login form would make the rule unauditable rather than satisfied.
+- **No keychain in this milestone.** `keyring` would be a brand-new dependency with no precedent in
+  this tree, and §7.2 makes a dependency a recorded decision rather than one to smuggle in beside a
+  feature. Login first, persistence second: **a session that lasts one launch is already the
+  difference between "impossible" and "tedious".**
+- **`ConnectionSettings::from_env` has four arms and the offline suites depend on one of them.**
+  Nothing configured is not a failure to log in to; it is a different mode that already works.
+
+#### Decision
+
+**1. `hyper`, with no TLS feature, and the login URL is derived from the WebSocket endpoint.**
+`SH_NEXUS_URL` already names the server's *socket* endpoint, and asking an operator to configure a
+second variable for the same host is asking two things to disagree — discovered later as a login
+posting to a different server than the socket connects to. The path is **replaced**, not appended
+to: `/ws` becomes `/auth/login`, because keeping the first produces `/ws/auth/login`, which is a 404
+that costs an afternoon.
+
+**2. A bounded channel seam, not a field.** `bridge.rs` gains a global holding one outstanding
+attempt and the single slot its answer arrives in. **A login produces no `DomainEvent`**, so routing
+it through the inbox would mean a second answer on a door whose whole shape is *one kind of thing* —
+and it would make a completed sign-in depend on whether the socket happened to be quiet.
+
+**3. The password crosses exactly one door, by value, and is stored nowhere.** `bridge::begin_login`
+takes it as a `String` and **moves** it into a worker closure; it is dropped when the request
+finishes. `state/app_state.rs` names neither it nor a token, and `AppState` has no field for either.
+
+| Rule | Held by |
+|---|---|
+| no layer below the seam stores it | there is no field to store it in — the parameter is moved, not borrowed |
+| no `Debug` or `Display` prints it | `LoginOutcome` writes both out by hand; `rest::Session` **does not implement `Debug` at all**, so a `{:?}` on it cannot compile |
+| no `tracing` call names it | `no_production_source_logs_a_credential_or_prints_one` scans the whole tree, comments stripped |
+
+**The last two are a design rather than a discipline.** The natural shape — a `LoginRequest` struct
+with a `username` and a `password` — is a type whose derived `Debug` prints the secret, and *"nobody
+will print it"* is not a guarantee. `rest::login` takes its arguments separately precisely so that no
+such struct exists.
+
+**4. The shell owns the mode; the view owns the sentence.** `Shell::Render` returns the form
+**instead of** the chat while there is no session — an early return, not a conditional child,
+because `tests/login.rs` asks the window whether `message-list` occupies any space and a
+hidden-but-present log would answer *yes*. A view cannot decide that about itself: it answers *here
+is the line to draw* (`LoginView::show`) and the shell answers *here is what happens now*.
+
+**5. The login poll runs first and ungated in `Shell::apply_inbox`.** The `applied() == 0` early
+return there is an optimisation about *frames*, and a login answer is not a frame event — it arrives
+on its own channel with the inbox silent, which is exactly the state in which putting the poll
+behind that gate would be invisible to every other test in the suite.
+
+**6. The startup matrix gains a fifth *case*, not a fifth arm, and no existing test changes.**
+
+| `SH_NEXUS_URL` | `SH_NEXUS_TOKEN` | Result |
+|---|---|---|
+| absent | absent | local mode, exactly as today |
+| present | absent | **the login view** |
+| present | present | the shell, exactly as today |
+| absent | present | `MissingSetting::Url` |
+
+`startup_from_env` returns a `Startup` value because a decision expressed as a value can be
+asserted: `ConnectionSettings::from_env` keeps its stricter four-case reading for callers that have
+no form to offer, and both read through one private `configured()`. **One code path for
+"connected", reached two ways** — `the_connected_state_has_exactly_one_representation` asserts the
+login path and the environment path build the same `ConnectionSettings`.
+
+#### Consequences
+
+- **`AGENTS.md` §8.1's Login Flow and Auth Failure Flow are now real flows rather than prose.** Two
+  of its ten mandatory flows were unwritable; both are driven end to end against a **real
+  `sh_nexus_server` process**, and the strong half of the login claim is that the issued token opens
+  a real handshake — a refused upgrade is `Rejected`, not `Connected`, so the wait cannot pass on a
+  token-shaped string.
+- **The refusal shown is the server's own words, and a refused login keeps no token.** A client
+  rendering its own *"login failed"* would be strictly less useful than one rendering *"that
+  username and password combination was not accepted by this server"*, which is the only half of the
+  sentence the user can act on.
+- **An unreachable server is a different *kind* of thing from a rejected credential, and is reported
+  as one.** `LoginError` splits `Refused` from `Unreachable` and the view draws them in different
+  colours, because a client that reported both as *"login failed"* would send the user to retype a
+  password that was never wrong. **A `2xx` carrying no token is `Unreadable` and not `Refused`** —
+  every status this endpoint uses for a refusal is a non-`2xx`, so that answer means this client is
+  talking to something that is not this API.
+- **Plain HTTP is correct only while `127.0.0.1` is the only supported deployment, and the refusal
+  is the line that breaks.** `SH_NEXUS_BIND` defaults to `127.0.0.1` deliberately and ADR-010's
+  threat model puts the adversary *outside* the team, so a cleartext POST is right for the only
+  topology that exists. **The day remote deployment lands, `rest::http_login_endpoint`'s refusal of
+  `wss://`/`https://` is what must break loudly** — a silent downgrade would post a password in the
+  clear to a host that asked for encryption. Recorded in ADR-012's consequences as well, because the
+  outbox is what a session token authenticates.
+- **The password field draws a bullet per character and no test can learn the password from a
+  painted frame.** The typed value is asserted through `LoginView::password`, for the same reason
+  `input_bar.rs::draft` is: the platform's text path is an *absence* failure mode, and only asking
+  the view can catch it.
+- **A second submit while one is outstanding is refused at the seam, not the view.** Every
+  `POST /auth/login` mints a session on the server, so two concurrent attempts mint two and the
+  socket would present whichever answer the pump took first.
+- **`LoginView` implements `EntityInputHandler` over a `String`, because there is no text-input
+  widget in `gpui` at the pinned rev.** `input_bar.rs` verified that against the checkout — no
+  `elements/input.rs`, and `InputState` exists nowhere — and three new dependencies for two
+  single-line fields is not a trade §7.1's supply-chain rule would take.
+- **Two new `LoginOutcome` cases are reachable and are now tested.** `LoggedIn` and `Refused` carry
+  the two surfaces that did not exist before, and both `Debug` and `Display` are asserted to be
+  credential-free rather than assumed to be.
+- **The credential scans live in `tests/login.rs` and are demonstrated to be non-vacuous.** A rule
+  enforced by *"the scanner skips one file"* is only as good as what that file does, so
+  `the_one_sanctioned_login_door_takes_the_password_by_value` asserts that every mention of a
+  password in `state/` is the by-value parameter, and `the_password_scanner_is_not_vacuous` proves
+  the scanner can still fail — including that **prose is admitted**, which is what lets
+  `network/rest.rs` and `login.rs` document the rule at length without the fix being "delete the
+  documentation".
+- **There is still no keychain and still no persistence.** A token lives in memory for the session
+  and dies with the process; §7.1's OS keychain remains the correct home and is still its own
+  milestone. **A logout button is deliberately absent** — the token lives in memory, so there is
+  nothing to revoke, and a logout that only cleared memory would be a feature pretending to be a
+  security property.
+- **`network/rest.rs` duplicates the server's `LOGIN_PATH` as a literal, and the duplication is
+  watched.** The client cannot depend on `sh_nexus_server` (ADR-002 would put `axum`, `rusqlite` and
+  SQLite's C amalgamation into `cargo tree -p sh_nexus`), and `sh_nexus_wire` describes WebSocket
+  envelopes — adding an HTTP surface to the protocol crate for a single request would make it depend
+  on a shape nobody else in the workspace speaks. `the_login_path_this_client_posts_to_is_the_one_the_suite_uses`
+  fails the build if the two spellings drift.
+
+#### Alternatives considered
+
+| Option | Why not chosen |
+|---|---|
+| **`reqwest`** | Genuinely new to `Cargo.lock` and it brings a crypto backend, which this project has declined twice. `DEPENDENCIES.md` records `ring`/`rustls` as absent **on purpose**, and the auth PR chose opaque tokens partly to avoid that stack. |
+| **A second configuration variable for the login URL** | Two spellings of "where the server is", discovered as a login posting somewhere the socket is not. The rewrite cannot produce a disagreement; see `the_websocket_endpoint_is_translated_into_an_http_login_url`. |
+| **Silently downgrading `wss://` to `http://`** | Sends a password in the clear to a host that explicitly asked for encryption. The refusal is worse-looking and strictly better. |
+| **Persisting the token (file, keychain, `db/`) now** | §7.1 forbids plaintext token storage, and a keychain is a brand-new dependency with no precedent here. The keychain is the *correct* storage and is its own milestone; a token in memory for the session is not a file this project wrote. |
+| **Replacing local mode rather than extending the matrix** | No server configured is not a failure to log in to. Every offline suite depends on that arm, and replacing it would have changed tests that are not about login. |
+| **Routing the login outcome through the event inbox as a `DomainEvent`** | A second answer on a door that returns one kind of thing, and it would make a completed sign-in depend on whether the socket was quiet — the exact state in which the mistake is invisible. `a_login_completes_with_the_event_inbox_completely_silent` drives both directions of that independence. |
+| **A `tokio` runtime owned by the application for its life** | The WebSocket transport already starts and stops its own per PR #41. A client-wide runtime would outlive every attempt it served, and `cx.background_executor()` has no IO driver — handing the request to GPUI's executor would compile and then hang. |
+| **Deciding the mode in `ui/views/login.rs`** | A view that could decide to replace the whole window is a view that knows about the log, the banner and the composer. One owner, per `bridge.rs` §5's audit-trail argument. |
+| **An unpinned HTML/WebView login form** | §7.1's last row: no JavaScript, no web tech. This is a native app. |

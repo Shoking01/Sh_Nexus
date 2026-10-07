@@ -143,6 +143,63 @@
 //! printed its connection state into a terminal would be a client reporting to
 //! whoever launched it rather than to the person looking at it. The banner is the
 //! user-facing surface, and `main.rs`'s subscriber is for the developer's terminal.
+//!
+//! # 7. The login mode, and why it is this file's decision
+//!
+//! **A window shows the form *instead of* the chat while there is no session, and
+//! this file is the only one that can say so.** `ui/views/login.rs` owns what the
+//! form looks like and §5's argument is why the form is not a third branch of
+//! this file; but *"which of two things is this window"* has one owner, and
+//! splitting it would be the audit trail §5 warns about. [`Self::login_form`] is
+//! the answer, [`Render`] reads it, and `login::LoginView` is handed an
+//! [`crate::ui::Colors`] it never asks this file about.
+//!
+//! **Why the chat is not merely hidden behind the form.** `tests/login.rs`
+//! asserts that `debug_bounds("message-list")` is `None` while the form is up — a
+//! window showing a chat a person has no claim on is a window telling them they
+//! are already signed in. That is a claim about the *element tree*, so it is made
+//! by an early return rather than by a conditional child.
+//!
+//! ## The startup matrix has five cases, and the fifth one is this feature
+//!
+//! [`Startup`] is that matrix as a value, and it exists because the decision used
+//! to be a `match` inside [`open`]'s window closure where no test could reach it.
+//! `startup_from_env` is the same decision, moved somewhere a test can call it.
+//!
+//! | `SH_NEXUS_URL` | `SH_NEXUS_TOKEN` | Result |
+//! |---|---|---|
+//! | absent | absent | [`Startup::Local`] — the offline shell, unchanged |
+//! | present | absent | [`Startup::Login`] — the form |
+//! | present | present | [`Startup::Connected`] — the shell, unchanged |
+//! | absent | present | [`MissingSetting::Url`] |
+//!
+//! **The rule it encodes: a login screen appears when a server is configured and
+//! you have no session.** No server configured is not a failure to log in to; it
+//! is a different mode that already works and that the offline suites depend on.
+//! **The other four cases are byte-for-byte what they were**, which is why
+//! `ConnectionSettings::from_env` still exists with its stricter four-case
+//! reading for the callers that have no form to offer.
+//!
+//! ## The poll is first, ungated, and the only thing that can end an attempt
+//!
+//! [`Self::apply_login`] runs **before** the drain and **before** the flush, and
+//! it is not behind the `report.applied() == 0` early return. That early return is
+//! an optimisation about *frames* — twenty quiet ticks a second should cost no
+//! repaints — and a login answer is not a frame event: it arrives on its own
+//! channel with the event inbox silent, which is exactly the state
+//! `a_login_completes_with_the_event_inbox_completely_silent` drives. Gating the
+//! poll on applied events would have made a successful sign-in wait for the socket
+//! to say something.
+//!
+//! ## One attempt, one socket, and the guard that makes it true
+//!
+//! [`Self::enter_login`] refuses while a form exists or a transport is held, and
+//! [`Self::accept_login`] drops the form and starts the socket in one step. So
+//! there is no state in which a form can be re-entered and a second socket
+//! started, and the answer that ends it is taken by the poll rather than by the
+//! view — [`bridge::try_take_login_outcome`] is the only caller, which is what
+//! makes `bridge::login_in_flight` deterministic rather than a race against the
+//! pump.
 
 use std::fmt;
 use std::time::Duration;
@@ -155,9 +212,10 @@ use gpui::{
 use crate::core::theme::BuiltIn;
 use crate::errors::ShNexusError;
 use crate::network::ws::{TransportConfig, TransportError, WsTransport};
-use crate::state::bridge::{self, EventSender};
+use crate::state::bridge::{self, EventSender, LoginOutcome};
 use crate::ui::views::connection_banner;
 use crate::ui::views::input_bar::InputBar;
+use crate::ui::views::login::LoginView;
 use crate::ui::views::message_list::MessageList;
 use crate::ui::Colors;
 use crate::UNSIGNED_IN_USER;
@@ -260,6 +318,39 @@ pub fn theme_colors() -> Colors {
     }
 }
 
+/// The environment variable naming the server's WebSocket endpoint.
+///
+/// **A constant rather than a literal in two places, and the reason is the module
+/// docs' §7 argument rather than tidiness:** the URL is read by two functions —
+/// [`ConnectionSettings::from_env`] and [`startup_from_env`] — and the login URL is
+/// derived from the value it holds. One spelling of the variable's name is one
+/// thing to get right.
+const URL_VARIABLE: &str = "SH_NEXUS_URL";
+
+/// The environment variable carrying the session token.
+///
+/// See [`URL_VARIABLE`] for why this is a constant.
+const TOKEN_VARIABLE: &str = "SH_NEXUS_TOKEN";
+
+/// The two variables, read once.
+///
+/// **One reader for both public readings, and that is the point.** There are two
+/// functions that answer "what is configured" — [`ConnectionSettings::from_env`]
+/// and [`startup_from_env`] — and they differ on exactly one arm. A second
+/// `std::env::var` pair would be a second answer to that question and the shape of
+/// the mistake `bridge.rs` §5's audit-trail argument is written about.
+///
+/// **`Option` rather than the `Result` because a missing variable is not an error
+/// at this level**: which of the two is missing is what the two callers each answer,
+/// and `Err(_)` for "not present" would put a `std::env::VarError` into a type
+/// whose whole purpose is to say *which variable*.
+fn configured() -> (Option<String>, Option<String>) {
+    (
+        std::env::var(URL_VARIABLE).ok(),
+        std::env::var(TOKEN_VARIABLE).ok(),
+    )
+}
+
 /// The environment the client reads its server from.
 ///
 /// # The two variables, and what absent means
@@ -274,12 +365,14 @@ pub fn theme_colors() -> Colors {
 /// no server configured gets the offline shell, which is the point: a client that
 /// refuses to start without a server is a client nobody can run for the first time.
 ///
-/// **A URL with no token is a misconfiguration, and it is refused.** ADR-010 made
-/// authentication mandatory, so a URL alone can only end in an opaque 401 the user
-/// cannot act on — and `AGENTS.md` §7.5 says an actionable code beats a silently
-/// dropped explanation. Failing at startup says which variable is missing, before a
-/// window opens, which is strictly more useful than the same message arriving after
-/// the user has typed something.
+/// **A URL with no token is two different things depending on who is asking.** A
+/// caller with a window to put a form in has one: [`Startup::Login`], and the user
+/// signs in. A caller that has nowhere to offer a form has only one: a URL alone
+/// can end in an opaque 401 the user cannot act on, so [`from_env`] reports
+/// [`MissingSetting::Token`] instead. `AGENTS.md` §7.5 says an actionable code
+/// beats a silently dropped explanation, and refusing *before* a window opens says
+/// which variable is missing, which is strictly more useful than the same message
+/// arriving after the user has typed something.
 ///
 /// # Why the environment and not a file or a login screen
 ///
@@ -291,6 +384,15 @@ pub fn theme_colors() -> Colors {
 /// never logged, never written, and never rendered into a `Debug` or `Display` output**
 /// — [`ConnectionSettings`]'s own `Debug` impl is what enforces that, and a test
 /// asserts it.
+///
+/// **The login screen does not change that, and the reason is worth stating because
+/// it is the obvious next question.** A form that persisted its own session would be
+/// a plaintext token on disk, which is the thing §7.1 names. **A token that lives in
+/// memory for the session is not that**: it reaches [`ConnectionSettings`] and
+/// nowhere else, and the process exiting is what makes it worthless. `odd/tasks/
+/// 6a-login.md` records the keychain as deliberately later for exactly this reason —
+/// login first, persistence second, because a session that lasts one launch is
+/// already the difference between "impossible" and "tedious".
 ///
 /// This is also the server's own convention, which is why the names match:
 /// `crates/sh_nexus_server/src/main.rs` reads `SH_NEXUS_BIND` and `SH_NEXUS_DB` the
@@ -308,20 +410,49 @@ pub struct ConnectionSettings {
 }
 
 impl ConnectionSettings {
+    /// Builds settings from a URL and a token.
+    ///
+    /// **A real constructor, and it is public because both ways of becoming
+    /// connected have to build the same value.** The environment path gets here
+    /// through [`Self::from_env`]; the login path gets here through
+    /// [`Startup::Login`] and a server-issued session. **Two constructors would be
+    /// two representations of "connected", and `bridge::install_transport`'s
+    /// one-transport-one-publication-point argument only holds if there is one way
+    /// to be connected** — `tests/login.rs::the_connected_state_has_exactly_one_
+    /// representation` is what asserts it rather than leaving it to review.
+    ///
+    /// **It takes the token and does nothing with it**, which is worth noticing
+    /// rather than fixing: this is where the only credential the client keeps comes
+    /// into existence, and it is a two-field struct with a hand-written `Debug`
+    /// rather than anything with storage.
+    pub fn new(url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            token: token.into(),
+        }
+    }
+
     /// Reads both variables, or explains precisely what is missing.
     ///
     /// `Ok(None)` is the **no-server case and is not an error**: the shell runs
     /// offline. `Err` is only ever "you asked for a connection and did not finish
     /// describing it".
+    ///
+    /// **This is the four-case reading, and it is deliberately still that.** A URL
+    /// with no token is [`MissingSetting::Token`] here rather than a login screen,
+    /// because this function has no window to put a form in — and a refusal that
+    /// arrives before any UI exists is the one place the user can still read the
+    /// explanation in a terminal. **The caller that *does* have a window uses
+    /// [`startup_from_env`]**, whose fifth case is that same arm answered with a
+    /// form instead of an error; see the type's docs. Both read through
+    /// [`configured`], so the two spellings of "the server is at this URL" cannot
+    /// drift.
     pub fn from_env() -> Result<Option<Self>, MissingSetting> {
-        match (
-            std::env::var("SH_NEXUS_URL"),
-            std::env::var("SH_NEXUS_TOKEN"),
-        ) {
-            (Err(_), Err(_)) => Ok(None),
-            (Ok(url), Ok(token)) => Ok(Some(Self { url, token })),
-            (Ok(_), Err(_)) => Err(MissingSetting::Token),
-            (Err(_), Ok(_)) => Err(MissingSetting::Url),
+        match configured() {
+            (None, None) => Ok(None),
+            (Some(url), Some(token)) => Ok(Some(Self::new(url, token))),
+            (Some(_), None) => Err(MissingSetting::Token),
+            (None, Some(_)) => Err(MissingSetting::Url),
         }
     }
 
@@ -332,22 +463,21 @@ impl ConnectionSettings {
 
     /// Builds settings from values the caller already has.
     ///
-    /// **Public because `from_env` is untestable for the populated case**, and the
-    /// reason it is untestable is worth recording: reaching the "both variables are
-    /// set" arm means calling `std::env::set_var`, which is `unsafe` under Rust 2024
-    /// and mutates state every other test in the process reads. A test that sets an
+    /// **A thin delegation to [`Self::new`], and the whole of its reason is that
+    /// the name is a lie the compiler cannot check.** It is `*_for_test` because
+    /// [`Self::from_env`] is untestable for the populated case, and that
+    /// untestability is worth recording: reaching the "both variables are set" arm
+    /// means calling `std::env::set_var`, which is `unsafe` under Rust 2024 and
+    /// mutates state every other test in the process reads. A test that sets an
     /// environment variable to prove something about a constructor is a test that
     /// breaks unrelated ones.
     ///
-    /// **Not a test-only escape hatch** — the production path builds the same values
-    /// from the same two fields through [`Self::from_env`], so there is one
-    /// representation of "a URL and a token" rather than two that could drift. What is
-    /// test-only is the *source* of the two strings.
+    /// **It is not a second representation, and that is what this line buys.** The
+    /// name survives so no existing caller changes, while the body is the one
+    /// constructor — so a caller reading `from_parts_for_test` sees one path into
+    /// the value and not two that could drift.
     pub fn from_parts_for_test(url: impl Into<String>, token: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            token: token.into(),
-        }
+        Self::new(url, token)
     }
 
     /// Builds the transport configuration this describes.
@@ -367,9 +497,17 @@ impl ConnectionSettings {
 /// **A distinct type rather than a `String`,** because the message is the whole point:
 /// an operator who set a URL and got "invalid configuration" has to guess, and one who
 /// is told `SH_NEXUS_TOKEN` is missing can fix it without reading this source.
+///
+/// **Both variants are still reachable, and `Token` is reachable from exactly one
+/// caller.** [`ConnectionSettings::from_env`] is the four-case reading and reports
+/// it; [`startup_from_env`] answers the same arm with [`Startup::Login`] instead,
+/// because it has a window to put a form in. **The asymmetry is the feature rather
+/// than an oversight** — and it is why this type is not a "configuration is wrong"
+/// flag with a login special case bolted on: which answer is right depends on
+/// whether the user is looking at a screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingSetting {
-    /// `SH_NEXUS_URL` is set but `SH_NEXUS_TOKEN` is not.
+    /// `SH_NEXUS_URL` is set but `SH_NEXUS_TOKEN` is not, and no form was offered.
     Token,
     /// `SH_NEXUS_TOKEN` is set but `SH_NEXUS_URL` is not.
     Url,
@@ -391,6 +529,57 @@ impl fmt::Display for MissingSetting {
 }
 
 impl std::error::Error for MissingSetting {}
+
+/// What this client should open, and why — the five-case matrix as a value.
+///
+/// **A value rather than a `match` inside [`open`], because a decision expressed as
+/// a value can be asserted.** The window closure reads the environment and then
+/// decides, and there was no way to ask "what did it decide" without opening a
+/// window; `tests/login.rs` asks it directly for the arm that acceptance criterion
+/// 4 is about.
+///
+/// **Three cases and one refusal, and the refusal is asymmetric on purpose.** A
+/// token with no server has nothing to offer the user — there is nowhere to send it
+/// — so it is [`MissingSetting::Url`]. A server with no token has a form, so it is
+/// [`Self::Login`]. [`ConnectionSettings::from_env`] keeps the stricter reading for
+/// callers that have no form; this is the reading [`open`] uses.
+///
+/// **`Self::Connected` holds the same [`ConnectionSettings`] the environment path
+/// would have built**, which is what `tests/login.rs::the_connected_state_has_exactly_
+/// one_representation` asserts. One type, one constructor, two ways of arriving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Startup {
+    /// Neither variable is set: the documented offline shell, and not an error.
+    Local,
+    /// A server is configured and there is no session, so the window opens the form.
+    Login {
+        /// The configured WebSocket endpoint. The login URL is derived from it
+        /// inside `network/rest.rs`; the view is handed the endpoint and never
+        /// asked to assemble a URL of its own.
+        endpoint: String,
+    },
+    /// Both variables are set, or a sign-in just succeeded: open the shell and
+    /// start the socket.
+    Connected(ConnectionSettings),
+}
+
+/// Reads the environment into the matrix [`Startup`] describes.
+///
+/// `Ok(Startup::Local)` is the **no-server case and is not an error**, and it is
+/// the arm every offline suite depends on — `tests/login.rs` asserts it before it
+/// asserts anything else, because a leaked `SH_NEXUS_URL` would make every other
+/// assertion in that suite pass or fail for the wrong reason.
+///
+/// The only `Err` is [`MissingSetting::Url`]: a token with nowhere to go. See the
+/// type's docs for why that one arm is not a login screen.
+pub fn startup_from_env() -> Result<Startup, MissingSetting> {
+    match configured() {
+        (None, None) => Ok(Startup::Local),
+        (Some(url), None) => Ok(Startup::Login { endpoint: url }),
+        (Some(url), Some(token)) => Ok(Startup::Connected(ConnectionSettings::new(url, token))),
+        (None, Some(_)) => Err(MissingSetting::Url),
+    }
+}
 
 /// Why [`Shell::start_transport`] did not start one.
 ///
@@ -490,6 +679,26 @@ pub struct Shell {
     /// delivering sends. Holding it for the shell's life is what makes the connection
     /// outlive a frame.
     transport: Option<WsTransport>,
+    /// The session a sign-in issued, when one has.
+    ///
+    /// **An `Option` and its own field rather than something the transport can be
+    /// asked for, because "who am I connected as" and "is there a socket" are
+    /// different questions.** `Self::transport` answers the second and is honest
+    /// about only the second; this one answers the first and is the *only* place
+    /// the client keeps the credential [`ConnectionSettings`] carries — see the
+    /// module docs, §7.
+    session: Option<ConnectionSettings>,
+    /// The login form, while there is no session.
+    ///
+    /// **`None` is the ordinary offline and connected case**, so this is not a mode
+    /// flag with a boolean next to it: one `Option` says both "is there a form" and
+    /// "is there no session", and the two cannot disagree.
+    ///
+    /// **An [`Entity`] for the reason [`Self::list`] is one**, plus one more: the
+    /// form's platform input handler is registered from a paint callback keyed on
+    /// the *entity*, so a form rebuilt per frame would have a different target on
+    /// every frame and would accept nothing.
+    login: Option<Entity<LoginView>>,
     /// The palette this shell's own elements draw with.
     ///
     /// **A copy rather than a borrow of the theme, and the same reason
@@ -562,6 +771,8 @@ impl Shell {
             colors,
             focus_handle,
             transport: None,
+            session: None,
+            login: None,
         };
         shell.start_drain_pump(cx);
         shell
@@ -641,6 +852,173 @@ impl Shell {
     /// [`connection_banner`] needs to decide whether to draw at all.
     pub fn transport(&self) -> Option<&WsTransport> {
         self.transport.as_ref()
+    }
+
+    /// Puts this window into the login mode, for `endpoint`.
+    ///
+    /// **Refused when the window is already in it or already connected, and the
+    /// guard is the whole reason this returns a `bool`.** There is no state in
+    /// which a second form replaces the first: two forms would be two sets of
+    /// buffers and two focus handles, and a form entered while a socket is being
+    /// started would let a user submit credentials into a window that is about to
+    /// leave for the chat. **A caller that ignored the refusal would not get two
+    /// forms — it would get one form and one stale entity nobody rendered.**
+    ///
+    /// **The endpoint is the configured WebSocket URL and is passed straight
+    /// through.** The login URL is derived from it inside `network/rest.rs`, and a
+    /// view that could build one would be a second place the two spellings of
+    /// "where the server is" could disagree — so the view displays the endpoint
+    /// and never assembles a URL.
+    pub fn enter_login(&mut self, endpoint: &str, cx: &mut Context<Self>) -> bool {
+        if self.login.is_some() || self.transport.is_some() {
+            return false;
+        }
+        let endpoint = endpoint.to_owned();
+        let colors = self.colors;
+        self.login = Some(cx.new(|cx| LoginView::new(endpoint, colors, cx)));
+        // **`Entity::update` does not mark anything dirty**, and the frame that is
+        // already on screen is the chat. Without this line the window would keep
+        // painting a log for a person who has no session, and
+        // `tests/login.rs::a_correct_login_moves_the_window_from_the_form_to_the_chat`
+        // would find `message-list` still occupying the window — a stale frame
+        // rather than a wrong tree, which is the harder of the two to diagnose.
+        cx.notify();
+        true
+    }
+
+    /// Applies what a finished attempt said, and reports whether the window left
+    /// the login mode.
+    ///
+    /// **The shell owns the mode and the view owns the sentence, and the split is
+    /// what keeps the layer boundary honest.** A successful login takes the whole
+    /// window somewhere else, and a view cannot decide that about itself — so it
+    /// answers "here is the line to draw" ([`crate::ui::views::login::LoginView`]
+    /// `::show`) and this answers "here is what happens now".
+    ///
+    /// **A refusal keeps the form, and keeps no token.** `AGENTS.md`'s Auth Failure
+    /// Flow is about a window that says why and holds nothing; storing the token
+    /// from a refused attempt would be a credential in a `String` with no owner,
+    /// and this function is the only place one could be stored.
+    ///
+    /// **The socket starts in the same step that drops the form**, so there is no
+    /// window in which the client holds a session, has no form, and has not been
+    /// told — which is what makes the "no second socket" claim in the module
+    /// docs, §7, true rather than aspirational.
+    ///
+    /// **A transport that cannot start does not throw the session away and does not
+    /// open the chat.** `start_transport` failing means this machine refused to
+    /// spawn a thread; the credential is still valid and the user is still looking
+    /// at a window, so the answer is rendered as a [`LoginOutcome::Failed`] and the
+    /// form stays where it is.
+    pub fn accept_login(&mut self, outcome: LoginOutcome, cx: &mut Context<Self>) -> bool {
+        match outcome {
+            LoginOutcome::LoggedIn { token, username } => {
+                let Some(endpoint) = self
+                    .login
+                    .as_ref()
+                    .map(|form| form.read(cx).endpoint().to_owned())
+                else {
+                    // **Unreachable while the poll is the only caller** — an attempt
+                    // can only have been started by a form — and it is reported
+                    // rather than handled, because the one honest answer to "a valid
+                    // session arrived and there is nothing to apply it to" is to say
+                    // so. Discarding the credential quietly would leave a user who
+                    // signed in correctly staring at a chat that never connects.
+                    tracing::warn!(
+                        reason = "no form is open",
+                        "a sign-in succeeded with nothing to apply it to"
+                    );
+                    return false;
+                };
+                let settings = ConnectionSettings::new(endpoint, token);
+                match self.start_transport(&settings, cx) {
+                    Ok(()) => {
+                        self.session = Some(settings);
+                        self.login = None;
+                        // **The handle, never the session.** `AGENTS.md` §7.5, and
+                        // `tests/login.rs` scans every production source for a log
+                        // line naming either credential.
+                        tracing::info!(username = %username, "signed in; the socket is starting");
+                        true
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            "signed in, but this machine could not open the socket"
+                        );
+                        self.show_login_outcome(
+                            LoginOutcome::Failed {
+                                reason: error.to_string(),
+                            },
+                            cx,
+                        );
+                        false
+                    }
+                }
+            }
+            refusal => {
+                self.show_login_outcome(refusal, cx);
+                false
+            }
+        }
+    }
+
+    /// Shows `outcome` on the open form, or records that there is nothing to show
+    /// it on.
+    ///
+    /// **`Option::None` on the form is not a failure and is not an error.** The
+    /// window has already left the login mode, so there is no surface left to draw
+    /// a line on — and the outcome is still worth a trace, because `AGENTS.md` §7.5
+    /// says ids and outcomes, and a login the user never saw explained is exactly
+    /// what a silent drop looks like from the other side.
+    fn show_login_outcome(&self, outcome: LoginOutcome, cx: &mut Context<Self>) {
+        match self.login.clone() {
+            Some(form) => form.update(cx, |form, cx| form.show(outcome, cx)),
+            None => tracing::info!(outcome = %outcome, "a sign-in attempt finished"),
+        }
+    }
+
+    /// The login form, while this window is in the login mode.
+    ///
+    /// **Exposed for the same reason [`Self::list`] and [`Self::input`] are**, and
+    /// for one more reason: "which of the two things is this window" is a question
+    /// with exactly one answer, and [`Render`], [`Self::accept_login`] and
+    /// `tests/login.rs` all asking the same accessor is what keeps it one question
+    /// rather than three inspections of a field.
+    pub fn login_form(&self) -> Option<&Entity<LoginView>> {
+        self.login.as_ref()
+    }
+
+    /// The session this client is connected with, if it has one.
+    ///
+    /// **`None` in two quite different situations, and the difference is not this
+    /// accessor's business**: the offline shell has no session because no server was
+    /// configured, and a window sitting on the login form has no session because
+    /// nobody has signed in yet. [`Self::login_form`] is what tells them apart.
+    pub fn session(&self) -> Option<&ConnectionSettings> {
+        self.session.as_ref()
+    }
+
+    /// Applies a finished attempt, if one is waiting, and reports whether one was.
+    ///
+    /// **First and ungated in [`Self::apply_inbox`], and the reason is in the module
+    /// docs, §7**: a login answer arrives on its own channel with the event inbox
+    /// silent, so putting this behind the `applied() == 0` early return would make a
+    /// successful sign-in wait for the socket to say something.
+    ///
+    /// **The repaint is conditional on the mode changing rather than on the answer
+    /// arriving.** A refusal repaints the form through the view's own `notify`,
+    /// because the form is the thing that changed; a success changes what this
+    /// shell renders, so only that case asks for a frame here.
+    fn apply_login(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(outcome) = bridge::try_take_login_outcome(cx) else {
+            return false;
+        };
+        let left_the_form = self.accept_login(outcome, cx);
+        if left_the_form {
+            cx.notify();
+        }
+        true
     }
 
     /// The production message list this shell composes.
@@ -781,7 +1159,25 @@ impl Shell {
     /// own socket (`AGENTS.md` §7.5's "reconnect scheduled" family), and
     /// [`bridge::FlushReport`] carries counts only — ids and sizes, never content.
     /// Nothing about it changes a row, so it does not ask for a repaint either.
+    ///
+    /// ## The login poll is first, and outside every gate below
+    ///
+    /// **Before the drain, before the flush, and before the `applied() == 0` early
+    /// return** — for the reason the module docs, §7, give: a login produces no
+    /// [`bridge`](crate::state::bridge) event, so on a socket that is quiet the
+    /// drain returns a report of zeroes and the early return would swallow the one
+    /// answer that mattered. `tests/login.rs` drives a completed sign-in against a
+    /// completely silent inbox precisely because that is the state in which the
+    /// mistake is invisible.
     fn apply_inbox(&mut self, cx: &mut Context<Self>) -> usize {
+        // **Unconditional, and the return value is deliberately not consulted
+        // below.** A refusal keeps the form and repaints it through the view's own
+        // notify; only a mode change needs a frame from here. Returning early on
+        // `false` would mean a refusal arriving in the same tick as no events
+        // skipped the *next* poll — which is where the answer that finally succeeds
+        // would be waiting.
+        self.apply_login(cx);
+
         let Some(report) = bridge::drain(cx) else {
             return 0;
         };
@@ -946,6 +1342,22 @@ impl Focusable for Shell {
 
 impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // **The login mode short-circuits the whole tree, and an early return is
+        // the only shape that makes the claim true.** A conditional child would
+        // still *build* the chat, and `tests/login.rs` asks the window whether
+        // `message-list` occupies any space — which a hidden-but-present log would
+        // answer "yes" to. So there is no path from this function to a message list
+        // while there is no session.
+        //
+        // **`AnyElement` in both arms**, and that is what makes the early return
+        // possible at all: `Render` returns one `impl IntoElement`, so a `Div` and
+        // an `Entity<LoginView>` cannot both be returned from two branches without
+        // erasing the type. The same reason `connection_banner` is a function
+        // returning `Option<AnyElement>` rather than an entity.
+        if let Some(form) = self.login.clone() {
+            return form.into_any_element();
+        }
+
         // **The banner is read before the tree is built, and that ordering is the
         // two-questions rule made mechanical.** `self.transport.is_some()` answers
         // *was a connection attempted* — the one thing that field honestly knows —
@@ -1013,6 +1425,8 @@ impl Render for Shell {
             // takes the height its content needs and the log takes the rest,
             // rather than the two sharing a row of an unbounded column.
             .child(self.input.clone())
+            // The erasure the early return above needs, and only that.
+            .into_any_element()
     }
 }
 
@@ -1073,37 +1487,52 @@ pub fn open(cx: &mut App) -> crate::errors::Result<WindowHandle<Shell>> {
         // comes from the shell. Reading the environment any earlier would make the
         // decision invisible from the window that the user is looking at.
         //
-        // **A missing token beside a URL is a startup failure, not a warning.**
-        // `AGENTS.md` §7.5 says an actionable code the user can report beats a
-        // silently dropped explanation, and this is the only place the user's
-        // terminal can still show them the message: once the socket is up, the same
-        // misconfiguration arrives as a 401 with nothing to act on.
-        match ConnectionSettings::from_env() {
+        // **The matrix is read once, as a value, and the fifth case is a window
+        // rather than an error.** `AGENTS.md` §7.5 says an actionable code the user
+        // can report beats a silently dropped explanation — and a login form is
+        // the actionable version of "you set a URL and have no session". Every
+        // other arm is byte-for-byte what it was; see `startup_from_env`.
+        match startup_from_env() {
             // Both variables absent: the documented offline shell. Not an error, and
             // not a banner — there is no connection to describe.
-            Ok(None) => {}
-            Ok(Some(settings)) => {
+            Ok(Startup::Local) => {}
+            // A server and no session. The window opens the form instead of the
+            // chat, and `Shell::Render` keeps it that way until a sign-in succeeds.
+            Ok(Startup::Login { endpoint }) => {
+                if !shell.update(cx, |shell, cx| shell.enter_login(&endpoint, cx)) {
+                    tracing::error!(
+                        "the login form could not be built, and this window has no session"
+                    );
+                }
+            }
+            Ok(Startup::Connected(settings)) => {
                 if let Err(error) =
                     shell.update(cx, |shell, cx| shell.start_transport(&settings, cx))
                 {
                     tracing::error!(error = %error, "the client has no socket");
                 }
             }
+            // A token with nowhere to go. There is no form that could help: the
+            // server is the thing that is missing.
             Err(missing) => {
                 tracing::error!(error = %missing, "the connection settings are incomplete");
             }
         }
-        // Focus the composer on open, mirroring how a real client focuses
-        // whatever will receive typing. That is now the composer and not the
-        // root: a chat window that opens with a text field focused is one the
-        // user can type into, and `AGENTS.md` 5.2 requires the feature to be
-        // reachable from the keyboard alone -- a window nothing focuses is a
-        // window whose keys go nowhere.
+        // Focus whatever will receive typing, mirroring how a real client focuses
+        // the field it opens on. That is the login form when there is one and the
+        // composer otherwise: a window that opens with no focused text field is
+        // one whose keys go nowhere, and `AGENTS.md` 5.2 requires the feature to be
+        // reachable from the keyboard alone.
         //
         // The root is still focusable and still takes `Escape` (see
         // `Shell::on_key_down`), so nothing is lost by the root not being what
         // the window starts on.
-        shell.read(cx).composer_focus_handle(cx).focus(window, cx);
+        let focus = shell
+            .read(cx)
+            .login_form()
+            .map(|form| form.read(cx).focus_handle(cx))
+            .unwrap_or_else(|| shell.read(cx).composer_focus_handle(cx));
+        focus.focus(window, cx);
         shell
     });
 
