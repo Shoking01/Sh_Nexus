@@ -160,7 +160,7 @@
 //! are already signed in. That is a claim about the *element tree*, so it is made
 //! by an early return rather than by a conditional child.
 //!
-//! ## The startup matrix has five cases, and the fifth one is this feature
+//! ## The startup matrix has six cases, and the fifth one is this feature
 //!
 //! [`Startup`] is that matrix as a value, and it exists because the decision used
 //! to be a `match` inside [`open`]'s window closure where no test could reach it.
@@ -169,16 +169,54 @@
 //! | `SH_NEXUS_URL` | `SH_NEXUS_TOKEN` | Result |
 //! |---|---|---|
 //! | absent | absent | [`Startup::Local`] — the offline shell, unchanged |
-//! | present | absent | [`Startup::Login`] — the form |
+//! | present | absent | [`Startup::Resume`] — the keychain has not answered yet |
 //! | present | present | [`Startup::Connected`] — the shell, unchanged |
 //! | absent | present | [`MissingSetting::Url`] |
 //!
 //! **The rule it encodes: a login screen appears when a server is configured and
-//! you have no session.** No server configured is not a failure to log in to; it
-//! is a different mode that already works and that the offline suites depend on.
+//! you have no session.** No server configured is not a failure to log in to; it is a
+//! different mode that already works and that the offline suites depend on.
 //! **The other four cases are byte-for-byte what they were**, which is why
 //! `ConnectionSettings::from_env` still exists with its stricter four-case
 //! reading for the callers that have no form to offer.
+//!
+//! ## The startup phase, and why there is one
+//!
+//! **The keychain made the matrix a phase rather than a decision.** Whether a launch
+//! shows a chat or a form now depends on a credential store that has not been read,
+//! and reading one is a blocking operating-system call — `CredReadW`, the Keychain
+//! Services call, a Secret Service round trip — which §2.3 forbids on the main thread.
+//! So [`Startup::Resume`] is a value that says *ask*, [`resume_with`] is the same
+//! decision with the answer supplied, and [`Shell::resuming`] is the window drawing
+//! neither a chat nor a form while it waits.
+//!
+//! **The waiting is a poll on the shell's existing pump, not a second mechanism.**
+//! [`Self::apply_resume`] is the first and ungated thing [`Self::apply_inbox`] does,
+//! for exactly the reason [`Self::apply_login`] is: the answer arrives on its own
+//! channel with the event inbox silent, so gating it behind `applied() == 0` would
+//! leave a window stuck in the startup phase until the socket happened to say
+//! something.
+//!
+//! **The cost is stated rather than hidden: the worst case is one
+//! [`DRAIN_INTERVAL`] after launch**, because that is the pump's period. §6.2's
+//! cached-session budget is 300 ms and this spends at most 50 ms of it.
+//!
+//! ## A restored session that the server refuses must not lock the user out
+//!
+//! **The trap this design exists to avoid.** If a launch restores a session and the
+//! server refuses it, an app that treats "I have a session" as final shows a chat
+//! that can never connect and **never offers the login form** — the user is stuck
+//! with no way back except deleting the credential by hand. So
+//! [`Self::recover_from_a_rejected_restored_session`] stops the socket, drops the
+//! session, clears the store and opens the form, in one step.
+//!
+//! **Only a *restored* session takes that path**, and [`Self::restored`] is what
+//! makes the difference checkable rather than a guess. A session from the
+//! environment or from a sign-in the user just typed is not cleared on refusal: the
+//! first is an operator's configuration and the second is a credential they can see,
+//! and deleting either without being asked would be a destructive action with no
+//! confirmation. That asymmetry is the cost of not recovering on every refusal, and
+//! it is stated here rather than discovered.
 //!
 //! ## The poll is first, ungated, and the only thing that can end an attempt
 //!
@@ -202,6 +240,7 @@
 //! pump.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
@@ -209,9 +248,11 @@ use gpui::{
     IntoElement, KeyDownEvent, Render, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 
+use crate::core::models::events::ConnectionState;
 use crate::core::theme::BuiltIn;
 use crate::errors::ShNexusError;
 use crate::network::ws::{TransportConfig, TransportError, WsTransport};
+use crate::platform::{LazyNativeStore, NoopTokenStore, TokenStore};
 use crate::state::bridge::{self, EventSender, LoginOutcome};
 use crate::ui::views::connection_banner;
 use crate::ui::views::input_bar::InputBar;
@@ -374,25 +415,23 @@ fn configured() -> (Option<String>, Option<String>) {
 /// which variable is missing, which is strictly more useful than the same message
 /// arriving after the user has typed something.
 ///
-/// # Why the environment and not a file or a login screen
+/// # Why the environment and not a file
 ///
 /// `AGENTS.md` §7.1 forbids plaintext token storage and names the OS keychain as where
-/// a token belongs. **There is no keychain here**: `platform/` does not exist, and
-/// building it is its own milestone. An environment variable is the one place a
-/// credential can live that is not a file this project wrote, so until the keychain
-/// lands this is the correct storage rather than a shortcut around it. **The token is
-/// never logged, never written, and never rendered into a `Debug` or `Display` output**
-/// — [`ConnectionSettings`]'s own `Debug` impl is what enforces that, and a test
-/// asserts it.
+/// a token belongs, and **`platform/` now exists and does that** — see
+/// [`Self::use_credential_store`] and [`Self::remember`]. An environment variable is
+/// still one of the two places a credential can arrive from, and it is the only one
+/// that needs no operating-system call to read: a developer with a token in their
+/// shell gets the shell with no keychain round trip and no startup phase at all.
+/// **The token is never logged, never written to a file this project owns, and never
+/// rendered into a `Debug` or `Display` output** — [`ConnectionSettings`]'s own
+/// `Debug` impl is what enforces that, and a test asserts it.
 ///
-/// **The login screen does not change that, and the reason is worth stating because
-/// it is the obvious next question.** A form that persisted its own session would be
-/// a plaintext token on disk, which is the thing §7.1 names. **A token that lives in
-/// memory for the session is not that**: it reaches [`ConnectionSettings`] and
-/// nowhere else, and the process exiting is what makes it worthless. `odd/tasks/
-/// 6a-login.md` records the keychain as deliberately later for exactly this reason —
-/// login first, persistence second, because a session that lasts one launch is
-/// already the difference between "impossible" and "tedious".
+/// **The keychain does not widen this type, and that is deliberate.** A credential read
+/// out of the store is built by the *same* [`Self::new`] the environment path uses and
+/// reaches the same two fields, so there is one representation of "connected" rather
+/// than two that could disagree — `tests/keychain.rs` asserts it, beside `6A`'s own
+/// assertion for the two ways the login milestone had.
 ///
 /// This is also the server's own convention, which is why the names match:
 /// `crates/sh_nexus_server/src/main.rs` reads `SH_NEXUS_BIND` and `SH_NEXUS_DB` the
@@ -400,9 +439,9 @@ fn configured() -> (Option<String>, Option<String>) {
 ///
 /// # What this is not
 ///
-/// It is not multi-account, not persisted, and not a settings screen. It is the wiring
-/// that makes the transport reachable from the running application, which is what
-/// stopped it being a library only tests could exercise.
+/// It is not multi-account and not a settings screen. It is the wiring that makes the
+/// transport reachable from the running application, which is what stopped it being a
+/// library only tests could exercise.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConnectionSettings {
     url: String,
@@ -530,7 +569,7 @@ impl fmt::Display for MissingSetting {
 
 impl std::error::Error for MissingSetting {}
 
-/// What this client should open, and why — the five-case matrix as a value.
+/// What this client should open, and why — the six-case matrix as a value.
 ///
 /// **A value rather than a `match` inside [`open`], because a decision expressed as
 /// a value can be asserted.** The window closure reads the environment and then
@@ -538,11 +577,12 @@ impl std::error::Error for MissingSetting {}
 /// window; `tests/login.rs` asks it directly for the arm that acceptance criterion
 /// 4 is about.
 ///
-/// **Three cases and one refusal, and the refusal is asymmetric on purpose.** A
+/// **Four cases and one refusal, and the refusal is asymmetric on purpose.** A
 /// token with no server has nothing to offer the user — there is nowhere to send it
-/// — so it is [`MissingSetting::Url`]. A server with no token has a form, so it is
-/// [`Self::Login`]. [`ConnectionSettings::from_env`] keeps the stricter reading for
-/// callers that have no form; this is the reading [`open`] uses.
+/// — so it is [`MissingSetting::Url`]. A server with no session credential has a
+/// form, so it is [`Self::Login`] — **but only once the store has answered**, which is
+/// what [`Self::Resume`] is for. [`ConnectionSettings::from_env`] keeps the stricter
+/// reading for callers that have no form; this is the reading [`open`] uses.
 ///
 /// **`Self::Connected` holds the same [`ConnectionSettings`] the environment path
 /// would have built**, which is what `tests/login.rs::the_connected_state_has_exactly_
@@ -551,15 +591,28 @@ impl std::error::Error for MissingSetting {}
 pub enum Startup {
     /// Neither variable is set: the documented offline shell, and not an error.
     Local,
-    /// A server is configured and there is no session, so the window opens the form.
-    Login {
-        /// The configured WebSocket endpoint. The login URL is derived from it
-        /// inside `network/rest.rs`; the view is handed the endpoint and never
-        /// asked to assemble a URL of its own.
+    /// A server is configured, there is no environment token, and the credential
+    /// store has not answered yet.
+    ///
+    /// **A phase, not a view, and that is the whole reason it exists.** Whether the
+    /// window shows a chat or a login form now depends on a store that has not been
+    /// read, and reading it is a blocking operating-system call that `AGENTS.md` §2.3
+    /// forbids on the main thread. So there is a window between "I read the
+    /// environment" and "I know which view to show", and this is what it looks like
+    /// as a value.
+    Resume {
+        /// The configured WebSocket endpoint. The login URL is derived from it inside
+        /// `network/rest.rs`; the view is handed the endpoint and never asked to
+        /// assemble a URL of its own.
         endpoint: String,
     },
-    /// Both variables are set, or a sign-in just succeeded: open the shell and
-    /// start the socket.
+    /// A server is configured and there is no session, so the window opens the form.
+    Login {
+        /// The configured WebSocket endpoint. See [`Self::Resume`].
+        endpoint: String,
+    },
+    /// Both variables are set, a sign-in just succeeded, or a stored session was
+    /// found: open the shell and start the socket.
     Connected(ConnectionSettings),
 }
 
@@ -572,12 +625,39 @@ pub enum Startup {
 ///
 /// The only `Err` is [`MissingSetting::Url`]: a token with nowhere to go. See the
 /// type's docs for why that one arm is not a login screen.
+///
+/// **A server with no token is [`Startup::Resume`] and not [`Startup::Login`]**, and
+/// that is the one case this function had to stop answering on its own. It cannot:
+/// the credential store is a blocking OS call, `AGENTS.md` §2.3 forbids that on the
+/// frame path, and answering "the form" before asking the store would put a login
+/// prompt on screen on every launch for a user who has never signed in on this
+/// machine. [`resume_with`] is the same decision, with the store's answer supplied.
 pub fn startup_from_env() -> Result<Startup, MissingSetting> {
     match configured() {
         (None, None) => Ok(Startup::Local),
-        (Some(url), None) => Ok(Startup::Login { endpoint: url }),
+        (Some(url), None) => Ok(Startup::Resume { endpoint: url }),
         (Some(url), Some(token)) => Ok(Startup::Connected(ConnectionSettings::new(url, token))),
         (None, Some(_)) => Err(MissingSetting::Url),
+    }
+}
+
+/// The mode a resumed window opens in, given what the credential store held.
+///
+/// **A pure function of two strings, and that is the point.** The alternative — a
+/// `match` inside [`Shell::apply_resume`] — would make "which view does a launch
+/// show" a thing only a test with a window, a store and a server could answer.
+/// `tests/keychain.rs` asserts both arms directly and then asserts that a real
+/// window ends up where this function said it would.
+///
+/// **`None` covers "nothing stored" and "this machine has no usable store",** and
+/// merging them is what keeps this a two-arm function: a person asked to sign in
+/// again cannot do anything about which of the two it was.
+pub fn resume_with(endpoint: &str, found: Option<&str>) -> Startup {
+    match found {
+        Some(credential) => Startup::Connected(ConnectionSettings::new(endpoint, credential)),
+        None => Startup::Login {
+            endpoint: endpoint.to_owned(),
+        },
     }
 }
 
@@ -699,6 +779,39 @@ pub struct Shell {
     /// the *entity*, so a form rebuilt per frame would have a different target on
     /// every frame and would accept nothing.
     login: Option<Entity<LoginView>>,
+    /// The endpoint whose stored session this window is still waiting for.
+    ///
+    /// **`Some` is the startup phase, and it is a field rather than a mode flag because
+    /// `AGENTS.md` §3.1's tree makes this file the only one that can say which of two
+    /// things a window is.** It answers the question the login field also answers, and two
+    /// answers to one question is `bridge.rs` §5's audit-trail hazard.
+    ///
+    /// **Holding the endpoint and not a bool is what makes the phase recoverable.** The
+    /// worker that reads the store takes time, and every way this can end — the answer
+    /// arriving, the worker refusing to start, a socket that cannot be opened — needs the
+    /// endpoint to build the next thing.
+    resuming: Option<String>,
+    /// Whether the live session was read out of the credential store rather than typed or
+    /// configured.
+    ///
+    /// **The one field in this struct whose value decides a destructive action**, and it
+    /// exists so the decision is checkable rather than inferred. See the module docs, §7:
+    /// only a restored session is cleared and replaced with the login form when the server
+    /// refuses it, because the other two kinds are an operator's configuration or a
+    /// credential the user can see.
+    restored: bool,
+    /// The store this window keeps its session credential in.
+    ///
+    /// **A [`NoopTokenStore`] until [`Self::use_credential_store`] replaces it**, and that
+    /// default is the documented offline behaviour rather than a placeholder: a shell built
+    /// without one keeps no credential and loses nothing, because there was never one to
+    /// keep. It is also what keeps the six suites that call [`Self::new`] directly from
+    /// touching a developer's real keychain.
+    ///
+    /// **An `Arc` because the seam hands it to a worker**, which is where every operating-
+    /// system call happens — see `platform/mod.rs`'s docs for why this struct may not do it
+    /// itself.
+    credentials: Arc<dyn TokenStore>,
     /// The palette this shell's own elements draw with.
     ///
     /// **A copy rather than a borrow of the theme, and the same reason
@@ -773,9 +886,157 @@ impl Shell {
             transport: None,
             session: None,
             login: None,
+            resuming: None,
+            restored: false,
+            credentials: Arc::new(NoopTokenStore),
         };
         shell.start_drain_pump(cx);
         shell
+    }
+
+    /// Puts the store this window keeps its session credential in.
+    ///
+    /// **A setter rather than a constructor parameter, and the reason is a signature six
+    /// test suites and `benches/frame_time.rs` depend on.** [`Self::new`] is called by
+    /// `tests/app_shell.rs`, `tests/login.rs`, `tests/shell_connection.rs`,
+    /// `tests/soak_cycle.rs`, `tests/soak_e2e.rs` and the bench, none of which is about
+    /// the keychain, and widening its arity would have touched all seven for one feature.
+    /// [`open`] calls this immediately after constructing the shell, so a production
+    /// window never spends a moment on the default.
+    pub fn use_credential_store(&mut self, store: Arc<dyn TokenStore>) {
+        self.credentials = store;
+    }
+
+    /// The store this window is keeping its session credential in.
+    ///
+    /// **Exposed for the reason [`Self::list`] and [`Self::input`] are**: a test asserting
+    /// that the production window holds the *real* store rather than the no-op one is what
+    /// makes "the keychain is wired up" a checkable claim rather than prose. It returns a
+    /// clone because the field is an `Arc` the seam shares with a worker.
+    pub fn credential_store(&self) -> Arc<dyn TokenStore> {
+        Arc::clone(&self.credentials)
+    }
+
+    /// Puts this window into the startup phase for `endpoint` and asks the seam to read
+    /// the store off the main thread.
+    ///
+    /// **Refused when the window is already in the phase, already connected, or already
+    /// showing a form**, for the reason [`Self::enter_login`] refuses: two startup phases
+    /// would be two workers reading one slot, and the second answer would have nothing to
+    /// apply to.
+    ///
+    /// **The worker starts before the flag is set, and the order is the contract.** A
+    /// worker that could not start has to leave the window somewhere it can be acted on,
+    /// and a window stuck in a phase nothing will ever leave is the one state with no way
+    /// forward — so a refusal falls straight through to [`Self::enter_login`].
+    ///
+    /// **Non-blocking, and that is what makes it safe from [`open`].** The credential read
+    /// is a synchronous OS call that `AGENTS.md` §2.3 forbids on the frame path; the seam
+    /// owns the thread and this function only asks.
+    pub fn begin_resume(&mut self, endpoint: &str, cx: &mut Context<Self>) -> bool {
+        if self.resuming.is_some() || self.transport.is_some() || self.login.is_some() {
+            return false;
+        }
+        self.resuming = Some(endpoint.to_owned());
+        if !bridge::begin_credential_load(cx, Arc::clone(&self.credentials)) {
+            tracing::error!(
+                "this machine refused to read the credential store, and this window has no session"
+            );
+            return self.resume_failed(endpoint, cx);
+        }
+        // **`Entity::update` does not mark anything dirty**, and the frame already on
+        // screen is a chat from before the launch decision — the same stale-frame problem
+        // `enter_login` solves with its own `notify`.
+        cx.notify();
+        true
+    }
+
+    /// Whether this window is waiting for the credential store to answer.
+    ///
+    /// **`Render` reads it and `tests/keychain.rs` asserts it, and it is a separate
+    /// accessor rather than a field read** for the reason [`Self::login_form`] gives: which
+    /// of three things this window is has exactly one answer, and every reader asking the
+    /// owner is what keeps it one question.
+    pub fn is_resuming(&self) -> bool {
+        self.resuming.is_some()
+    }
+
+    /// Whether the live session was read out of the credential store.
+    ///
+    /// **The flag the recovery path gates on, exposed so the distinction is checkable.**
+    /// `a_rejected_stored_credential_is_cleared_and_the_login_form_appears` asserts it is
+    /// true after a restore and false afterwards, which is what proves the recovery cleared
+    /// the *restored* marker rather than merely the session.
+    pub fn session_was_restored(&self) -> bool {
+        self.restored
+    }
+
+    /// Gives up on the startup phase and shows the form instead.
+    ///
+    /// **The only way out of [`Self::resuming`] other than an answer**, and it exists so
+    /// the field has no path that leaves a window stranded. `AGENTS.md` §2.1's rule about
+    /// not panicking in user-facing code has an equally firm counterpart: a user-facing path
+    /// with no way forward is the same defect wearing a different hat.
+    fn resume_failed(&mut self, endpoint: &str, cx: &mut Context<Self>) -> bool {
+        self.resuming = None;
+        self.enter_login(endpoint, cx)
+    }
+
+    /// Applies the credential answer, if one is waiting, and reports whether one was.
+    ///
+    /// **First and ungated in [`Self::apply_inbox`], and before the login poll.** The
+    /// answer arrives on its own channel with the event inbox silent — the same state
+    /// `a_login_completes_with_the_event_inbox_completely_silent` drives for 6A — so
+    /// gating it would leave a window in the startup phase until the socket said
+    /// something.
+    ///
+    /// **The decision about what to do with it is [`resume_with`], not this function.** That
+    /// is what lets both of its arms be asserted without a window, and it is why this
+    /// method has no branch of its own for "nothing was stored".
+    ///
+    /// **A socket that cannot be opened falls back to the form rather than keeping a
+    /// session with no socket**, for the reason [`Self::accept_login`] gives: the credential
+    /// is still valid and the user is still looking at a window, so the answer is a form
+    /// they can use and not a chat that can never connect.
+    fn apply_resume(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(answer) = bridge::try_take_credential_load(cx) else {
+            return false;
+        };
+        let Some(endpoint) = self.resuming.take() else {
+            // **Unreachable while this poll is the only caller**, and reported rather than
+            // unwrapped: an answer with nothing to apply it to would mean a credential was
+            // read and then dropped without a word.
+            tracing::warn!("a stored session was read with nothing waiting for it");
+            return false;
+        };
+
+        match resume_with(&endpoint, answer.credential()) {
+            Startup::Connected(settings) => match self.start_transport(&settings, cx) {
+                Ok(()) => {
+                    self.session = Some(settings);
+                    self.restored = true;
+                    // **The handle, never the value** — `AGENTS.md` §7.5, and the per-line
+                    // scan in `tests/login.rs` and `tests/keychain.rs` is what says so.
+                    tracing::info!("a stored session was found and the socket is starting");
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "this machine could not open the socket for a stored session");
+                    self.resume_failed(&endpoint, cx);
+                }
+            },
+            Startup::Login { endpoint } => {
+                self.enter_login(&endpoint, cx);
+            }
+            // **Unreachable, and handled rather than matched with `unreachable!()`.**
+            // `resume_with` has two arms and `AGENTS.md` §2.1 forbids a panic in a
+            // user-facing path; a third arm here would be a decision to invent rather than
+            // to check.
+            Startup::Local | Startup::Resume { .. } => {
+                tracing::error!("the stored-session answer produced no window at all");
+            }
+        }
+        cx.notify();
+        true
     }
 
     /// Starts the socket if this machine is configured for one, and reports what it did.
@@ -886,6 +1147,111 @@ impl Shell {
         true
     }
 
+    /// Clears a restored session the server refused, and opens the form in its place.
+    ///
+    /// **This is the lockout trap's exit, and it exists because of what happens without
+    /// it.** A launch that restores a credential and then meets a 401 has a chat that can
+    /// never connect and no way to reach a login form, so the user's only recovery is
+    /// deleting a credential by hand in a system dialog they have never heard of. The fix
+    /// is four actions in one step and **the order is the contract**:
+    ///
+    /// 1. the socket is shut down and dropped, and unpublished from the seam;
+    /// 2. the session is dropped, so nothing holds a credential the server has refused;
+    /// 3. the store is told to forget it, off the main thread;
+    /// 4. the form is opened for the endpoint that session was for.
+    ///
+    /// **Step 1 precedes step 4 because [`Self::enter_login`] refuses while a transport is
+    /// held.** A form and a refused socket together is precisely the state this method
+    /// exists to leave, and `bridge.rs`'s one-transport-one-publication-point rule means the
+    /// drop has to be published as well as performed — a socket the seam still holds would
+    /// accept a send into a socket nobody is watching.
+    ///
+    /// **Only a *restored* session takes this path, and [`Self::restored`] is the gate.** A
+    /// session from `SH_NEXUS_TOKEN` is an operator's configuration and one the user just
+    /// typed is a credential they can see; clearing either without being asked is a
+    /// destructive action with no confirmation, which is the same reasoning
+    /// `actions::discard_failed_send` gives for not wiring its affordance. The cost is
+    /// stated: **a refused environment token still leaves the user at the banner**, and that
+    /// is the pre-existing behaviour rather than a regression.
+    ///
+    /// **Gated on `report.applied() != 0` at the call site**, because a refusal always
+    /// arrives as an applied [`ConnectionState`] event. Reading the state on every quiet
+    /// tick would be a lease of the global twenty times a second for a condition that
+    /// cannot have changed.
+    fn recover_from_a_rejected_restored_session(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.restored || self.transport.is_none() {
+            return false;
+        }
+        let rejected = bridge::try_read(cx, |state| {
+            matches!(state.connection(), ConnectionState::Rejected { .. })
+        })
+        .unwrap_or(false);
+        if !rejected {
+            return false;
+        }
+        let Some(endpoint) = self
+            .session
+            .as_ref()
+            .map(|session| session.url().to_owned())
+        else {
+            // **Unreachable while [`Self::restored`] implies a session** — the two are set
+            // together in `apply_resume` — and reported rather than unwrapped, because the
+            // alternative is a window that has decided to drop a credential it cannot name.
+            tracing::warn!(
+                "a restored session was refused and this window cannot say which server it was for"
+            );
+            return false;
+        };
+
+        // `WsTransport` has no `Drop` that stops its worker: the handle owns a clone of the
+        // outbound sender, so the socket has to be told to stop. Publishing `None` as well
+        // is the other half of the same step, per the seam's one-publication-point rule.
+        if let Some(transport) = self.transport.take() {
+            transport.shutdown();
+        }
+        bridge::install_transport(cx, None);
+        self.session = None;
+        self.restored = false;
+        self.forget();
+
+        // **The return value is the frame decision, not a summary.** `enter_login` cannot
+        // be refused here — the socket is gone and no form was open — and returning its
+        // answer keeps "did the window change" in one place rather than two.
+        self.enter_login(&endpoint, cx)
+    }
+    ///
+    /// **A private method rather than a `bridge::remember_credential` call at each site,
+    /// because there are exactly two sites and they must not drift**: a sign-in that just
+    /// succeeded, and nothing else. `AGENTS.md` §8.1's Login Flow says the token is stored
+    /// in the keychain after a valid credential, and `odd/tasks/6b-keychain.md` decision 2
+    /// records that this is specified behaviour rather than an open product question — a
+    /// "remember me" toggle is deliberately out of scope.
+    ///
+    /// **The value is moved, not borrowed**, and the worker's copy dies with the operation.
+    /// Nothing on this side keeps it, which is the same structural guarantee
+    /// `bridge::begin_login` gives the password.
+    ///
+    /// **A store that refuses costs nothing here, and that asymmetry is the requirement.**
+    /// Losing a remembered credential costs the user a sign-in next launch; losing the login
+    /// screen costs them the window. The seam reports the refusal as a log line and the
+    /// session is untouched.
+    fn remember(&self, credential: String) {
+        if !bridge::remember_credential(Arc::clone(&self.credentials), credential) {
+            tracing::warn!("this machine refused to start the worker that would keep the session");
+        }
+    }
+
+    /// Asks the store to forget whatever it was holding, off the main thread.
+    ///
+    /// **Idempotent end to end.** Two callers reach it on any ordinary run — a logout and
+    /// the recovery from a refused stored session — and `platform::TokenStore::clear`
+    /// answers `Ok(())` for "there was nothing", so neither can fail on the second.
+    fn forget(&self) {
+        if !bridge::forget_credential(Arc::clone(&self.credentials)) {
+            tracing::warn!("this machine refused to start the worker that would clear the session");
+        }
+    }
+
     /// Applies what a finished attempt said, and reports whether the window left
     /// the login mode.
     ///
@@ -930,7 +1296,13 @@ impl Shell {
                     );
                     return false;
                 };
-                let settings = ConnectionSettings::new(endpoint, token);
+                // **One value, cloned once, and the reason is that the store needs it too.**
+                // `ConnectionSettings` keeps it for the life of the session and
+                // `TokenStore::store` takes it by value, so exactly one of the two
+                // receives the original. Which one is arbitrary; *that it is one and not
+                // two hand-rolled copies* is not, because a credential reassembled by hand
+                // is a credential with no owner.
+                let settings = ConnectionSettings::new(endpoint, token.clone());
                 match self.start_transport(&settings, cx) {
                     Ok(()) => {
                         self.session = Some(settings);
@@ -939,6 +1311,11 @@ impl Shell {
                         // `tests/login.rs` scans every production source for a log
                         // line naming either credential.
                         tracing::info!(username = %username, "signed in; the socket is starting");
+                        // **And only once the socket is up**, so the remembered credential
+                        // is one this client has actually used. A session whose socket could
+                        // not be opened is dropped above, and a token nobody has presented
+                        // anywhere is not worth writing to disk.
+                        self.remember(token);
                         true
                     }
                     Err(error) => {
@@ -1169,7 +1546,25 @@ impl Shell {
     /// answer that mattered. `tests/login.rs` drives a completed sign-in against a
     /// completely silent inbox precisely because that is the state in which the
     /// mistake is invisible.
+    ///
+    /// **The credential poll is ahead of it for the same reason, and by the same
+    /// argument.** A window in its startup phase has no socket and therefore no events
+    /// at all, so it is the state in which that mistake is not merely invisible but
+    /// terminal: nothing else on this tick would ever end the phase.
+    ///
+    /// ## The refusal check is last, and only when something arrived
+    ///
+    /// [`Self::recover_from_a_rejected_restored_session`] reads the connection state, so
+    /// it runs after the drain — the drain is what applied the refusal — and behind
+    /// `applied() != 0`, which is the condition that says the state changed at all. The
+    /// alternative, checking on every tick, would lease the global twenty times a second
+    /// to re-ask a question no quiet tick can have changed the answer to.
     fn apply_inbox(&mut self, cx: &mut Context<Self>) -> usize {
+        // **First of all, and ungated, for the reason §7's two polls give.** The
+        // credential answer is what gets this window out of its startup phase, and it
+        // arrives on its own channel while the event inbox is silent.
+        self.apply_resume(cx);
+
         // **Unconditional, and the return value is deliberately not consulted
         // below.** A refusal keeps the form and repaints it through the view's own
         // notify; only a mode change needs a frame from here. Returning early on
@@ -1192,6 +1587,17 @@ impl Shell {
                 );
             }
             Some(_) | None => {}
+        }
+
+        // **After the drain, because the drain is what applied the refusal, and only
+        // when something actually arrived.** The check itself is one field read once
+        // the window has a restored session; twenty leases of the global a second to
+        // re-ask a question that cannot have changed is a cost with no claim behind it.
+        if report.applied() != 0 && self.recover_from_a_rejected_restored_session(cx) {
+            // **A frame, because this is a mode change and the shell renders the mode.**
+            // The recovery returns the answer to *that* question rather than the
+            // notification, so "did the window change" stays one decision.
+            cx.notify();
         }
 
         if report.applied() == 0 {
@@ -1342,6 +1748,18 @@ impl Focusable for Shell {
 
 impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // **The startup phase short-circuits first, before the login mode, and the
+        // order is chronological rather than arbitrary.** The phase is earlier: it is
+        // what a window is in *instead of* either of the two things below, and a shell
+        // cannot hold both `resuming` and a form. The claim is the negative one —
+        // `tests/keychain.rs` asks the window whether `message-list` or the login
+        // selector occupies any space, and a hidden-but-present surface would answer
+        // "yes" to the wrong question. A window showing a chat before it knows whether
+        // there is a session is telling the user they are signed in.
+        if self.resuming.is_some() {
+            return resuming_panel(self.colors).into_any_element();
+        }
+
         // **The login mode short-circuits the whole tree, and an early return is
         // the only shape that makes the claim true.** A conditional child would
         // still *build* the chat, and `tests/login.rs` asks the window whether
@@ -1349,9 +1767,9 @@ impl Render for Shell {
         // answer "yes" to. So there is no path from this function to a message list
         // while there is no session.
         //
-        // **`AnyElement` in both arms**, and that is what makes the early return
-        // possible at all: `Render` returns one `impl IntoElement`, so a `Div` and
-        // an `Entity<LoginView>` cannot both be returned from two branches without
+        // **`AnyElement` in every arm**, and that is what makes the early returns
+        // possible at all: `Render` returns one `impl IntoElement`, so a `Div` and an
+        // `Entity<LoginView>` cannot both be returned from two branches without
         // erasing the type. The same reason `connection_banner` is a function
         // returning `Option<AnyElement>` rather than an entity.
         if let Some(form) = self.login.clone() {
@@ -1430,6 +1848,45 @@ impl Render for Shell {
     }
 }
 
+/// The element the startup phase paints.
+///
+/// **A free function rather than a fourth branch written out in [`Shell::render`], for
+/// the reason the module docs, §5, give: a second place to answer "what does the window
+/// show in the startup phase" is the audit trail.** [`RESUME_SELECTOR`] is what makes the
+/// claim checkable from a painted frame rather than from a field.
+///
+/// **It says one line and offers nothing, and both halves are the requirement.** A person
+/// looking at it has a window that is about to decide between a chat and a form; anything
+/// actionable in the meantime would be a control whose answer the phase has not reached
+/// yet. `AGENTS.md` §7.3's explicit text colour is set on both containers for the reason
+/// the spike established: satisfying the rule unconditionally is cheaper than explaining
+/// which elements inherit.
+fn resuming_panel(colors: Colors) -> impl IntoElement {
+    div()
+        .id("app-resume")
+        .key_context("StartupResume")
+        .debug_selector(|| RESUME_SELECTOR.to_owned())
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .size_full()
+        .bg(colors.background)
+        .text_color(colors.text)
+        .child(
+            div()
+                .text_sm()
+                .text_color(colors.text_muted)
+                .child("Restoring your session"),
+        )
+}
+
+/// The selector [`resuming_panel`] records its bounds under.
+///
+/// **Public so the test can name it and so the literal is written once**, which is
+/// `tests/app_shell.rs`'s arrangement for every other selector in this shell.
+pub const RESUME_SELECTOR: &str = "startup-resume";
+
 /// A centred, windowed [`WINDOW_WIDTH`] x [`WINDOW_HEIGHT`] chat window.
 ///
 /// Private because the surface is the point: `bridge.rs` §5 argues that the number
@@ -1481,13 +1938,22 @@ pub fn open(cx: &mut App) -> crate::errors::Result<WindowHandle<Shell>> {
     let opened = cx.open_window(options, move |window, cx| {
         let shell = cx.new(|cx| Shell::new(sender, cx));
 
+        // **The store is handed over before the startup decision, and constructing it
+        // costs nothing.** `platform::LazyNativeStore` resolves which credential store this
+        // machine has on a *worker*, so this line is the only thing on the main thread
+        // that touches `platform/` at all — see that type's docs for why choosing a store
+        // is itself a blocking OS call and therefore cannot happen here.
+        shell.update(cx, |shell, _cx| {
+            shell.use_credential_store(Arc::new(LazyNativeStore::new()))
+        });
+
         // **Read and start the transport here, inside the window's own closure,**
         // because the Shell must exist before it can be given a socket: the
         // transport publishes through the shell's `EventSender`, and that handle
         // comes from the shell. Reading the environment any earlier would make the
         // decision invisible from the window that the user is looking at.
         //
-        // **The matrix is read once, as a value, and the fifth case is a window
+        // **The matrix is read once, as a value, and the sixth case is a window
         // rather than an error.** `AGENTS.md` §7.5 says an actionable code the user
         // can report beats a silently dropped explanation — and a login form is
         // the actionable version of "you set a URL and have no session". Every
@@ -1496,8 +1962,19 @@ pub fn open(cx: &mut App) -> crate::errors::Result<WindowHandle<Shell>> {
             // Both variables absent: the documented offline shell. Not an error, and
             // not a banner — there is no connection to describe.
             Ok(Startup::Local) => {}
-            // A server and no session. The window opens the form instead of the
-            // chat, and `Shell::Render` keeps it that way until a sign-in succeeds.
+            // A server, no environment token, and a store that has not answered. The
+            // window opens the startup phase, and `Shell::apply_resume` decides between
+            // the chat and the form when the answer arrives.
+            Ok(Startup::Resume { endpoint }) => {
+                if !shell.update(cx, |shell, cx| shell.begin_resume(&endpoint, cx)) {
+                    tracing::error!(
+                        "the startup phase could not be entered, and this window has no session"
+                    );
+                }
+            }
+            // A server and no session, with the store already asked and answered.
+            // `startup_from_env` cannot produce this arm — see its docs — but the match
+            // is exhaustive rather than `unreachable!()`, which `AGENTS.md` 2.1 forbids.
             Ok(Startup::Login { endpoint }) => {
                 if !shell.update(cx, |shell, cx| shell.enter_login(&endpoint, cx)) {
                     tracing::error!(
@@ -1519,22 +1996,46 @@ pub fn open(cx: &mut App) -> crate::errors::Result<WindowHandle<Shell>> {
             }
         }
         // Focus whatever will receive typing, mirroring how a real client focuses
-        // the field it opens on. That is the login form when there is one and the
-        // composer otherwise: a window that opens with no focused text field is
-        // one whose keys go nowhere, and `AGENTS.md` 5.2 requires the feature to be
-        // reachable from the keyboard alone.
+        // the field it opens on. That is the login form when there is one, the
+        // composer when there is a chat, and the shell's own root during the startup
+        // phase: a window that opens with no focused text field is one whose keys go
+        // nowhere, and `AGENTS.md` 5.2 requires the feature to be reachable from the
+        // keyboard alone.
         //
         // The root is still focusable and still takes `Escape` (see
         // `Shell::on_key_down`), so nothing is lost by the root not being what
         // the window starts on.
-        let focus = shell
-            .read(cx)
-            .login_form()
-            .map(|form| form.read(cx).focus_handle(cx))
-            .unwrap_or_else(|| shell.read(cx).composer_focus_handle(cx));
+        let focus = launch_focus_target(&shell, cx);
         focus.focus(window, cx);
         shell
     });
 
     opened.map_err(|error| ShNexusError::Unknown(error.to_string()))
+}
+
+/// The handle a freshly opened window puts the keyboard on.
+///
+/// **Three answers, and which one applies is chronological rather than a preference:**
+/// the form's field when there is a form, the composer's when there is a chat, and this
+/// shell's own root during the startup phase.
+///
+/// **The root is the right answer for the startup phase and the only one available.** The
+/// phase draws one line of text and no input, so there is no field to focus; focusing the
+/// composer would focus an entity that is not in the element tree, which GPUI can satisfy
+/// and the keyboard cannot use. The root handle *is* in the tree, it holds `Escape`, and
+/// `AGENTS.md` §5.2's requirement — that the window's keys reach something — is satisfied
+/// by it for the at-most-50 ms the phase lasts.
+///
+/// **A free function rather than a closure in [`open`], because three nested borrows of
+/// `cx` inside that closure is a shape a reader has to reconstruct.** One named place that
+/// answers the question is also what `bridge.rs` §5's audit-trail argument asks for.
+fn launch_focus_target(shell: &Entity<Shell>, cx: &App) -> FocusHandle {
+    let borrowed = shell.read(cx);
+    if let Some(form) = borrowed.login_form() {
+        return form.read(cx).focus_handle(cx);
+    }
+    if borrowed.is_resuming() {
+        return borrowed.focus_handle(cx);
+    }
+    borrowed.composer_focus_handle(cx)
 }

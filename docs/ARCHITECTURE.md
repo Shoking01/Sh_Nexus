@@ -38,6 +38,7 @@ ADR-005.
 | [ADR-011](#adr-011--connection-visibility-a-banner-in-the-window-and-stderr-for-the-terminal) | Connection visibility: a banner in the window, and stderr for the terminal | **Accepted** |
 | [ADR-012](#adr-012--the-outbox-is-released-by-acknowledgement-not-by-a-successful-write) | The outbox is released by acknowledgement, not by a successful write | **Accepted** |
 | [ADR-013](#adr-013--a-login-screen-and-the-one-http-request-it-makes) | A login screen, and the one HTTP request it makes | **Accepted** |
+| [ADR-014](#adr-014--the-os-keychain-behind-a-trait-and-a-startup-phase) | The OS keychain behind a trait, and a startup phase | **Accepted** |
 
 ---
 
@@ -1844,3 +1845,141 @@ login path and the environment path build the same `ConnectionSettings`.
 | **A `tokio` runtime owned by the application for its life** | The WebSocket transport already starts and stops its own per PR #41. A client-wide runtime would outlive every attempt it served, and `cx.background_executor()` has no IO driver — handing the request to GPUI's executor would compile and then hang. |
 | **Deciding the mode in `ui/views/login.rs`** | A view that could decide to replace the whole window is a view that knows about the log, the banner and the composer. One owner, per `bridge.rs` §5's audit-trail argument. |
 | **An unpinned HTML/WebView login form** | §7.1's last row: no JavaScript, no web tech. This is a native app. |
+
+---
+
+### ADR-014 — The OS keychain behind a trait, and a startup phase
+
+**Status:** Accepted — 2026-10-07
+
+#### Context
+
+ADR-013 left one sentence of its own consequences unwritten: *"There is still no keychain and still no persistence. A token lives in memory for the session and dies with the process."* Three places in `AGENTS.md` had already named the missing thing.
+
+| Where | What it says |
+|---|---|
+| §7.1 | "No plaintext storage of tokens → Use the OS keychain via `platform/` abstraction" |
+| L88 | "`platform/`: OS-specific implementations behind traits (notifications, sounds, secure token storage)" |
+| §8.1 | Login Flow: "Valid credentials → **Token stored in keychain** → Channels load → Chat view" |
+
+So this ADR closes a gap the project's own standards name. It does not add a feature to them. The change
+record is `odd/tasks/6b-keychain.md`.
+
+Two constraints shaped the answer, and the first is the one that is easy to get wrong.
+
+- **Every credential-store call is synchronous and therefore forbidden on the frame loop.** §2.3 says no
+  blocking I/O on the main thread. `CredReadW`, the Keychain Services call and a Secret Service round trip
+  are all blocking calls, and **deciding which store exists is itself one** — `keyring` initialises its
+  Secret Service backend on first use, which on Linux is a session-bus round trip. So the read is not
+  merely "somewhere off the main thread"; the *resolution* is too.
+- **The decision *which view to show* now depends on a store that has not answered.** With no keychain, a
+  server plus no token was one `match` arm. With one, it is a question the application cannot answer
+  synchronously, which means **there is a phase between "I read the environment" and "I know which view
+  this window is"**.
+
+#### Decision
+
+**1. `platform::TokenStore`, a trait, with five implementations.** §3.1's tree puts `platform/` beside
+`network/` and `db/` and L88 says "behind traits". One trait of three operations — `load`, `store`,
+`clear` — and five implementations, each of which exists for a stated reason:
+
+| Implementation | Why it exists |
+|---|---|
+| `KeyringTokenStore` | the real one: Windows Credential Manager, macOS Keychain Services, Secret Service |
+| `LazyNativeStore` | **what `app::open` hands the window**, and it resolves on a worker |
+| `InMemoryTokenStore` | the tests — a real implementation, not a mock, so §4.3's hermetic requirement is reachable |
+| `NoopTokenStore` | a machine with no credential service: degrade to "sign in again", never to a failed start |
+| `RefusingTokenStore` | the failing-keychain path, so it is a **tested** path rather than an untested branch |
+
+**2. The store is resolved off the main thread, which is why `LazyNativeStore` exists.** The object the main
+thread holds is a `OnceLock` and nothing else; the first worker to touch it asks `keyring` whether this
+machine has a store, logs once if not, and memoises the answer. `app::open` therefore makes no
+operating-system call at all — it constructs one `OnceLock`. **This is the difference between honouring §2.3
+and asserting it.**
+
+**3. Reuse ADR-013's seam rather than inventing a second mechanism.** `platform::TokenStore` is
+synchronous and `state/bridge.rs` §7's argument says the crossing belongs to the seam, so the three doors
+are `begin_credential_load`, `remember_credential` and `forget_credential` — the first shaped exactly like
+`begin_login` (a one-slot channel, a named thread, a poll that runs **first and ungated** in
+`Shell::apply_inbox`), the other two fire-and-forget because a save changes nothing the user can see.
+
+**4. `Startup` gains a `Resume` case, and the decision becomes a pure function.** A server with no
+`SH_NEXUS_TOKEN` is now `Startup::Resume { endpoint }` rather than `Startup::Login { endpoint }`, because
+answering "the form" before asking the store would put a login prompt on screen on every launch for a user
+who has never signed in on this machine. `resume_with(endpoint, found)` is the same decision with the
+answer supplied, which is what lets both arms be asserted **without a window, a server or a store**.
+
+**5. The shell owns three new fields, and one of them is load-bearing.** `resuming: Option<String>` is the
+phase; `credentials: Arc<dyn TokenStore>` is the store; and **`restored: bool` decides a destructive
+action**. Only a *restored* session is cleared and replaced with the login form when the server refuses it.
+
+**6. A refused restored session is cleared and the form appears — in one ordered step.**
+
+| # | Action | Why the order is the contract |
+|---|---|---|
+| 1 | `transport.shutdown()`, drop the handle, `bridge::install_transport(cx, None)` | `enter_login` refuses while a transport is held, and ADR-013's one-publication-point rule means the drop has to be published as well as performed |
+| 2 | drop the session | nothing may keep a credential the server has called worthless |
+| 3 | clear the store, off the main thread | the credential must not come back on the next launch |
+| 4 | open the form for that endpoint | the user gets a way back in |
+
+#### Consequences
+
+- **§8.1's Login Flow is now literally true**, and the missing middle step of ADR-013 is filled: valid
+  credentials → token in the keychain → channels load → chat.
+- **A stale credential can no longer lock anyone out.** Without step 1–4, a launch that restores a session
+  and meets a 401 shows a chat that can never connect and **never offers the login form**; the only
+  recovery is deleting a credential by hand in a system dialog the user has never heard of.
+  `a_rejected_stored_credential_is_cleared_and_the_login_form_appears` produces that situation honestly —
+  a real session from a real server, revoked through the server's **own logout route** — and asserts all
+  four outcomes.
+- **The cost of going off-thread is stated: the startup read is answered on the shell's next pump tick.**
+  `DRAIN_INTERVAL` puts that at worst 50 ms after launch, well inside §6.2's 300 ms cached-session budget,
+  and it is the price of not reading a credential store inside `open()`.
+- **A machine with no credential service still runs and login still works — it is just not remembered.**
+  That is acceptance criterion 3, and it is why `NoopTokenStore` and `LazyNativeStore`'s `Unavailable` arm
+  return `Ok(())` from a write rather than an error: **a warning the user cannot act on, printed on every
+  sign-in, trains the reader to ignore the line that matters.**
+- **A keychain that refuses costs a sign-in, not the window.** The session is untouched and the refusal is
+  one log line; `a_login_the_store_refuses_to_keep_still_leaves_a_working_session` drives that through the
+  real form, seam, HTTP and server with a store that fails every operation.
+- **`platform/` derives no `Debug` at all.** Every value it holds is a credential or the absence of one, so
+  a derived impl would print the value and compile while doing it. The two hand-written impls are asserted at
+  runtime, and `no_platform_source_can_print_a_credential` fails the build on a third appearing.
+- **`Err(Error::NoEntry)` had to become `Ok(())` in two places, and one of them is a platform fact rather
+  than an intention.** `get_password` answers `NoEntry` for an entry nobody wrote, and reading that as a
+  failure would report an ordinary first launch as a broken machine. `delete_credential` answers `NoEntry`
+  too — on Windows `CredDeleteW` reports `ERROR_NOT_FOUND` — so **without that mapping a first logout on a
+  fresh machine would fail**. Both are asserted against the real API, read-only.
+- **The suite deliberately does not write to a developer's real credential store.** It would mean `cargo
+  test` transiently replaces the session of anyone signed in on that machine, leaving a stray entry if the
+  run dies. The write path is covered by `InMemoryTokenStore`; the two classifications that could plausibly
+  be wrong against the real API are read-only and are asserted directly.
+- **Only a *restored* session is cleared on refusal, and that asymmetry is a cost.** A session from
+  `SH_NEXUS_TOKEN` is an operator's configuration and one the user just typed is a credential they can
+  see; clearing either without being asked is a destructive action with no confirmation, which is the same
+  reasoning `actions::discard_failed_send` gives for not wiring its affordance. **A refused environment
+  token still leaves the user at the banner.** That is pre-existing behaviour rather than a regression.
+- **A visible "remember me" toggle, token refresh and multi-account switching are all still out of scope.**
+  The first is new UI, new state and new tests for a default `§8.1` already fixes; the second is
+  `auth.rs`'s own §4.2 gap; the third would make `CREDENTIAL_ACCOUNT` a key rather than a name.
+- **`Shell::new`'s signature did not change, and that is why `use_credential_store` is a setter.** Six test
+  suites and `benches/frame_time.rs` call it; widening its arity would have touched all seven for one
+  feature. A shell built without the setter holds a `NoopTokenStore`, which is also what keeps those suites
+  from touching a developer's real keychain.
+
+#### Alternatives considered
+
+| Option | Why not chosen |
+|---|---|
+| **Hand-roll `CredReadW` / Keychain Services / keyutils** | Three unstable C APIs with three different failure modes and three different notions of what a "service" and a "user" are. It is a project in itself and it is exactly the supply-chain risk §7.2 exists to keep reviewed rather than absorbed. |
+| **A trait with three implementations and no `RefusingTokenStore`** | The most important degraded path — *the keychain refuses* — would have been the least tested one. `KeyringTokenStore` cannot be made to refuse on demand, and patching an OS call to produce a failure is not a test. |
+| **A `Mutex`-protected field on `AppState`** | §3.1 describes `state/` as channels, presence, unread counts and cursors. A credential there is a field no reader of the type could interpret, and ADR-013's `LoginGlobal` already established that the seam's own state is the right home for a value that is not domain data. |
+| **Read the store inside `open()`'s closure** | Blocking I/O on the main thread, which §2.3 forbids outright. |
+| **Resolve the store at `open()` time and hand the concrete type to the window** | The resolution is itself a blocking OS call — a session-bus round trip on Linux. §2.3 has no per-platform exception. |
+| **Open the login form immediately and let a stored credential replace it** | It flashes a sign-in prompt at a user who is already signed in, on every launch. `AGENTS.md` §5.2 asks for states a user can act on, and a prompt that disappears by itself is not one. |
+| **Block on the credential answer before opening a window** | Same §2.3 violation, and it also makes the window's appearance depend on a foreign service. |
+| **A second polling mechanism for the credential answer** | ADR-013 already established the pattern — a bridge-owned channel polled first and ungated by the shell's existing 50 ms pump. A second mechanism would be two answers to one question. |
+| **Recover from *every* refused session** | A destructive action with no confirmation, applied to a credential the user can see or an operator typed. Gated on `restored` instead, and the cost of that gate is recorded above. |
+| **`keyring::use_native_store(..)`** | It is behind the `cli` feature, which is deliberately off — `use_native_store` lives in `keyring::cli`, not in `keyring::v1`. The `v1` API at 4.2 is `Entry::store_status()` for the one-time resolution and `Entry::new(..)` for the handle. |
+| **Enabling `linux-keyutils-keyring-store` alongside the Secret Service** | `keyring` picks a store at runtime and `v1` already supplies a working one; this would compile two stores to use one. Recorded in the root manifest so nobody "fixes" it later. |
+| **A per-account key in the store** | Multi-account switching is out of scope, and a credential store holding a key per account is a design that has to be reviewed when there is a second account to tell apart. |
