@@ -144,8 +144,12 @@
 //! | [`try_flush_outbox`] | every send `PLAN.md` §7 queued, in enqueue order |
 //! | [`try_render_and_cache`], [`try_rendered`] | the parse on render, and the read that promotes it |
 //! | [`try_read`] | any read of the state |
-//! | [`begin_login`] | the one door a credential crosses — see §7 |
+//! | [`begin_login`] | the one door a **password** crosses — see §7 |
 //! | [`try_take_login_outcome`], [`login_in_flight`] | the answer, and whether one is outstanding |
+//! | [`begin_credential_load`] | the one credential **read** this client makes, off the main thread — see §9 |
+//! | [`try_take_credential_load`] | its answer, which is *absent* or the value |
+//! | [`remember_credential`] | keep the session that just arrived |
+//! | [`forget_credential`] | drop one, on a logout or a refusal |
 //!
 //! **There is no general `with_state_mut`, and its absence is the point.**
 //! `AGENTS.md` §3.2 asks for every mutation to be auditable, and 1E-1 achieved
@@ -222,6 +226,42 @@
 //! - **Whether a login was good enough to open a window.** [`try_take_login_outcome`]
 //!   hands the answer over; the shell builds the [`ConnectionSettings`] and the
 //!   view draws the refusal.
+//! - **Whether a stored credential was any good.** [`try_take_credential_load`]
+//!   answers whether one was there; [`app::Shell`] decides what a refused one
+//!   means, because that decision is about a window rather than about a value.
+//!
+//! # 9. The credential door, and why it is this file rather than `platform/`
+//!
+//! [`platform::TokenStore`] is a **synchronous** trait: every real implementation is a
+//! blocking operating-system call — `CredReadW`, the Keychain Services call, a Secret
+//! Service round trip — and `AGENTS.md` §2.3 forbids blocking the frame loop. Something
+//! therefore has to hand the work to a thread and report what it did, and §7's argument
+//! applies exactly as it does to the password: **this file owns the crossing, and the module
+//! that holds the value owns neither the thread nor the policy.**
+//!
+//! **Reusing §7's shape rather than inventing a second mechanism is the point.**
+//! [`begin_credential_load`] is [`begin_login`] with a different payload: it claims a
+//! one-slot channel, spawns a named thread, and returns. The answer is taken by a poll that
+//! runs first and ungated in `Shell::apply_inbox`, for the same reason the login poll does —
+//! an answer that arrives on its own channel must not wait for the socket to say something.
+//!
+//! **Three properties make the value as safe as the password, and all three are
+//! structural rather than policed.**
+//!
+//! | Property | How it is structural |
+//! |---|---|
+//! | nothing stores it | [`TokenStore::store`] takes a `String` **by value** and the worker closure owns it; no field exists on this side |
+//! | nothing prints it | [`StoredCredential`]'s `Debug` and `Display` are written out by hand and print its presence, not the value |
+//! | nothing logs it | the worker logs the *answer*, and `AGENTS.md` §7.5's rule is a per-line source scan in `tests/keychain.rs` |
+//!
+//! **A failure at startup is `Absent`, and the reason is a window rather than a value.**
+//! Refusing to leave the login mode because a keychain would not open would leave a user with
+//! no way in at all. The credential is lost — recoverable — and the reason is one log line
+//! for the person who launched the process, not something to draw on screen.
+//!
+//! **The saves are fire-and-forget, and that is what their doors being separate says.** A
+//! save or a clear changes nothing the user can see, so there is no slot to take an answer
+//! from and no poll to take it; a thread that could not start is a `false` and a log line.
 
 use std::fmt;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -236,6 +276,7 @@ use crate::core::markdown::Document;
 use crate::core::models::events::DomainEvent;
 use crate::network::rest::{self, LoginError, Session};
 use crate::network::ws::WsTransport;
+use crate::platform::{StoredCredential, TokenStore, TokenStoreError};
 use crate::state::actions::{self, ApplyOutcome, SendOutcome};
 use crate::state::app_state::AppState;
 
@@ -505,6 +546,15 @@ pub fn install(cx: &mut App, self_user_id: impl Into<String>) -> Result<EventSen
     cx.set_global(LoginGlobal {
         sender: login_sender,
         inbox: login_inbox,
+        in_flight: false,
+    });
+    // The credential seam's channel, created here for the reason the login one is: the
+    // three doors below need nothing but `&mut App` and a store, and a second window
+    // could not arrive at a second channel. See §9.
+    let (credential_sender, credential_inbox) = sync_channel(MAX_PENDING_CREDENTIALS);
+    cx.set_global(CredentialGlobal {
+        sender: credential_sender,
+        inbox: credential_inbox,
         in_flight: false,
     });
     Ok(EventSender { sender })
@@ -1051,6 +1101,218 @@ fn interpret(outcome: Result<Session, LoginError>) -> LoginOutcome {
 /// point here rather than a crash.
 pub fn is_installed(cx: &App) -> bool {
     cx.has_global::<AppStateGlobal>()
+}
+
+/// How many finished credential loads may sit in this seam's inbox at once.
+///
+/// **One, for the reason [`MAX_PENDING_LOGINS`] is one:** a window reads its
+/// credential store once and refuses a second read while one is outstanding, so a
+/// larger capacity would be a capacity nothing could ever use. `AGENTS.md` §7.1's
+/// bound on unbounded in-memory state is satisfied by the door rather than by a
+/// policy about it.
+pub const MAX_PENDING_CREDENTIALS: usize = 1;
+
+/// The credential seam's own global: one outstanding load, and the slot its answer
+/// arrives in.
+///
+/// **A separate global for the reason [`LoginGlobal`] is one, and here the reason is
+/// that the two answers have different shapes.** [`LoginOutcome::LoggedIn`] is a decision
+/// a server made and carries an account name; [`StoredCredential`] is the presence or
+/// absence of a value this machine already had. `AGENTS.md` §3.1 describes `state/` as
+/// channels, presence, unread counts and cursors, and a credential in `AppState` would be
+/// a field no reader of that type could interpret.
+///
+/// **Nothing secret is stored here, and that is a property of the type rather than of its
+/// users.** A worker is handed the value by value and drops it when the operation
+/// finishes; what comes back is a [`StoredCredential`] whose `Debug` prints presence.
+pub struct CredentialGlobal {
+    /// The producing half, cloned per operation. `Sync` by construction, which is what
+    /// lets a worker thread hold it while the state itself stays `!Sync`.
+    sender: SyncSender<StoredCredential>,
+    /// The consuming half, on the main thread. `Receiver` is `!Sync`, so this global
+    /// cannot be shared with a thread that is not this one — the same ownership argument
+    /// [`AppStateGlobal`]'s inbox makes.
+    inbox: Receiver<StoredCredential>,
+    /// Whether a read is outstanding: started, and not yet answered on screen.
+    in_flight: bool,
+}
+
+impl Global for CredentialGlobal {}
+
+/// Reads `store` on a thread of its own, so a window can decide its mode from what was
+/// there, and reports whether the read started.
+///
+/// **`begin_login` with a different payload, and reusing its shape is the whole point.**
+/// See the module docs, §9: `platform::TokenStore` is synchronous, so the crossing has to
+/// happen somewhere, and §7's argument says this file owns it.
+///
+/// **Non-blocking, and that is what makes it safe from `app::open`.** The caller is the
+/// main thread during startup, so it hands the work to a thread and returns; the answer is
+/// waiting for the shell's first poll, which `Shell::apply_resume` runs first and ungated.
+///
+/// **A second read while one is outstanding is refused,** for the reason
+/// [`begin_login`] refuses a second attempt: one window reads one credential, and a
+/// second read could not be applied to anything.
+///
+/// # Errors
+///
+/// None as such: a refusal to start is a `false`, and it is one of three things — the
+/// state is not installed, a read is already outstanding, or this machine refused to spawn
+/// the thread. Each is actionable by a different party, so the caller says which in its own
+/// words.
+pub fn begin_credential_load(cx: &mut App, store: Arc<dyn TokenStore>) -> bool {
+    if !is_installed(cx) {
+        return false;
+    }
+    let Some(attempt) = cx
+        .try_global::<CredentialGlobal>()
+        .map(|global| global.sender.clone())
+    else {
+        return false;
+    };
+
+    // The flag is claimed before the thread exists, so a second caller in the same turn
+    // cannot get past it, and it is handed back below if the thread could not start.
+    let claimed = cx.update_global::<CredentialGlobal, _>(|global, _| {
+        if global.in_flight {
+            return false;
+        }
+        global.in_flight = true;
+        true
+    });
+    if !claimed {
+        return false;
+    }
+
+    match std::thread::Builder::new()
+        .name("sh_nexus-credential-load".to_owned())
+        .spawn(move || {
+            let answer = match store.load() {
+                Ok(Some(credential)) => StoredCredential::Present(credential),
+                // **Both of these mean "sign in", and merging them is the point.** An
+                // empty store is the ordinary first launch, and a machine with no
+                // credential service is one that cannot remember anything — and a
+                // person asked to sign in again cannot do anything about which of the
+                // two it was.
+                Ok(None) | Err(TokenStoreError::Unavailable(_)) => StoredCredential::Absent,
+                // **A refusal is `Absent` too, and the cost of that is stated rather than
+                // hidden.** Leaving the login mode out because a keychain would not open
+                // would leave a user with no way in at all. The remembered session is lost
+                // — which is recoverable — and the reason is one log line for whoever
+                // launched the process rather than something to draw on screen.
+                Err(error) => {
+                    tracing::warn!(reason = %error, "the stored session could not be read, so it will have to be signed in again");
+                    StoredCredential::Absent
+                }
+            };
+            tracing::info!(found = %answer, "the credential store answered");
+            // The slot cannot be full and the channel cannot be closed while this global
+            // lives: there is one read at a time, one slot for its answer, and the seam
+            // holds the sending half for the process's life.
+            let _ = attempt.try_send(answer);
+        }) {
+        Ok(_) => true,
+        Err(error) => {
+            cx.update_global::<CredentialGlobal, _>(|global, _| global.in_flight = false);
+            tracing::warn!(reason = %error, "this machine refused to start the credential worker");
+            false
+        }
+    }
+}
+
+/// Takes the answer to the startup read, if one is waiting.
+///
+/// **First and ungated in `Shell::apply_inbox`, for the reason the login poll is** — see
+/// the module docs, §9. A credential answer arrives on its own channel while the event
+/// inbox is silent, which is exactly the state in which putting the poll behind the
+/// `applied() == 0` early return would leave a window stuck in its startup phase.
+///
+/// **The flag is cleared only here and only on an answer,** so a poll that found nothing
+/// leaves an outstanding read outstanding and [`begin_credential_load`]'s refusal stays
+/// deterministic rather than a race.
+pub fn try_take_credential_load(cx: &mut App) -> Option<StoredCredential> {
+    if !is_installed(cx) {
+        return None;
+    }
+    cx.update_global::<CredentialGlobal, _>(|global, _| match global.inbox.try_recv() {
+        Ok(answer) => {
+            global.in_flight = false;
+            Some(answer)
+        }
+        // Nothing has finished. `try_recv` does not block, so this is the normal end of
+        // every poll rather than a wait.
+        Err(_) => None,
+    })
+}
+
+/// Asks `store` to keep `credential`, off the main thread, and reports whether the worker
+/// started.
+///
+/// **The value is taken by value and moved into the worker**, which is
+/// [`TokenStore::store`]'s contract rather than a rule this file adds: there is no field
+/// on this side that could hold it, and the worker's copy dies with the operation.
+///
+/// **Fire-and-forget, and the separate door is what says so.** A save changes nothing the
+/// user can see, so there is no slot to take an answer from and no poll to take it; a
+/// worker that could not start is a `false` and a log line, and the session is untouched
+/// either way — losing a remembered credential costs a sign-in, losing the session costs
+/// the window.
+///
+/// **No `&mut App` parameter, and that asymmetry with [`begin_credential_load`] is the
+/// shape of the difference.** This door touches no GPUI state, so there is no global to
+/// claim a slot in and nothing to be installed *for*; refusing the save because the
+/// application was being torn down would drop a credential for no reason, and a
+/// `&mut App` that is not used is a parameter that lies about what the call needs.
+pub fn remember_credential(store: Arc<dyn TokenStore>, credential: String) -> bool {
+    spawn_credential_work("sh_nexus-remember", move || {
+        if let Err(error) = store.store(credential) {
+            // **A `warn!` and nothing more, and that is the whole of the requirement.**
+            // The window already says the user is signed in; there is nothing on screen
+            // that "could not be saved for next time" would improve, and a line the user
+            // cannot act on is noise.
+            tracing::warn!(reason = %error, "the signed-in session could not be kept for next time");
+        }
+    })
+}
+
+/// Asks `store` to forget whatever it was holding, off the main thread, and reports
+/// whether the worker started.
+///
+/// **Idempotence is [`TokenStore::clear`]'s contract and this door does not weaken it.**
+/// Two callers reach here on any ordinary run — a logout, and the recovery from a
+/// credential the server refused — and `AGENTS.md` §2.1's rule about never failing a
+/// user-facing path on an unrecoverable-looking condition is why a second call answers
+/// `Ok(())` rather than an error the user cannot act on.
+pub fn forget_credential(store: Arc<dyn TokenStore>) -> bool {
+    spawn_credential_work("sh_nexus-forget", move || {
+        if let Err(error) = store.clear() {
+            tracing::warn!(reason = %error, "a stored session could not be cleared from this machine");
+        }
+    })
+}
+
+/// Runs one credential operation on a thread of its own, and reports whether the thread
+/// started.
+///
+/// **A helper rather than three copies of `Builder::new`, because a refusal to start a
+/// thread is a report and a log line and nothing else** — and one spelling of that is one
+/// thing to keep correct.
+///
+/// **It takes no `&mut App`, and that is the difference between it and
+/// [`begin_credential_load`].** A save or a clear has no answer to route back through the
+/// seam, so there is no global to touch and no main-thread value to borrow — which is also
+/// why these two doors cannot be the one door the load uses.
+fn spawn_credential_work(thread_name: &str, work: impl FnOnce() + Send + 'static) -> bool {
+    match std::thread::Builder::new()
+        .name(thread_name.to_owned())
+        .spawn(work)
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(reason = %error, "this machine refused to start a credential worker");
+            false
+        }
+    }
 }
 
 /// Applies one event, on the main thread, and reports what it did.
