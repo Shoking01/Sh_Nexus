@@ -238,6 +238,18 @@ hyper-util = { workspace = true }
 # stack" row to become a direct dependency of the client rather than a new row.
 http-body-util = { workspace = true }
 
+# keyring: the OS credential store, and the only sanctioned way this token is
+# allowed to outlive the process. `AGENTS.md` 7.1 forbids plaintext storage and
+# names the keychain as the replacement; 8.1's Login Flow expects it. Audited in
+# the root manifest -- Apache-2.0, read from `LICENSE-APACHE` because crates.io
+# leaves the field blank.
+#
+# Declared here rather than in the server: the token is the *client's* credential
+# and the server must never see a keychain. This is also the crate that makes
+# `platform/` exist -- it is the project's first, and `AGENTS.md` L88 already
+# described what belongs in it.
+keyring = { workspace = true }
+
 [dev-dependencies]
 # proptest: `AGENTS.md` 4.4 mandates it. Its property tests here cover the
 # properties the hand-written cases cannot: that no wire value at all reaches
